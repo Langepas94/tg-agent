@@ -1,11 +1,6 @@
-mod bot;
-mod config;
-mod mcp_client;
-mod scheduler;
-mod state;
-
 use anyhow::Result;
 use teloxide::{prelude::*, utils::command::BotCommands};
+use tg_agent::{bot, config, scheduler, state};
 use tracing::info;
 
 #[tokio::main]
