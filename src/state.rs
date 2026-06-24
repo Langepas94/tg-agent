@@ -71,8 +71,11 @@ impl BotState {
             let chat = teloxide::types::ChatId(spec.chat_id);
             let mut ticker =
                 tokio::time::interval(Duration::from_secs(spec.interval_min.max(1) * 60));
-            // The first tick is immediate, so the very first check gives instant
-            // feedback that the subscription is alive.
+            // `first` marks the immediate tick (fires now, also on every restart).
+            // On it we only send a "collecting" heartbeat — never a DATA summary —
+            // so data summaries always land on the interval grid and restarts can't
+            // emit off-cadence posts.
+            let mut first = true;
             let mut announced_waiting = false;
             loop {
                 ticker.tick().await;
@@ -82,23 +85,44 @@ impl BotState {
                 {
                     Ok(out) => out,
                     Err(e) => {
-                        let _ = bot.send_message(chat, format!("⏱ watch failed: {e}")).await;
+                        if !first {
+                            let _ = bot.send_message(chat, format!("⏱ watch failed: {e}")).await;
+                        }
+                        first = false;
                         continue;
                     }
                 };
 
-                // No data yet: tell the user ONCE that it's collecting, then stay
-                // quiet until real data arrives (no silent dead-air, no spam).
-                if out.trim().is_empty() || looks_like_no_data(&out) {
+                let no_data = out.trim().is_empty() || looks_like_no_data(&out);
+
+                if first {
+                    // Immediate tick: heartbeat only (once), never an off-grid summary.
+                    if no_data && !announced_waiting {
+                        announced_waiting = true;
+                        let _ = bot
+                            .send_message(
+                                chat,
+                                format!(
+                                    "⏳ Подписка активна: {}/{} каждые {} мин. Первая сводка — через {} мин.",
+                                    spec.server, spec.tool, spec.interval_min, spec.interval_min
+                                ),
+                            )
+                            .await;
+                    }
+                    first = false;
+                    continue;
+                }
+
+                // No data yet: tell the user ONCE that it's collecting, then stay quiet.
+                if no_data {
                     if !announced_waiting {
                         announced_waiting = true;
                         let _ = bot
                             .send_message(
                                 chat,
                                 format!(
-                                    "⏳ Подписка активна: {}/{} каждые {} мин. \
-                                     Данные ещё собираются — пришлю сводку, как появятся первые замеры.",
-                                    spec.server, spec.tool, spec.interval_min
+                                    "⏳ Данные ещё собираются ({}). Пришлю сводку, как появятся замеры.",
+                                    spec.server
                                 ),
                             )
                             .await;
