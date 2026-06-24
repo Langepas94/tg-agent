@@ -422,17 +422,9 @@ async fn handle_watch(bot: &Bot, chat: ChatId, state: &BotState, args: &str) -> 
             .await?;
         return Ok(());
     }
-    let id = state.alloc_watch_id();
-    let spec = crate::persist::WatchSpec {
-        id,
-        chat_id: chat.0,
-        server: server.clone(),
-        tool: tool.clone(),
-        args: json,
-        interval_min: minutes,
-    };
-    state.add_watch(spec.clone()).await;
-    crate::scheduler::spawn_watch(bot.clone(), state.clone(), spec).await;
+    let id = state
+        .schedule_summary(chat.0, server.clone(), tool.clone(), json, minutes)
+        .await;
     bot.send_message(
         chat,
         format!("✅ watch #{id}: {server}/{tool} every {minutes}m. First result shortly. /unwatch {id} to stop."),

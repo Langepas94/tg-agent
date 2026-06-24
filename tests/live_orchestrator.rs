@@ -81,6 +81,33 @@ async fn orchestrated_turn_uses_profile_and_invariants() {
 
 #[tokio::test]
 #[ignore]
+async fn agent_self_subscribes_on_collect_request() {
+    let (llm, state) = setup().await;
+    // a bot handle is required for start_watch; use a dummy token (no network call
+    // happens because the watch's first tick is one interval away).
+    state.set_bot(teloxide::Bot::new("123:dummy")).await;
+
+    let mut session = ChatSession::new(303);
+    let result = agent::run_turn(
+        &llm,
+        &state,
+        &mut session,
+        "Собирай погоду в Волгограде каждые 2 минуты и присылай мне сводку.",
+    )
+    .await
+    .expect("turn");
+
+    println!("\n=== ANSWER ===\n{}\n", result.answer);
+    let watches = state.list_watches().await;
+    println!("watches registered: {watches:?}");
+    assert!(
+        !watches.is_empty(),
+        "agent did not self-subscribe via schedule_summary"
+    );
+}
+
+#[tokio::test]
+#[ignore]
 async fn travel_flow_pipeline_runs() {
     let (llm, state) = setup().await;
     let session = ChatSession::new(202);

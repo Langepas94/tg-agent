@@ -36,8 +36,11 @@ async fn main() -> Result<()> {
     bot.set_my_commands(bot::Command::bot_commands()).await?;
     info!("Bot commands registered");
 
+    // Store the bot handle so watches/agent meta-tools can post to chats.
+    state.set_bot(bot.clone()).await;
+
     // Restore persisted state: reconnect MCP servers, subscribers, watches.
-    restore_state(&bot, &state).await;
+    restore_state(&state).await;
 
     scheduler::spawn(bot.clone(), cfg.digest_interval_minutes, state.clone());
 
@@ -56,7 +59,7 @@ async fn main() -> Result<()> {
 }
 
 /// Reload persisted state from disk and bring it back to life.
-async fn restore_state(bot: &Bot, state: &state::BotState) {
+async fn restore_state(state: &state::BotState) {
     let saved = persist::load();
     if saved.servers.is_empty() && saved.subscribers.is_empty() && saved.watches.is_empty() {
         return;
@@ -85,5 +88,5 @@ async fn restore_state(bot: &Bot, state: &state::BotState) {
     for spec in saved.watches {
         state.add_watch(spec).await;
     }
-    scheduler::restore_watches(bot, state).await;
+    scheduler::restore_watches(state).await;
 }

@@ -80,15 +80,31 @@ impl Llm {
         self.answer_with_system(state, system, user_text).await
     }
 
-    /// Agentic tool-calling loop with a caller-supplied system prompt
-    /// (used by the orchestrator's layered PromptBuilder output).
+    /// Agentic loop with a caller-supplied system prompt and no chat context
+    /// (no self-scheduling meta-tool).
     pub async fn answer_with_system(
         &self,
         state: &BotState,
         system: &str,
         user_text: &str,
     ) -> Result<String> {
-        let (tool_defs, tool_to_server) = collect_tools(state).await;
+        self.answer_in_chat(state, system, user_text, None).await
+    }
+
+    /// Agentic tool-calling loop. When `chat_id` is set, the agent also gets a
+    /// `schedule_summary` meta-tool so it can subscribe the user to periodic
+    /// updates itself (no separate /watch needed).
+    pub async fn answer_in_chat(
+        &self,
+        state: &BotState,
+        system: &str,
+        user_text: &str,
+        chat_id: Option<i64>,
+    ) -> Result<String> {
+        let (mut tool_defs, tool_to_server) = collect_tools(state).await;
+        if chat_id.is_some() {
+            tool_defs.push(schedule_summary_def());
+        }
 
         let mut messages = vec![
             json!({ "role": "system", "content": system }),
@@ -108,12 +124,16 @@ impl Llm {
                         let args_raw = call["function"]["arguments"].as_str().unwrap_or("{}");
                         let args = parse_args(args_raw);
 
-                        let content = match tool_to_server.get(&name) {
-                            None => format!("error: tool '{name}' is not available"),
-                            Some(server) => match state.call_tool(server, &name, args).await {
-                                Ok(out) => truncate(&out, 6000),
-                                Err(e) => format!("error: {e}"),
-                            },
+                        let content = if name == "schedule_summary" {
+                            handle_schedule_summary(state, chat_id, args_raw).await
+                        } else {
+                            match tool_to_server.get(&name) {
+                                None => format!("error: tool '{name}' is not available"),
+                                Some(server) => match state.call_tool(server, &name, args).await {
+                                    Ok(out) => truncate(&out, 6000),
+                                    Err(e) => format!("error: {e}"),
+                                },
+                            }
                         };
                         messages.push(json!({
                             "role": "tool",
@@ -158,6 +178,58 @@ async fn collect_tools(
         }
     }
     (defs, map)
+}
+
+/// Meta-tool definition: lets the agent subscribe the user to a recurring
+/// summary (it sets up the periodic poll itself).
+fn schedule_summary_def() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "schedule_summary",
+            "description": "Subscribe the user to a RECURRING update: every <minutes> minutes, \
+                call <server>/<tool> with <args> and automatically send the result to the user. \
+                Call this whenever the user asks to be kept posted, to receive data periodically, \
+                or to get a regular summary — so they don't have to ask each time. \
+                For weather collection, first schedule the collection job, then call this with the \
+                summary tool (e.g. get_weather_summary) and the job_id in args.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "server": { "type": "string", "description": "connected MCP server name" },
+                    "tool": { "type": "string", "description": "tool to call each interval" },
+                    "minutes": { "type": "integer", "description": "interval in minutes (>=1)" },
+                    "args": { "type": "object", "description": "JSON arguments for the tool" }
+                },
+                "required": ["server", "tool", "minutes"]
+            }
+        }
+    })
+}
+
+/// Execute the `schedule_summary` meta-tool: register + start a watch.
+async fn handle_schedule_summary(state: &BotState, chat_id: Option<i64>, args_raw: &str) -> String {
+    let Some(chat_id) = chat_id else {
+        return "error: cannot schedule outside a chat".into();
+    };
+    let v: Value = match serde_json::from_str(args_raw) {
+        Ok(v) => v,
+        Err(e) => return format!("error: bad args: {e}"),
+    };
+    let server = v["server"].as_str().unwrap_or("").to_string();
+    let tool = v["tool"].as_str().unwrap_or("").to_string();
+    let minutes = v["minutes"].as_u64().unwrap_or(0);
+    if server.is_empty() || tool.is_empty() || minutes == 0 {
+        return "error: need server, tool, and minutes>=1".into();
+    }
+    if !state.mcp_names().await.iter().any(|n| n == &server) {
+        return format!("error: server '{server}' is not connected");
+    }
+    let args = v.get("args").and_then(|a| a.as_object().cloned());
+    let id = state
+        .schedule_summary(chat_id, server.clone(), tool.clone(), args, minutes)
+        .await;
+    format!("scheduled watch #{id}: {server}/{tool} every {minutes}m (first result shortly)")
 }
 
 fn parse_args(raw: &str) -> Option<rmcp::model::JsonObject> {

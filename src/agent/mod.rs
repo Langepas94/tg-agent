@@ -70,7 +70,9 @@ pub async fn run_turn(
             None,
             feedback,
         );
-        answer = llm.answer_with_system(state, &system, user_text).await?;
+        answer = llm
+            .answer_in_chat(state, &system, user_text, Some(session.chat_id))
+            .await?;
 
         let report = invariants::check(&invariants, &answer);
         status = report.status();
