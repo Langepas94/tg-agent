@@ -47,10 +47,37 @@ pub fn handler_schema() -> UpdateHandler<anyhow::Error> {
         .branch(Update::filter_callback_query().endpoint(handle_callback))
 }
 
-/// Non-command text: everything is driven by commands, so just point to /help.
-async fn handle_text(bot: Bot, msg: Message, _state: BotState) -> anyhow::Result<()> {
-    bot.send_message(msg.chat.id, "Send /help to see commands.")
+/// Non-command text: ask the LLM agent (it uses MCP tools), or point to /help
+/// if no LLM is configured.
+async fn handle_text(bot: Bot, msg: Message, state: BotState) -> anyhow::Result<()> {
+    let chat = msg.chat.id;
+    let text = msg.text().unwrap_or("").trim().to_string();
+    if text.is_empty() {
+        return Ok(());
+    }
+    let Some(llm) = state.llm.clone() else {
+        bot.send_message(
+            chat,
+            "Send /help to see commands. (No LLM configured for free-form questions.)",
+        )
         .await?;
+        return Ok(());
+    };
+
+    bot.send_chat_action(chat, teloxide::types::ChatAction::Typing)
+        .await
+        .ok();
+    match llm.answer(&state, &text).await {
+        Ok(answer) => {
+            for chunk in split_chunks(&answer, 3900) {
+                bot.send_message(chat, chunk).await?;
+            }
+        }
+        Err(e) => {
+            bot.send_message(chat, format!("❌ agent error: {e}"))
+                .await?;
+        }
+    }
     Ok(())
 }
 

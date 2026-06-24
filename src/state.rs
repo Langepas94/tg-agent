@@ -8,6 +8,7 @@ use std::{
 use tokio::{sync::Mutex, task::JoinHandle};
 
 use crate::{
+    llm::Llm,
     mcp_client::{ConnectParams, EventSender, McpClient},
     persist::{self, Persisted, WatchSpec},
 };
@@ -26,10 +27,16 @@ pub struct BotState {
     next_watch_id: Arc<AtomicU64>,
     /// shared event channel for all MCP notifications
     pub events: EventSender,
+    /// optional LLM for natural-language agent answers
+    pub llm: Option<Arc<Llm>>,
 }
 
 impl BotState {
     pub fn new(events: EventSender) -> Self {
+        Self::with_llm(events, None)
+    }
+
+    pub fn with_llm(events: EventSender, llm: Option<Arc<Llm>>) -> Self {
         Self {
             mcps: Arc::new(Mutex::new(HashMap::new())),
             subscribers: Arc::new(Mutex::new(HashSet::new())),
@@ -37,6 +44,7 @@ impl BotState {
             watch_tasks: Arc::new(Mutex::new(HashMap::new())),
             next_watch_id: Arc::new(AtomicU64::new(1)),
             events,
+            llm,
         }
     }
 

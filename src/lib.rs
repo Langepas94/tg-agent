@@ -1,5 +1,6 @@
 pub mod bot;
 pub mod config;
+pub mod llm;
 pub mod mcp_client;
 pub mod persist;
 pub mod scheduler;

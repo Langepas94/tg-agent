@@ -1,6 +1,8 @@
+use std::sync::Arc;
+
 use anyhow::Result;
 use teloxide::{prelude::*, utils::command::BotCommands};
-use tg_agent::{bot, config, persist, scheduler, state};
+use tg_agent::{bot, config, llm::Llm, persist, scheduler, state};
 use tracing::{info, warn};
 
 #[tokio::main]
@@ -18,7 +20,17 @@ async fn main() -> Result<()> {
 
     // Shared event channel for all (runtime-added) MCP servers
     let (tx, _rx) = tokio::sync::broadcast::channel(256);
-    let state = state::BotState::new(tx);
+    let llm = match &cfg.llm {
+        Some(c) => {
+            info!("LLM enabled: {} @ {}", c.model, c.base_url);
+            Some(Arc::new(Llm::new(c.clone())))
+        }
+        None => {
+            warn!("No LLM configured — free-form questions disabled (set DEEPSEEK_API_KEY)");
+            None
+        }
+    };
+    let state = state::BotState::with_llm(tx, llm);
 
     let bot = Bot::new(&cfg.telegram_token);
     bot.set_my_commands(bot::Command::bot_commands()).await?;

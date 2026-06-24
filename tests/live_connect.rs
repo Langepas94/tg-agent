@@ -59,7 +59,11 @@ async fn registry_keeps_connection_across_calls() {
 
     // Separate operation — must still see the server.
     let names = state.mcp_names().await;
-    assert_eq!(names, vec!["weather".to_string()], "registry lost the server!");
+    assert_eq!(
+        names,
+        vec!["weather".to_string()],
+        "registry lost the server!"
+    );
 
     // Persistence must have written the server to disk.
     let saved = tg_agent::persist::load();
@@ -71,7 +75,10 @@ async fn registry_keeps_connection_across_calls() {
     let (tx2, _rx2) = tokio::sync::broadcast::channel(8);
     let restored = tg_agent::state::BotState::new(tx2);
     for params in tg_agent::persist::load().servers {
-        restored.connect_mcp(params).await.expect("reconnect on restart");
+        restored
+            .connect_mcp(params)
+            .await
+            .expect("reconnect on restart");
     }
     assert_eq!(
         restored.mcp_names().await,
