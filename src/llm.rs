@@ -191,8 +191,10 @@ fn schedule_summary_def() -> Value {
                 call <server>/<tool> with <args> and automatically send the result to the user. \
                 Call this whenever the user asks to be kept posted, to receive data periodically, \
                 or to get a regular summary — so they don't have to ask each time. \
-                For weather collection, first schedule the collection job, then call this with the \
-                summary tool (e.g. get_weather_summary) and the job_id in args. \
+                For weather collection, FIRST call the list-jobs tool and REUSE an existing running \
+                job for the same location/variables instead of creating a duplicate; only schedule a \
+                new collection job if none exists. Then call this with the summary tool \
+                (e.g. get_weather_summary) and that job_id in args. \
                 IMPORTANT — keep the cadences consistent: if the summary tool takes an aggregation \
                 window/period argument, set it to MATCH this delivery interval (e.g. minutes=10 → \
                 period covering ~10 minutes), not a longer window, otherwise consecutive summaries \

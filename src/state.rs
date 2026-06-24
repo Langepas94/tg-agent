@@ -205,7 +205,9 @@ impl BotState {
     }
 
     /// Register AND start a periodic summary in one call (used by the agent's
-    /// `schedule_summary` meta-tool and by /watch). Returns the new watch id.
+    /// `schedule_summary` meta-tool and by /watch). Returns the watch id.
+    /// Deduplicates: an identical watch (same chat/server/tool/args) is reused
+    /// rather than creating garbage duplicates.
     pub async fn schedule_summary(
         &self,
         chat_id: i64,
@@ -214,6 +216,11 @@ impl BotState {
         args: Option<rmcp::model::JsonObject>,
         interval_min: u64,
     ) -> u64 {
+        if let Some(existing) = self.watches.lock().await.iter().find(|w| {
+            w.chat_id == chat_id && w.server == server && w.tool == tool && w.args == args
+        }) {
+            return existing.id;
+        }
         let id = self.alloc_watch_id();
         let spec = WatchSpec {
             id,
@@ -226,6 +233,18 @@ impl BotState {
         self.add_watch(spec.clone()).await;
         self.start_watch(spec).await;
         id
+    }
+
+    /// Stop and remove every watch (bot side). Returns how many were removed.
+    /// Does not touch MCP-side cron jobs — those are cancelled via the MCP's
+    /// own cancel tool.
+    pub async fn remove_all_watches(&self) -> usize {
+        let ids: Vec<u64> = self.watches.lock().await.iter().map(|w| w.id).collect();
+        let n = ids.len();
+        for id in ids {
+            self.remove_watch(id).await;
+        }
+        n
     }
 
     pub async fn remove_watch(&self, id: u64) -> bool {
@@ -336,6 +355,34 @@ mod tests {
     async fn remove_missing_watch_false() {
         let s = state();
         assert!(!s.remove_watch(999).await);
+    }
+
+    #[tokio::test]
+    async fn schedule_summary_dedups_identical() {
+        let s = state();
+        let id1 = s
+            .schedule_summary(7, "weather".into(), "get_weather_summary".into(), None, 10)
+            .await;
+        let id2 = s
+            .schedule_summary(7, "weather".into(), "get_weather_summary".into(), None, 10)
+            .await;
+        assert_eq!(id1, id2, "identical watch should be reused");
+        assert_eq!(s.list_watches().await.len(), 1);
+        // different chat → separate watch
+        let id3 = s
+            .schedule_summary(8, "weather".into(), "get_weather_summary".into(), None, 10)
+            .await;
+        assert_ne!(id1, id3);
+        assert_eq!(s.list_watches().await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn remove_all_watches_clears() {
+        let s = state();
+        s.schedule_summary(7, "a".into(), "t".into(), None, 5).await;
+        s.schedule_summary(7, "b".into(), "t".into(), None, 5).await;
+        assert_eq!(s.remove_all_watches().await, 2);
+        assert!(s.list_watches().await.is_empty());
     }
 
     #[test]

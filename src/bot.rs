@@ -26,7 +26,7 @@ pub enum Command {
     Call(String),
     #[command(description = "periodic poll: /watch <server> <tool> <minutes> [json-args]")]
     Watch(String),
-    #[command(description = "stop a watch: /unwatch <id>")]
+    #[command(description = "stop a watch: /unwatch <id> | /unwatch all")]
     Unwatch(String),
     #[command(description = "list active watches")]
     Watches,
@@ -157,19 +157,29 @@ async fn handle_command(
         Command::Watch(args) => {
             handle_watch(&bot, chat, &state, &args).await?;
         }
-        Command::Unwatch(arg) => match arg.trim().parse::<u64>() {
-            Ok(id) if state.remove_watch(id).await => {
-                bot.send_message(chat, format!("✅ watch #{id} stopped."))
+        Command::Unwatch(arg) => {
+            let arg = arg.trim();
+            if arg.eq_ignore_ascii_case("all") {
+                let n = state.remove_all_watches().await;
+                bot.send_message(chat, format!("✅ stopped {n} watch(es)."))
                     .await?;
+            } else {
+                match arg.parse::<u64>() {
+                    Ok(id) if state.remove_watch(id).await => {
+                        bot.send_message(chat, format!("✅ watch #{id} stopped."))
+                            .await?;
+                    }
+                    Ok(id) => {
+                        bot.send_message(chat, format!("No watch #{id}. See /watches."))
+                            .await?;
+                    }
+                    Err(_) => {
+                        bot.send_message(chat, "Usage: /unwatch <id> | /unwatch all")
+                            .await?;
+                    }
+                }
             }
-            Ok(id) => {
-                bot.send_message(chat, format!("No watch #{id}. See /watches."))
-                    .await?;
-            }
-            Err(_) => {
-                bot.send_message(chat, "Usage: /unwatch <id>").await?;
-            }
-        },
+        }
         Command::Watches => {
             let watches = state.list_watches().await;
             if watches.is_empty() {
