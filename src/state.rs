@@ -68,31 +68,55 @@ impl BotState {
         let id = spec.id;
         let state = self.clone();
         let handle = tokio::spawn(async move {
+            let chat = teloxide::types::ChatId(spec.chat_id);
             let mut ticker =
                 tokio::time::interval(Duration::from_secs(spec.interval_min.max(1) * 60));
+            // Consume the immediate first tick — wait one full interval before the
+            // first post so we don't spam "no data yet" before collection runs.
+            ticker.tick().await;
             loop {
                 ticker.tick().await;
-                let chat = teloxide::types::ChatId(spec.chat_id);
-                let text = match state
+                let out = match state
                     .call_tool(&spec.server, &spec.tool, spec.args.clone())
                     .await
                 {
-                    Ok(out) => {
-                        let body = if out.trim().is_empty() {
-                            "(empty)".into()
-                        } else {
-                            out
-                        };
-                        format!("⏱ {} / {}:\n{}", spec.server, spec.tool, body)
+                    Ok(out) => out,
+                    Err(e) => {
+                        let _ = bot.send_message(chat, format!("⏱ watch failed: {e}")).await;
+                        continue;
                     }
-                    Err(e) => format!("⏱ watch {} failed: {e}", spec.tool),
                 };
-                for chunk in chunk_text(&text, 3900) {
+                // Skip noise: empty results or "no data collected yet".
+                if out.trim().is_empty() || looks_like_no_data(&out) {
+                    continue;
+                }
+                // Humanize the raw tool output via the LLM when available.
+                let body = state.humanize_watch(&spec.tool, &out).await;
+                for chunk in chunk_text(&format!("📬 {body}"), 3900) {
                     let _ = bot.send_message(chat, chunk).await;
                 }
             }
         });
         self.watch_tasks.lock().await.insert(id, handle);
+    }
+
+    /// Turn a raw tool result into a short human-readable summary via the LLM.
+    /// Falls back to the raw text when no LLM is configured or the call fails.
+    async fn humanize_watch(&self, tool: &str, raw: &str) -> String {
+        let Some(llm) = &self.llm else {
+            return raw.to_string();
+        };
+        let system = "You format MCP tool results for a Telegram user. \
+            Summarize the data below in the user's language, short and human-readable \
+            (use a few emoji, no JSON, no code blocks). If it is weather data, give \
+            temperature/precip/wind highlights.";
+        match llm
+            .complete(system, &format!("Tool: {tool}\nResult:\n{raw}"))
+            .await
+        {
+            Ok(s) if !s.trim().is_empty() => s,
+            _ => raw.to_string(),
+        }
     }
 
     pub fn alloc_watch_id(&self) -> u64 {
@@ -230,6 +254,15 @@ impl BotState {
     }
 }
 
+/// Heuristic: a tool result that carries no collected data yet (don't spam it).
+fn looks_like_no_data(s: &str) -> bool {
+    let low = s.to_ascii_lowercase();
+    low.contains("no data")
+        || low.contains("\"readings\":0")
+        || low.contains("\"readings\": 0")
+        || low.contains("nothing collected")
+}
+
 /// Split text on line boundaries into chunks under `limit` bytes.
 fn chunk_text(text: &str, limit: usize) -> Vec<String> {
     let mut out = Vec::new();
@@ -286,5 +319,14 @@ mod tests {
     async fn remove_missing_watch_false() {
         let s = state();
         assert!(!s.remove_watch(999).await);
+    }
+
+    #[test]
+    fn no_data_detection() {
+        assert!(looks_like_no_data(
+            r#"{"readings":0,"message":"No data collected yet"}"#
+        ));
+        assert!(looks_like_no_data(r#"{"readings": 0}"#));
+        assert!(!looks_like_no_data(r#"{"readings":3,"avg_temp":21.5}"#));
     }
 }
