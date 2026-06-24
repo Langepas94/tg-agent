@@ -55,6 +55,19 @@ pub fn handler_schema() -> UpdateHandler<anyhow::Error> {
         .branch(Update::filter_callback_query().endpoint(handle_callback))
 }
 
+/// Keep the Telegram "typing…" indicator alive (it expires after ~5s) by
+/// re-sending the chat action every 4s until the returned task is aborted.
+fn spawn_typing(bot: Bot, chat: ChatId) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            let _ = bot
+                .send_chat_action(chat, teloxide::types::ChatAction::Typing)
+                .await;
+            tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+        }
+    })
+}
+
 /// Non-command text: ask the LLM agent (it uses MCP tools), or point to /help
 /// if no LLM is configured.
 async fn handle_text(bot: Bot, msg: Message, state: BotState) -> anyhow::Result<()> {
@@ -72,12 +85,12 @@ async fn handle_text(bot: Bot, msg: Message, state: BotState) -> anyhow::Result<
         return Ok(());
     };
 
-    bot.send_chat_action(chat, teloxide::types::ChatAction::Typing)
-        .await
-        .ok();
+    let typing = spawn_typing(bot.clone(), chat);
 
     let mut session = crate::agent::session::load(chat.0);
-    match crate::agent::run_turn(&llm, &state, &mut session, &text).await {
+    let outcome = crate::agent::run_turn(&llm, &state, &mut session, &text).await;
+    typing.abort();
+    match outcome {
         Ok(result) => {
             if let Err(e) = crate::agent::session::save(&session) {
                 tracing::error!("save session {}: {e}", chat.0);
@@ -285,11 +298,11 @@ async fn handle_trip(bot: &Bot, chat: ChatId, state: &BotState, args: &str) -> a
         .await?;
         return Ok(());
     }
-    bot.send_chat_action(chat, teloxide::types::ChatAction::Typing)
-        .await
-        .ok();
+    let typing = spawn_typing(bot.clone(), chat);
     let session = crate::agent::session::load(chat.0);
-    match crate::agent::flow::run(&llm, state, &session, args).await {
+    let outcome = crate::agent::flow::run(&llm, state, &session, args).await;
+    typing.abort();
+    match outcome {
         Ok(report) => {
             let stages: Vec<String> = report
                 .records
