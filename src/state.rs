@@ -71,9 +71,9 @@ impl BotState {
             let chat = teloxide::types::ChatId(spec.chat_id);
             let mut ticker =
                 tokio::time::interval(Duration::from_secs(spec.interval_min.max(1) * 60));
-            // Consume the immediate first tick — wait one full interval before the
-            // first post so we don't spam "no data yet" before collection runs.
-            ticker.tick().await;
+            // The first tick is immediate, so the very first check gives instant
+            // feedback that the subscription is alive.
+            let mut announced_waiting = false;
             loop {
                 ticker.tick().await;
                 let out = match state
@@ -86,10 +86,27 @@ impl BotState {
                         continue;
                     }
                 };
-                // Skip noise: empty results or "no data collected yet".
+
+                // No data yet: tell the user ONCE that it's collecting, then stay
+                // quiet until real data arrives (no silent dead-air, no spam).
                 if out.trim().is_empty() || looks_like_no_data(&out) {
+                    if !announced_waiting {
+                        announced_waiting = true;
+                        let _ = bot
+                            .send_message(
+                                chat,
+                                format!(
+                                    "⏳ Подписка активна: {}/{} каждые {} мин. \
+                                     Данные ещё собираются — пришлю сводку, как появятся первые замеры.",
+                                    spec.server, spec.tool, spec.interval_min
+                                ),
+                            )
+                            .await;
+                    }
                     continue;
                 }
+
+                announced_waiting = false;
                 // Humanize the raw tool output via the LLM when available.
                 let body = state.humanize_watch(&spec.tool, &out).await;
                 for chunk in chunk_text(&format!("📬 {body}"), 3900) {
