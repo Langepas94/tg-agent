@@ -16,10 +16,10 @@ tokio = { version = "1", features = ["full"] }
 teloxide = { version = "0.12", features = ["macros"] }
 rmcp = { version = "1.8", features = [
     "client",
-    "transport-child-process",
     "transport-streamable-http-client",
     "transport-streamable-http-client-reqwest",
 ] }
+http = "1"
 dotenvy = "0.15"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

@@ -1,89 +1,118 @@
-use anyhow::{bail, Result};
+use anyhow::{Context, Result};
 use rmcp::{
     model::{LoggingMessageNotificationParam, Tool},
     service::{NotificationContext, RoleClient},
+    transport::{
+        streamable_http_client::StreamableHttpClientTransportConfig, StreamableHttpClientTransport,
+    },
     ClientHandler, Peer, ServiceExt,
 };
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 use tokio::sync::{broadcast, Mutex};
 use tracing::{error, info};
 
-use crate::config::McpConfig;
-
 #[derive(Debug, Clone)]
 pub enum McpEvent {
-    ToolsChanged,
-    LogMessage { level: String, data: String },
+    /// Which server's tools changed
+    ToolsChanged { server: String },
+    LogMessage {
+        server: String,
+        level: String,
+        data: String,
+    },
 }
 
 pub type EventSender = broadcast::Sender<McpEvent>;
-pub type EventReceiver = broadcast::Receiver<McpEvent>;
 
-/// Active MCP connection: holds peer handle + cached tool list
+/// User-supplied connection parameters for one MCP server
+#[derive(Debug, Clone)]
+pub struct ConnectParams {
+    pub name: String,
+    pub url: String,
+    /// Bearer token (sent as `Authorization: Bearer <auth>`)
+    pub auth: Option<String>,
+    /// Extra HTTP headers (e.g. X-Tracker-Token: ...)
+    pub headers: Vec<(String, String)>,
+}
+
+/// One live MCP connection
 pub struct McpClient {
-    #[allow(dead_code)]
-    peer: Peer<RoleClient>,
+    pub params: ConnectParams,
     tools: Arc<Mutex<Vec<Tool>>>,
-    /// Keep the JoinHandle alive so the connection doesn't drop
     _task: tokio::task::JoinHandle<()>,
 }
 
 impl McpClient {
-    pub async fn connect(cfg: &McpConfig) -> Result<(Self, EventReceiver)> {
-        let (tx, rx) = broadcast::channel::<McpEvent>(64);
-        match cfg {
-            McpConfig::Http { url } if !url.is_empty() => {
-                Self::connect_http(url, tx, rx).await
-            }
-            McpConfig::Stdio { command, args } => {
-                Self::connect_stdio(command, args, tx, rx).await
-            }
-            McpConfig::Http { .. } => bail!("MCP_HTTP_URL is empty"),
+    /// Connect to an MCP server over Streamable HTTP.
+    /// Shares one broadcast channel across all servers (event carries server name).
+    pub async fn connect(params: ConnectParams, tx: EventSender) -> Result<Self> {
+        info!("Connecting MCP '{}' -> {}", params.name, params.url);
+
+        let mut cfg = StreamableHttpClientTransportConfig::with_uri(params.url.clone());
+        if let Some(a) = &params.auth {
+            cfg = cfg.auth_header(a.clone());
         }
-    }
+        if !params.headers.is_empty() {
+            let mut map = HashMap::new();
+            for (k, v) in &params.headers {
+                let name = http::HeaderName::from_bytes(k.as_bytes())
+                    .with_context(|| format!("invalid header name: {k}"))?;
+                let val = http::HeaderValue::from_str(v)
+                    .with_context(|| format!("invalid header value for {k}"))?;
+                map.insert(name, val);
+            }
+            cfg = cfg.custom_headers(map);
+        }
 
-    async fn connect_http(
-        url: &str,
-        tx: EventSender,
-        rx: EventReceiver,
-    ) -> Result<(Self, EventReceiver)> {
-        use rmcp::transport::StreamableHttpClientTransport;
-
-        info!("Connecting MCP via HTTP: {url}");
-        let transport = StreamableHttpClientTransport::from_uri(url);
-        let svc = NotificationHandler { tx: tx.clone() }.serve(transport).await?;
+        let transport = StreamableHttpClientTransport::from_config(cfg);
+        let handler = NotificationHandler {
+            server: params.name.clone(),
+            tx: tx.clone(),
+        };
+        let svc = handler
+            .serve(transport)
+            .await
+            .context("MCP handshake failed (check URL / auth / headers)")?;
         let peer: Peer<RoleClient> = svc.peer().clone();
 
-        let tools = Arc::new(Mutex::new(list_all_tools(&peer).await?));
-        info!("MCP ready, {} tools", tools.lock().await.len());
+        let tools = peer.list_all_tools().await.context("list_tools failed")?;
+        let n = tools.len();
+        let tools = Arc::new(Mutex::new(tools));
+        info!("MCP '{}' ready, {n} tools", params.name);
 
-        let task = spawn_refresh_task(peer.clone(), tools.clone(), tx);
+        // Keep the service alive + refresh tools on change
+        let task = {
+            let peer = peer.clone();
+            let tools = tools.clone();
+            let server = params.name.clone();
+            let mut rx = tx.subscribe();
+            tokio::spawn(async move {
+                // Hold svc so the connection stays open
+                let _svc = svc;
+                loop {
+                    match rx.recv().await {
+                        Ok(McpEvent::ToolsChanged { server: s }) if s == server => {
+                            match peer.list_all_tools().await {
+                                Ok(t) => {
+                                    info!("'{server}' tools refreshed: {}", t.len());
+                                    *tools.lock().await = t;
+                                }
+                                Err(e) => error!("'{server}' refresh failed: {e}"),
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            })
+        };
 
-        Ok((McpClient { peer, tools, _task: task }, rx))
-    }
-
-    async fn connect_stdio(
-        command: &str,
-        args: &[String],
-        tx: EventSender,
-        rx: EventReceiver,
-    ) -> Result<(Self, EventReceiver)> {
-        use rmcp::transport::TokioChildProcess;
-        use tokio::process::Command;
-
-        info!("Connecting MCP via stdio: {command} {args:?}");
-        let mut cmd = Command::new(command);
-        cmd.args(args);
-        let transport = TokioChildProcess::new(cmd)?;
-        let svc = NotificationHandler { tx: tx.clone() }.serve(transport).await?;
-        let peer: Peer<RoleClient> = svc.peer().clone();
-
-        let tools = Arc::new(Mutex::new(list_all_tools(&peer).await?));
-        info!("MCP stdio ready, {} tools", tools.lock().await.len());
-
-        let task = spawn_refresh_task(peer.clone(), tools.clone(), tx);
-
-        Ok((McpClient { peer, tools, _task: task }, rx))
+        Ok(McpClient {
+            params,
+            tools,
+            _task: task,
+        })
     }
 
     pub async fn tools(&self) -> Vec<Tool> {
@@ -91,66 +120,36 @@ impl McpClient {
     }
 }
 
-/// Fetch all tools (paginated)
-async fn list_all_tools(peer: &Peer<RoleClient>) -> Result<Vec<Tool>> {
-    let result = peer.list_all_tools().await?;
-    Ok(result)
-}
-
-/// Background task: listens to broadcast and refreshes tool list on ToolsChanged
-fn spawn_refresh_task(
-    peer: Peer<RoleClient>,
-    tools: Arc<Mutex<Vec<Tool>>>,
-    tx: EventSender,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut rx = tx.subscribe();
-        loop {
-            match rx.recv().await {
-                Ok(McpEvent::ToolsChanged) => {
-                    match list_all_tools(&peer).await {
-                        Ok(t) => {
-                            let n = t.len();
-                            *tools.lock().await = t;
-                            info!("Tools refreshed: {n}");
-                        }
-                        Err(e) => error!("Refresh tools failed: {e}"),
-                    }
-                }
-                Ok(_) => {}
-                Err(broadcast::error::RecvError::Lagged(n)) => {
-                    tracing::warn!("Event channel lagged: missed {n}");
-                }
-                Err(broadcast::error::RecvError::Closed) => break,
-            }
-        }
-    })
-}
-
-/// rmcp handler that forwards server notifications into our broadcast channel
 struct NotificationHandler {
+    server: String,
     tx: EventSender,
 }
 
 impl ClientHandler for NotificationHandler {
     fn on_tool_list_changed(
         &self,
-        _context: NotificationContext<RoleClient>,
+        _ctx: NotificationContext<RoleClient>,
     ) -> impl std::future::Future<Output = ()> + Send + '_ {
         async move {
-            let _ = self.tx.send(McpEvent::ToolsChanged);
+            let _ = self.tx.send(McpEvent::ToolsChanged {
+                server: self.server.clone(),
+            });
         }
     }
 
     fn on_logging_message(
         &self,
         params: LoggingMessageNotificationParam,
-        _context: NotificationContext<RoleClient>,
+        _ctx: NotificationContext<RoleClient>,
     ) -> impl std::future::Future<Output = ()> + Send + '_ {
         async move {
             let level = format!("{:?}", params.level);
             let data = params.data.as_str().unwrap_or("").to_string();
-            let _ = self.tx.send(McpEvent::LogMessage { level, data });
+            let _ = self.tx.send(McpEvent::LogMessage {
+                server: self.server.clone(),
+                level,
+                data,
+            });
         }
     }
 }
