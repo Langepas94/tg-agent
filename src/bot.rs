@@ -39,18 +39,10 @@ pub fn handler_schema() -> UpdateHandler<anyhow::Error> {
         .branch(Update::filter_callback_query().endpoint(handle_callback))
 }
 
-/// Plain text: if it contains an http(s) URL, connect to it (Inspector-style).
-async fn handle_text(bot: Bot, msg: Message, state: BotState) -> anyhow::Result<()> {
-    let text = msg.text().unwrap_or("").trim();
-    if text.contains("http://") || text.contains("https://") {
-        do_connect(&bot, msg.chat.id, &state, text).await?;
-    } else {
-        bot.send_message(
-            msg.chat.id,
-            "Paste an MCP URL to connect, or send /help for commands.",
-        )
+/// Non-command text: everything is driven by commands, so just point to /help.
+async fn handle_text(bot: Bot, msg: Message, _state: BotState) -> anyhow::Result<()> {
+    bot.send_message(msg.chat.id, "Send /help to see commands.")
         .await?;
-    }
     Ok(())
 }
 
@@ -67,9 +59,9 @@ async fn handle_command(
             bot.send_message(
                 chat,
                 "✅ Subscribed to digests.\n\n\
-                 To connect an MCP server, just paste its URL, or use:\n\
+                 Connect an MCP server:\n\
                  /connect <url> [name=N] [auth=TOKEN] [Header:Value ...]\n\n\
-                 Then browse with the buttons, /mcps and /tools.",
+                 Then /mcps and /tools (or use the buttons).",
             )
             .await?;
         }
@@ -91,7 +83,7 @@ async fn handle_command(
                     send_tools(&bot, chat, &state, &name).await?;
                 }
                 if state.mcp_names().await.is_empty() {
-                    bot.send_message(chat, "No MCP connected. Paste a URL or /connect.")
+                    bot.send_message(chat, "No MCP connected. Use /connect <url>.")
                         .await?;
                 }
             } else {
@@ -171,7 +163,7 @@ async fn do_connect(bot: &Bot, chat: ChatId, state: &BotState, args: &str) -> an
 async fn send_mcp_list(bot: &Bot, chat: ChatId, state: &BotState) -> anyhow::Result<()> {
     let names = state.mcp_names().await;
     if names.is_empty() {
-        bot.send_message(chat, "No MCP servers connected. Paste a URL or /connect.")
+        bot.send_message(chat, "No MCP servers connected. Use /connect <url>.")
             .await?;
         return Ok(());
     }
