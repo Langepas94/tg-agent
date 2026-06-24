@@ -272,6 +272,24 @@ impl BotState {
         n
     }
 
+    /// Remove all watches belonging to one chat (with linked teardown). Scoped
+    /// to the chat so one user can't cancel another's subscriptions.
+    pub async fn remove_watches_for_chat(&self, chat_id: i64) -> usize {
+        let ids: Vec<u64> = self
+            .watches
+            .lock()
+            .await
+            .iter()
+            .filter(|w| w.chat_id == chat_id)
+            .map(|w| w.id)
+            .collect();
+        let n = ids.len();
+        for id in ids {
+            self.remove_watch(id).await;
+        }
+        n
+    }
+
     /// Remove a watch and tear down its linked MCP-side resource (e.g. cancel
     /// the collection cron job) so nothing is orphaned.
     pub async fn remove_watch(&self, id: u64) -> bool {
@@ -439,6 +457,24 @@ mod tests {
             .await;
         assert_ne!(id1, id3);
         assert_eq!(s.list_watches().await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn remove_watches_for_chat_is_scoped() {
+        let s = state();
+        s.schedule_summary(7, "a".into(), "t".into(), None, 5, None)
+            .await;
+        s.schedule_summary(7, "b".into(), "t".into(), None, 5, None)
+            .await;
+        s.schedule_summary(8, "c".into(), "t".into(), None, 5, None)
+            .await;
+        // cancelling chat 7 leaves chat 8's watch intact
+        assert_eq!(s.remove_watches_for_chat(7).await, 2);
+        let left = s.list_watches().await;
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].chat_id, 8);
+        // cancelling again removes nothing
+        assert_eq!(s.remove_watches_for_chat(7).await, 0);
     }
 
     #[tokio::test]

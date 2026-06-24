@@ -104,6 +104,7 @@ impl Llm {
         let (mut tool_defs, tool_to_server) = collect_tools(state).await;
         if chat_id.is_some() {
             tool_defs.push(schedule_summary_def());
+            tool_defs.push(cancel_summary_def());
         }
 
         let mut messages = vec![
@@ -126,6 +127,8 @@ impl Llm {
 
                         let content = if name == "schedule_summary" {
                             handle_schedule_summary(state, chat_id, args_raw).await
+                        } else if name == "cancel_summary" {
+                            handle_cancel_summary(state, chat_id).await
                         } else {
                             match tool_to_server.get(&name) {
                                 None => format!("error: tool '{name}' is not available"),
@@ -219,6 +222,35 @@ fn schedule_summary_def() -> Value {
             }
         }
     })
+}
+
+/// Meta-tool: cancel the user's recurring summary subscription(s).
+fn cancel_summary_def() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "cancel_summary",
+            "description": "Cancel/stop the user's recurring summary subscription(s). \
+                Use this whenever the user asks to unsubscribe, stop receiving updates, \
+                stop the periodic summary, or 'отмени подписку'. This stops the periodic \
+                delivery AND tears down the underlying collection job (no orphans). \
+                After calling it, confirm to the user in their language.",
+            "parameters": { "type": "object", "properties": {} }
+        }
+    })
+}
+
+/// Execute `cancel_summary`: remove all of this chat's watches (with cleanup).
+async fn handle_cancel_summary(state: &BotState, chat_id: Option<i64>) -> String {
+    let Some(chat_id) = chat_id else {
+        return "error: cannot cancel outside a chat".into();
+    };
+    let n = state.remove_watches_for_chat(chat_id).await;
+    if n == 0 {
+        "no active subscriptions to cancel".into()
+    } else {
+        format!("cancelled {n} subscription(s) and their collection jobs")
+    }
 }
 
 /// Execute the `schedule_summary` meta-tool: register + start a watch.

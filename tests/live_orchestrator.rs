@@ -108,6 +108,37 @@ async fn agent_self_subscribes_on_collect_request() {
 
 #[tokio::test]
 #[ignore]
+async fn agent_cancels_subscription_on_request() {
+    let (llm, state) = setup().await;
+    state.set_bot(teloxide::Bot::new("123:dummy")).await;
+
+    // seed a subscription directly
+    state
+        .schedule_summary(
+            404,
+            "weather".into(),
+            "get_weather_summary".into(),
+            None,
+            10,
+            None,
+        )
+        .await;
+    assert_eq!(state.list_watches().await.len(), 1);
+
+    let mut session = ChatSession::new(404);
+    let result = agent::run_turn(&llm, &state, &mut session, "Отмени подписку на погоду.")
+        .await
+        .expect("turn");
+    println!("\n=== ANSWER ===\n{}\n", result.answer);
+
+    assert!(
+        state.list_watches().await.is_empty(),
+        "agent did not cancel the subscription"
+    );
+}
+
+#[tokio::test]
+#[ignore]
 async fn travel_flow_pipeline_runs() {
     let (llm, state) = setup().await;
     let session = ChatSession::new(202);

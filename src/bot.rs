@@ -95,7 +95,16 @@ async fn handle_text(bot: Bot, msg: Message, state: BotState) -> anyhow::Result<
             if let Err(e) = crate::agent::session::save(&session) {
                 tracing::error!("save session {}: {e}", chat.0);
             }
-            for chunk in split_chunks(&result.answer, 3900) {
+            // Never send an empty message (Telegram rejects it -> silent failure).
+            let answer = if result.answer.trim().is_empty() {
+                "✅ Готово.".to_string()
+            } else {
+                result.answer
+            };
+            for chunk in split_chunks(&answer, 3900) {
+                if chunk.trim().is_empty() {
+                    continue;
+                }
                 bot.send_message(chat, chunk).await?;
             }
         }
