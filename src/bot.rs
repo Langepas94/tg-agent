@@ -22,6 +22,8 @@ pub enum Command {
     Mcps,
     #[command(description = "list tools: /tools [server]")]
     Tools(String),
+    #[command(description = "call a tool: /call <server> <tool> [json-args]")]
+    Call(String),
     #[command(description = "disconnect a server: /disconnect <name>")]
     Disconnect(String),
 }
@@ -90,6 +92,9 @@ async fn handle_command(
                 send_tools(&bot, chat, &state, target).await?;
             }
         }
+        Command::Call(args) => {
+            handle_call(&bot, chat, &state, &args).await?;
+        }
         Command::Disconnect(arg) => {
             let name = arg.trim();
             if name.is_empty() {
@@ -155,6 +160,42 @@ async fn do_connect(bot: &Bot, chat: ChatId, state: &BotState, args: &str) -> an
         Err(e) => {
             bot.send_message(chat, format!("❌ Connect '{name}' failed: {e}"))
                 .await?;
+        }
+    }
+    Ok(())
+}
+
+/// `/call <server> <tool> [json-args]`
+async fn handle_call(bot: &Bot, chat: ChatId, state: &BotState, args: &str) -> anyhow::Result<()> {
+    let (server, tool, json) = match parse_call(args) {
+        Ok(t) => t,
+        Err(e) => {
+            bot.send_message(
+                chat,
+                format!(
+                    "❌ {e}\n\nUsage:\n/call <server> <tool> [json-args]\n\n\
+                     Example:\n/call weather geocode {{\"name\":\"Moscow\"}}"
+                ),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+    bot.send_message(chat, format!("⏳ Calling {server}/{tool}…"))
+        .await?;
+    match state.call_tool(&server, &tool, json).await {
+        Ok(text) => {
+            let body = if text.is_empty() {
+                "(empty result)".to_string()
+            } else {
+                text
+            };
+            for chunk in split_chunks(&format!("✅ {tool}:\n{body}"), 3900) {
+                bot.send_message(chat, chunk).await?;
+            }
+        }
+        Err(e) => {
+            bot.send_message(chat, format!("❌ {e}")).await?;
         }
     }
     Ok(())
@@ -261,6 +302,34 @@ fn parse_connect(args: &str) -> Result<ConnectParams, String> {
         auth,
         headers,
     })
+}
+
+/// Parse `/call <server> <tool> [json-args]`.
+/// Returns (server, tool, optional JSON object of arguments).
+#[allow(clippy::type_complexity)]
+fn parse_call(args: &str) -> Result<(String, String, Option<rmcp::model::JsonObject>), String> {
+    let args = args.trim();
+    let mut it = args.splitn(3, char::is_whitespace);
+    let server = it
+        .next()
+        .filter(|s| !s.is_empty())
+        .ok_or("missing <server>")?;
+    let tool = it
+        .next()
+        .filter(|s| !s.is_empty())
+        .ok_or("missing <tool>")?;
+    let json = match it.next().map(str::trim).filter(|s| !s.is_empty()) {
+        None => None,
+        Some(raw) => {
+            let val: serde_json::Value =
+                serde_json::from_str(raw).map_err(|e| format!("bad JSON args: {e}"))?;
+            match val {
+                serde_json::Value::Object(map) => Some(map),
+                _ => return Err("json-args must be an object, e.g. {\"key\":\"value\"}".into()),
+            }
+        }
+    };
+    Ok((server.to_string(), tool.to_string(), json))
 }
 
 /// Derive a short server name from a URL: host[:port], sanitized.
@@ -387,6 +456,36 @@ mod tests {
     #[test]
     fn split_chunks_empty() {
         assert!(split_chunks("", 100).is_empty());
+    }
+
+    #[test]
+    fn parse_call_with_json() {
+        let (s, t, j) = parse_call("weather geocode {\"name\":\"Moscow\"}").unwrap();
+        assert_eq!(s, "weather");
+        assert_eq!(t, "geocode");
+        assert_eq!(j.unwrap().get("name").unwrap(), "Moscow");
+    }
+
+    #[test]
+    fn parse_call_no_args() {
+        let (s, t, j) = parse_call("weather list_jobs").unwrap();
+        assert_eq!((s.as_str(), t.as_str()), ("weather", "list_jobs"));
+        assert!(j.is_none());
+    }
+
+    #[test]
+    fn parse_call_missing_tool() {
+        assert!(parse_call("weather").is_err());
+    }
+
+    #[test]
+    fn parse_call_bad_json() {
+        assert!(parse_call("w t {not json}").is_err());
+    }
+
+    #[test]
+    fn parse_call_non_object_json() {
+        assert!(parse_call("w t [1,2,3]").is_err());
     }
 
     #[test]

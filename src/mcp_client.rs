@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use rmcp::{
-    model::{LoggingMessageNotificationParam, Tool},
+    model::{CallToolRequestParams, JsonObject, LoggingMessageNotificationParam, Tool},
     service::{NotificationContext, RoleClient},
     transport::{
         streamable_http_client::StreamableHttpClientTransportConfig, StreamableHttpClientTransport,
@@ -38,6 +38,7 @@ pub struct ConnectParams {
 /// One live MCP connection
 pub struct McpClient {
     pub params: ConnectParams,
+    peer: Peer<RoleClient>,
     tools: Arc<Mutex<Vec<Tool>>>,
     _task: tokio::task::JoinHandle<()>,
 }
@@ -110,6 +111,7 @@ impl McpClient {
 
         Ok(McpClient {
             params,
+            peer,
             tools,
             _task: task,
         })
@@ -117,6 +119,37 @@ impl McpClient {
 
     pub async fn tools(&self) -> Vec<Tool> {
         self.tools.lock().await.clone()
+    }
+
+    /// Call a tool by name with optional JSON-object arguments.
+    /// Returns the result rendered as plain text (text content + structured JSON).
+    pub async fn call_tool(&self, tool: &str, arguments: Option<JsonObject>) -> Result<String> {
+        let mut params = CallToolRequestParams::new(tool.to_string());
+        if let Some(args) = arguments {
+            params = params.with_arguments(args);
+        }
+        let result = self
+            .peer
+            .call_tool(params)
+            .await
+            .with_context(|| format!("call_tool '{tool}' failed"))?;
+
+        let mut out = String::new();
+        for c in &result.content {
+            if let Some(t) = c.as_text() {
+                out.push_str(&t.text);
+                out.push('\n');
+            }
+        }
+        if let Some(sc) = &result.structured_content {
+            if out.trim().is_empty() {
+                out = serde_json::to_string_pretty(sc).unwrap_or_else(|_| sc.to_string());
+            }
+        }
+        if result.is_error.unwrap_or(false) {
+            anyhow::bail!("tool reported an error:\n{}", out.trim());
+        }
+        Ok(out.trim().to_string())
     }
 }
 

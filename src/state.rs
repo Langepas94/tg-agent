@@ -44,6 +44,20 @@ impl BotState {
         self.mcps.lock().await.remove(name).is_some()
     }
 
+    /// Call a tool on a connected server. Errors if the server is unknown.
+    pub async fn call_tool(
+        &self,
+        server: &str,
+        tool: &str,
+        arguments: Option<rmcp::model::JsonObject>,
+    ) -> anyhow::Result<String> {
+        let guard = self.mcps.lock().await;
+        let client = guard
+            .get(server)
+            .ok_or_else(|| anyhow::anyhow!("unknown server '{server}' — see /mcps"))?;
+        client.call_tool(tool, arguments).await
+    }
+
     pub async fn mcp_names(&self) -> Vec<String> {
         let mut v: Vec<String> = self.mcps.lock().await.keys().cloned().collect();
         v.sort();

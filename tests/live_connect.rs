@@ -23,4 +23,14 @@ async fn connects_and_lists_tools() {
         println!("  - {}", t.name);
     }
     assert!(!tools.is_empty(), "expected at least one tool");
+
+    // Call a real tool and print the result.
+    let mut args = serde_json::Map::new();
+    args.insert("name".into(), serde_json::json!("Moscow"));
+    let out = client
+        .call_tool("geocode", Some(args))
+        .await
+        .expect("geocode call should succeed");
+    println!("geocode(Moscow) ->\n{out}");
+    assert!(!out.is_empty(), "expected a non-empty geocode result");
 }
