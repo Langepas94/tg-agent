@@ -23,6 +23,17 @@ impl Llm {
         }
     }
 
+    /// Single completion with a custom system prompt and no tools.
+    /// Used by staged service agents (planner, fact/profile extractor).
+    pub async fn complete(&self, system: &str, user: &str) -> Result<String> {
+        let messages = vec![
+            json!({ "role": "system", "content": system }),
+            json!({ "role": "user", "content": user }),
+        ];
+        let msg = self.chat(&messages, &[]).await?;
+        Ok(msg["content"].as_str().unwrap_or("").trim().to_string())
+    }
+
     /// One chat-completions round. Returns the assistant `message` object.
     async fn chat(&self, messages: &[Value], tools: &[Value]) -> Result<Value> {
         let mut body = json!({
@@ -59,20 +70,28 @@ impl Llm {
             .context("LLM response missing choices[0].message")
     }
 
-    /// Agentic loop: answer `user_text` in natural language, calling MCP tools
-    /// across all connected servers as needed.
+    /// Agentic loop with a default system prompt.
     pub async fn answer(&self, state: &BotState, user_text: &str) -> Result<String> {
+        let system = "You are a helpful assistant with access to MCP tools. \
+            When a question needs live data, call the appropriate tool(s). \
+            Resolve place names to coordinates with a geocode tool before \
+            weather tools if required. Answer concisely in the user's language. \
+            Never show raw JSON — summarize results in human-readable prose.";
+        self.answer_with_system(state, system, user_text).await
+    }
+
+    /// Agentic tool-calling loop with a caller-supplied system prompt
+    /// (used by the orchestrator's layered PromptBuilder output).
+    pub async fn answer_with_system(
+        &self,
+        state: &BotState,
+        system: &str,
+        user_text: &str,
+    ) -> Result<String> {
         let (tool_defs, tool_to_server) = collect_tools(state).await;
 
         let mut messages = vec![
-            json!({
-                "role": "system",
-                "content": "You are a helpful assistant with access to MCP tools. \
-                    When a question needs live data, call the appropriate tool(s). \
-                    Resolve place names to coordinates with a geocode tool before \
-                    weather tools if required. Answer concisely in the user's language. \
-                    Never show raw JSON — summarize results in human-readable prose."
-            }),
+            json!({ "role": "system", "content": system }),
             json!({ "role": "user", "content": user_text }),
         ];
 

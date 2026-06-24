@@ -32,6 +32,14 @@ pub enum Command {
     Watches,
     #[command(description = "disconnect a server: /disconnect <name>")]
     Disconnect(String),
+    #[command(description = "view/set profile: /profile [key value | clear]")]
+    Profile(String),
+    #[command(description = "show learned facts (layered memory)")]
+    Facts,
+    #[command(description = "travel-weather flow: /trip <cities/dates>")]
+    Trip(String),
+    #[command(description = "reset this chat's memory (keeps long-term)")]
+    Reset,
 }
 
 pub fn handler_schema() -> UpdateHandler<anyhow::Error> {
@@ -67,9 +75,14 @@ async fn handle_text(bot: Bot, msg: Message, state: BotState) -> anyhow::Result<
     bot.send_chat_action(chat, teloxide::types::ChatAction::Typing)
         .await
         .ok();
-    match llm.answer(&state, &text).await {
-        Ok(answer) => {
-            for chunk in split_chunks(&answer, 3900) {
+
+    let mut session = crate::agent::session::load(chat.0);
+    match crate::agent::run_turn(&llm, &state, &mut session, &text).await {
+        Ok(result) => {
+            if let Err(e) = crate::agent::session::save(&session) {
+                tracing::error!("save session {}: {e}", chat.0);
+            }
+            for chunk in split_chunks(&result.answer, 3900) {
                 bot.send_message(chat, chunk).await?;
             }
         }
@@ -171,6 +184,127 @@ async fn handle_command(
                 bot.send_message(chat, format!("No server named '{name}'. See /mcps."))
                     .await?;
             }
+        }
+        Command::Profile(args) => {
+            handle_profile(&bot, chat, &args).await?;
+        }
+        Command::Facts => {
+            handle_facts(&bot, chat).await?;
+        }
+        Command::Trip(args) => {
+            handle_trip(&bot, chat, &state, &args).await?;
+        }
+        Command::Reset => {
+            let mut session = crate::agent::session::load(chat.0);
+            session.memory.reset_for_new_session();
+            let _ = crate::agent::session::save(&session);
+            bot.send_message(chat, "✅ Chat memory reset (long-term facts kept).")
+                .await?;
+        }
+    }
+    Ok(())
+}
+
+/// `/profile` — show; `/profile <key> <value>` — set; `/profile clear`.
+async fn handle_profile(bot: &Bot, chat: ChatId, args: &str) -> anyhow::Result<()> {
+    let mut session = crate::agent::session::load(chat.0);
+    let args = args.trim();
+    if args.is_empty() {
+        let p = &session.profile;
+        if p.is_empty() {
+            bot.send_message(
+                chat,
+                "Profile is empty. Set with: /profile <key> <value>\nKnown keys: home_city, preferred_units, comfort_temp_min, comfort_temp_max, dislikes_rain, interests, language",
+            )
+            .await?;
+        } else {
+            bot.send_message(
+                chat,
+                format!("👤 Profile:\n{}", p.render_lines().join("\n")),
+            )
+            .await?;
+        }
+        return Ok(());
+    }
+    if args.eq_ignore_ascii_case("clear") {
+        session.profile.clear();
+        let _ = crate::agent::session::save(&session);
+        bot.send_message(chat, "✅ Profile cleared.").await?;
+        return Ok(());
+    }
+    let (key, value) = match args.split_once(char::is_whitespace) {
+        Some((k, v)) => (k, v.trim()),
+        None => {
+            bot.send_message(chat, "Usage: /profile <key> <value>  |  /profile clear")
+                .await?;
+            return Ok(());
+        }
+    };
+    session.profile.set(key, value);
+    let _ = crate::agent::session::save(&session);
+    bot.send_message(chat, format!("✅ profile.{key} = {value}"))
+        .await?;
+    Ok(())
+}
+
+/// `/facts` — render the layered memory.
+async fn handle_facts(bot: &Bot, chat: ChatId) -> anyhow::Result<()> {
+    use crate::agent::memory::MemoryLayer;
+    let session = crate::agent::session::load(chat.0);
+    if session.memory.facts.is_empty() {
+        bot.send_message(chat, "No facts learned yet.").await?;
+        return Ok(());
+    }
+    let mut lines = vec!["🧠 Layered memory:".to_string()];
+    for layer in MemoryLayer::ORDERED {
+        let facts = session.memory.facts_in_layer(layer);
+        if facts.is_empty() {
+            continue;
+        }
+        lines.push(format!("\n[{layer}]"));
+        for f in facts {
+            lines.push(format!("• {}: {}", f.key, f.value));
+        }
+    }
+    bot.send_message(chat, lines.join("\n")).await?;
+    Ok(())
+}
+
+/// `/trip` — run the multi-agent travel-weather pipeline.
+async fn handle_trip(bot: &Bot, chat: ChatId, state: &BotState, args: &str) -> anyhow::Result<()> {
+    let Some(llm) = state.llm.clone() else {
+        bot.send_message(chat, "No LLM configured (set DEEPSEEK_API_KEY).")
+            .await?;
+        return Ok(());
+    };
+    if args.trim().is_empty() {
+        bot.send_message(
+            chat,
+            "Usage: /trip <cities and dates>, e.g. /trip Москва и Сочи на выходные",
+        )
+        .await?;
+        return Ok(());
+    }
+    bot.send_chat_action(chat, teloxide::types::ChatAction::Typing)
+        .await
+        .ok();
+    let session = crate::agent::session::load(chat.0);
+    match crate::agent::flow::run(&llm, state, &session, args).await {
+        Ok(report) => {
+            let stages: Vec<String> = report
+                .records
+                .iter()
+                .map(|r| format!("• {:?}: {}", r.stage, r.output))
+                .collect();
+            bot.send_message(chat, format!("🧭 Pipeline:\n{}", stages.join("\n")))
+                .await?;
+            for chunk in split_chunks(&report.answer, 3900) {
+                bot.send_message(chat, chunk).await?;
+            }
+        }
+        Err(e) => {
+            bot.send_message(chat, format!("❌ trip flow error: {e}"))
+                .await?;
         }
     }
     Ok(())

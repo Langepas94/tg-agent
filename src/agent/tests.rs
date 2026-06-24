@@ -1,0 +1,233 @@
+//! Unit tests for the agent runtime: memory layers, profile, invariants,
+//! prompt assembly, and flow plan parsing.
+
+use super::{
+    invariants::{self, Invariant, InvariantCheck, InvariantStatus},
+    memory::{AgentMemory, MemoryLayer, RECENT_WINDOW},
+    profile::UserProfile,
+    prompt,
+    session::ChatSession,
+};
+
+// ---------- memory ----------
+
+#[test]
+fn layer_parse_and_display() {
+    assert_eq!(
+        "long".parse::<MemoryLayer>().unwrap(),
+        MemoryLayer::LongTerm
+    );
+    assert_eq!(
+        "working".parse::<MemoryLayer>().unwrap(),
+        MemoryLayer::Working
+    );
+    assert_eq!(MemoryLayer::ShortTerm.to_string(), "short-term");
+    assert!("nope".parse::<MemoryLayer>().is_err());
+}
+
+#[test]
+fn recent_window_caps() {
+    let mut m = AgentMemory::default();
+    for i in 0..(RECENT_WINDOW + 5) {
+        m.push_message("user", &format!("m{i}"));
+    }
+    assert_eq!(m.recent.len(), RECENT_WINDOW);
+    assert_eq!(
+        m.recent.last().unwrap().1,
+        format!("m{}", RECENT_WINDOW + 4)
+    );
+}
+
+#[test]
+fn upsert_updates_in_place() {
+    let mut m = AgentMemory::default();
+    assert!(m.upsert_fact("home_city", "Volgograd", MemoryLayer::LongTerm));
+    assert!(m.upsert_fact("home_city", "Moscow", MemoryLayer::LongTerm));
+    assert_eq!(m.facts.len(), 1);
+    assert_eq!(m.facts[0].value, "Moscow");
+}
+
+#[test]
+fn sensitive_rejected_from_longterm() {
+    let mut m = AgentMemory::default();
+    assert!(!m.upsert_fact("token", "sk-abcdef1234567890abcdef", MemoryLayer::LongTerm));
+    assert!(m.facts.is_empty());
+    // but allowed in working (non-durable)
+    assert!(m.upsert_fact("tmp", "sk-abcdef1234567890abcdef", MemoryLayer::Working));
+}
+
+#[test]
+fn reset_keeps_longterm_only() {
+    let mut m = AgentMemory::default();
+    m.upsert_fact("home_city", "Volgograd", MemoryLayer::LongTerm);
+    m.upsert_fact("goal", "trip", MemoryLayer::Working);
+    m.push_message("user", "hi");
+    m.reset_for_new_session();
+    assert_eq!(m.facts.len(), 1);
+    assert_eq!(m.facts[0].key, "home_city");
+    assert!(m.recent.is_empty());
+}
+
+#[test]
+fn merge_extracted_json_demotes_shortterm() {
+    let mut m = AgentMemory::default();
+    let json = r#"{"facts":[
+        {"key":"home_city","value":"Volgograd","layer":"long-term"},
+        {"key":"goal","value":"weekend trip","layer":"short-term"}
+    ]}"#;
+    assert_eq!(m.merge_extracted_json(json), 2);
+    assert_eq!(m.facts_in_layer(MemoryLayer::LongTerm).len(), 1);
+    // short-term demoted to working
+    assert_eq!(m.facts_in_layer(MemoryLayer::Working).len(), 1);
+}
+
+#[test]
+fn merge_extracted_json_missing_layer_uses_default() {
+    let mut m = AgentMemory::default();
+    let json = r#"{"facts":[{"key":"interests","value":"hiking"}]}"#;
+    assert_eq!(m.merge_extracted_json(json), 1);
+    assert_eq!(m.facts[0].layer, MemoryLayer::LongTerm);
+}
+
+#[test]
+fn keyword_fallback_extracts_home_city() {
+    let mut m = AgentMemory::default();
+    let n = m.extract_keyword_fallback("Привет, я из Волгоград, какая погода?");
+    assert_eq!(n, 1);
+    assert_eq!(m.facts[0].key, "home_city");
+}
+
+// ---------- profile ----------
+
+#[test]
+fn profile_set_get_clear() {
+    let mut p = UserProfile::default();
+    p.set("home_city", "Volgograd");
+    p.set("language", "ru");
+    assert_eq!(p.fields.len(), 2);
+    p.set("home_city", ""); // empty removes
+    assert_eq!(p.fields.len(), 1);
+    p.clear();
+    assert!(p.is_empty());
+}
+
+#[test]
+fn profile_merge_skips_secrets() {
+    let mut p = UserProfile::default();
+    let json = r#"{"fields":[
+        {"key":"home_city","value":"Volgograd"},
+        {"key":"api","value":"sk-abcdef1234567890abcdef"}
+    ]}"#;
+    let n = p.merge_extracted_json(json);
+    assert_eq!(n, 1);
+    assert!(p.fields.contains_key("home_city"));
+    assert!(!p.fields.contains_key("api"));
+}
+
+// ---------- invariants ----------
+
+#[test]
+fn invariant_number_required() {
+    let inv = vec![Invariant {
+        text: "needs number".into(),
+        check: InvariantCheck::MustContainNumber,
+    }];
+    assert_eq!(
+        invariants::check(&inv, "It is warm").status(),
+        InvariantStatus::Failed
+    );
+    assert_eq!(
+        invariants::check(&inv, "It is 25C").status(),
+        InvariantStatus::Passed
+    );
+}
+
+#[test]
+fn invariant_must_not_contain_secret() {
+    let inv = vec![Invariant {
+        text: "no secrets".into(),
+        check: InvariantCheck::MustNotContain(vec!["sk-".into()]),
+    }];
+    let r = invariants::check(&inv, "key is sk-12345");
+    assert_eq!(r.status(), InvariantStatus::Failed);
+    assert_eq!(r.violations, vec!["no secrets".to_string()]);
+}
+
+#[test]
+fn invariant_empty_answer_passes() {
+    let inv = invariants::travel_weather_defaults();
+    assert_eq!(
+        invariants::check(&inv, "   ").status(),
+        InvariantStatus::Passed
+    );
+}
+
+#[test]
+fn invariant_advisory_is_advisory() {
+    let inv = vec![Invariant {
+        text: "be nice".into(),
+        check: InvariantCheck::Advisory,
+    }];
+    assert_eq!(
+        invariants::check(&inv, "hello 1").status(),
+        InvariantStatus::Advisory
+    );
+}
+
+// ---------- prompt ----------
+
+#[test]
+fn prompt_layers_in_order_and_dedup() {
+    let mut memory = AgentMemory::default();
+    memory.upsert_fact("home_city", "Volgograd", MemoryLayer::LongTerm);
+    memory.upsert_fact("goal", "weekend trip", MemoryLayer::Working);
+    let mut profile = UserProfile::default();
+    profile.set("language", "ru");
+    let inv = invariants::travel_weather_defaults();
+
+    let s = prompt::build_system_prompt(&memory, &profile, &inv, None, None);
+    let long = s.find("[memory:long-term]").unwrap();
+    let prof = s.find("[user-profile]").unwrap();
+    let work = s.find("[memory:working]").unwrap();
+    let invs = s.find("[invariants]").unwrap();
+    assert!(
+        long < prof && prof < work && work < invs,
+        "layer order wrong:\n{s}"
+    );
+}
+
+#[test]
+fn prompt_includes_violation_feedback() {
+    let memory = AgentMemory::default();
+    let profile = UserProfile::default();
+    let s = prompt::build_system_prompt(
+        &memory,
+        &profile,
+        &[],
+        None,
+        Some(&["needs a number".to_string()]),
+    );
+    assert!(s.contains("violated these"));
+    assert!(s.contains("needs a number"));
+}
+
+// ---------- session ----------
+
+#[test]
+fn session_uses_default_invariants_when_empty() {
+    let s = ChatSession::new(1);
+    assert!(s.invariants.is_empty());
+    assert!(!s.effective_invariants().is_empty());
+}
+
+// ---------- flow ----------
+
+#[test]
+fn trip_plan_parses_json() {
+    let plan: super::flow::TripPlan = serde_json::from_str(
+        r#"{"cities":["Москва","Сочи"],"dates":["2026-06-28"],"note":"weekend"}"#,
+    )
+    .unwrap();
+    assert_eq!(plan.cities, vec!["Москва", "Сочи"]);
+    assert_eq!(plan.dates.len(), 1);
+}

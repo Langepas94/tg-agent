@@ -1,0 +1,72 @@
+//! Per-chat agent session: layered memory + user profile + invariants,
+//! persisted to disk (one JSON file per chat under the sessions dir).
+
+use std::path::PathBuf;
+
+use serde::{Deserialize, Serialize};
+
+use super::{invariants::Invariant, memory::AgentMemory, profile::UserProfile};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatSession {
+    pub chat_id: i64,
+    #[serde(default)]
+    pub memory: AgentMemory,
+    #[serde(default)]
+    pub profile: UserProfile,
+    /// Custom invariants; empty → defaults are used at prompt-build time.
+    #[serde(default)]
+    pub invariants: Vec<Invariant>,
+}
+
+impl ChatSession {
+    pub fn new(chat_id: i64) -> Self {
+        Self {
+            chat_id,
+            memory: AgentMemory::default(),
+            profile: UserProfile::default(),
+            invariants: Vec::new(),
+        }
+    }
+
+    /// Effective invariants: custom if set, else the travel-weather defaults.
+    pub fn effective_invariants(&self) -> Vec<Invariant> {
+        if self.invariants.is_empty() {
+            super::invariants::travel_weather_defaults()
+        } else {
+            self.invariants.clone()
+        }
+    }
+}
+
+/// Directory holding per-chat session files: `$SESSIONS_DIR` or `./sessions`.
+pub fn sessions_dir() -> PathBuf {
+    std::env::var("SESSIONS_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("sessions"))
+}
+
+fn session_path(chat_id: i64) -> PathBuf {
+    sessions_dir().join(format!("{chat_id}.json"))
+}
+
+pub fn load(chat_id: i64) -> ChatSession {
+    let path = session_path(chat_id);
+    match std::fs::read_to_string(&path) {
+        Ok(s) => serde_json::from_str(&s).unwrap_or_else(|e| {
+            tracing::warn!("session {chat_id} corrupt ({e}); starting fresh");
+            ChatSession::new(chat_id)
+        }),
+        Err(_) => ChatSession::new(chat_id),
+    }
+}
+
+pub fn save(session: &ChatSession) -> anyhow::Result<()> {
+    let dir = sessions_dir();
+    std::fs::create_dir_all(&dir)?;
+    let path = session_path(session.chat_id);
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_string_pretty(session)?)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(())
+}
