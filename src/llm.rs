@@ -192,7 +192,13 @@ fn schedule_summary_def() -> Value {
                 Call this whenever the user asks to be kept posted, to receive data periodically, \
                 or to get a regular summary — so they don't have to ask each time. \
                 For weather collection, first schedule the collection job, then call this with the \
-                summary tool (e.g. get_weather_summary) and the job_id in args.",
+                summary tool (e.g. get_weather_summary) and the job_id in args. \
+                IMPORTANT — keep the cadences consistent: if the summary tool takes an aggregation \
+                window/period argument, set it to MATCH this delivery interval (e.g. minutes=10 → \
+                period covering ~10 minutes), not a longer window, otherwise consecutive summaries \
+                overlap and repeat. In your confirmation to the user, state all three clearly: how \
+                often data is COLLECTED, how often a SUMMARY is sent, and the window each summary \
+                covers.",
             "parameters": {
                 "type": "object",
                 "properties": {
