@@ -191,15 +191,34 @@ async fn send_tools(bot: &Bot, chat: ChatId, state: &BotState, name: &str) -> an
             }
         }
     };
-    let mut lines = vec![format!("🔧 {name} ({} tools):", tools.len())];
-    for t in &tools {
+    let mut blocks = vec![format!(
+        "🔧 <b>{}</b> — {} tools",
+        html_escape(name),
+        tools.len()
+    )];
+    for (i, t) in tools.iter().enumerate() {
         let desc = t.description.as_deref().unwrap_or("");
-        lines.push(format!("• {} — {desc}", t.name));
+        blocks.push(format!(
+            "<b>{}. {}</b>\n<i>{}</i>",
+            i + 1,
+            html_escape(&t.name),
+            html_escape(desc)
+        ));
     }
-    for chunk in split_chunks(&lines.join("\n"), 4000) {
-        bot.send_message(chat, chunk).await?;
+    // Blank line between blocks; "\n\n" survives split_chunks (line-based).
+    for chunk in split_chunks(&blocks.join("\n\n"), 3500) {
+        bot.send_message(chat, chunk)
+            .parse_mode(teloxide::types::ParseMode::Html)
+            .await?;
     }
     Ok(())
+}
+
+/// Escape the 3 characters Telegram's HTML parse mode treats specially.
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 fn server_keyboard(name: &str) -> InlineKeyboardMarkup {
@@ -368,5 +387,11 @@ mod tests {
     #[test]
     fn split_chunks_empty() {
         assert!(split_chunks("", 100).is_empty());
+    }
+
+    #[test]
+    fn html_escape_specials() {
+        assert_eq!(html_escape("a & b < c > d"), "a &amp; b &lt; c &gt; d");
+        assert_eq!(html_escape("plain"), "plain");
     }
 }
