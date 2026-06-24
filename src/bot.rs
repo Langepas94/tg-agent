@@ -203,3 +203,81 @@ fn split_chunks(text: &str, limit: usize) -> Vec<String> {
     }
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_connect_minimal() {
+        let p = parse_connect("tracker https://host/mcp").unwrap();
+        assert_eq!(p.name, "tracker");
+        assert_eq!(p.url, "https://host/mcp");
+        assert!(p.auth.is_none());
+        assert!(p.headers.is_empty());
+    }
+
+    #[test]
+    fn parse_connect_auth_and_headers() {
+        let p =
+            parse_connect("trk https://h/mcp auth=SECRET X-Tracker-Token:abc X-Tracker-Org-Id:42")
+                .unwrap();
+        assert_eq!(p.auth.as_deref(), Some("SECRET"));
+        assert_eq!(
+            p.headers,
+            vec![
+                ("X-Tracker-Token".to_string(), "abc".to_string()),
+                ("X-Tracker-Org-Id".to_string(), "42".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_connect_header_value_with_colon() {
+        // split_once(':') keeps the rest of the value intact
+        let p = parse_connect("n http://h X-Url:http://a.b/c").unwrap();
+        assert_eq!(
+            p.headers,
+            vec![("X-Url".to_string(), "http://a.b/c".to_string())]
+        );
+    }
+
+    #[test]
+    fn parse_connect_missing_url() {
+        assert!(parse_connect("onlyname").is_err());
+    }
+
+    #[test]
+    fn parse_connect_rejects_bad_scheme() {
+        assert!(parse_connect("n ftp://host").is_err());
+    }
+
+    #[test]
+    fn parse_connect_rejects_bare_token() {
+        assert!(parse_connect("n http://h plainword").is_err());
+    }
+
+    #[test]
+    fn split_chunks_keeps_short_text_single() {
+        let v = split_chunks("a\nb\nc", 4000);
+        assert_eq!(v, vec!["a\nb\nc".to_string()]);
+    }
+
+    #[test]
+    fn split_chunks_splits_on_limit() {
+        let text = "aaaa\nbbbb\ncccc"; // each line 4 chars
+        let v = split_chunks(text, 6); // forces a split per ~line
+        assert!(v.len() > 1);
+        // no chunk exceeds the limit (single lines under limit)
+        for c in &v {
+            assert!(c.len() <= 6, "chunk too long: {c:?}");
+        }
+        // round-trips back to original content
+        assert_eq!(v.join("\n"), text);
+    }
+
+    #[test]
+    fn split_chunks_empty() {
+        assert!(split_chunks("", 100).is_empty());
+    }
+}

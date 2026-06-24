@@ -58,3 +58,36 @@ impl BotState {
         self.subscribers.lock().await.iter().cloned().collect()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn state() -> BotState {
+        let (tx, _rx) = tokio::sync::broadcast::channel(8);
+        BotState::new(tx)
+    }
+
+    #[tokio::test]
+    async fn subscribe_is_idempotent() {
+        let s = state();
+        s.subscribe(42).await;
+        s.subscribe(42).await;
+        s.subscribe(7).await;
+        let mut subs = s.subscribers().await;
+        subs.sort();
+        assert_eq!(subs, vec![7, 42]);
+    }
+
+    #[tokio::test]
+    async fn disconnect_missing_returns_false() {
+        let s = state();
+        assert!(!s.disconnect_mcp("nope").await);
+    }
+
+    #[tokio::test]
+    async fn mcp_names_empty_initially() {
+        let s = state();
+        assert!(s.mcp_names().await.is_empty());
+    }
+}
