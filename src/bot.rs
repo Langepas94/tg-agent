@@ -446,7 +446,7 @@ async fn handle_watch(bot: &Bot, chat: ChatId, state: &BotState, args: &str) -> 
         return Ok(());
     }
     let id = state
-        .schedule_summary(chat.0, server.clone(), tool.clone(), json, minutes)
+        .schedule_summary(chat.0, server.clone(), tool.clone(), json, minutes, None)
         .await;
     bot.send_message(
         chat,

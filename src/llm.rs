@@ -200,14 +200,20 @@ fn schedule_summary_def() -> Value {
                 period covering ~10 minutes), not a longer window, otherwise consecutive summaries \
                 overlap and repeat. In your confirmation to the user, state all three clearly: how \
                 often data is COLLECTED, how often a SUMMARY is sent, and the window each summary \
-                covers.",
+                covers. \
+                If you created (or are reusing) an MCP resource that should be torn down when the \
+                user unsubscribes (e.g. a collection cron job), set cleanup_tool/cleanup_args to the \
+                tool+args that cancel it (e.g. cancel_job with the job_id) so /unwatch removes both \
+                the delivery and the underlying job — no orphans.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "server": { "type": "string", "description": "connected MCP server name" },
                     "tool": { "type": "string", "description": "tool to call each interval" },
                     "minutes": { "type": "integer", "description": "interval in minutes (>=1)" },
-                    "args": { "type": "object", "description": "JSON arguments for the tool" }
+                    "args": { "type": "object", "description": "JSON arguments for the tool" },
+                    "cleanup_tool": { "type": "string", "description": "tool that cancels the underlying job on unsubscribe (optional)" },
+                    "cleanup_args": { "type": "object", "description": "args for cleanup_tool, e.g. {job_id, session_id} (optional)" }
                 },
                 "required": ["server", "tool", "minutes"]
             }
@@ -234,10 +240,24 @@ async fn handle_schedule_summary(state: &BotState, chat_id: Option<i64>, args_ra
         return format!("error: server '{server}' is not connected");
     }
     let args = v.get("args").and_then(|a| a.as_object().cloned());
+    let cleanup = v
+        .get("cleanup_tool")
+        .and_then(|t| t.as_str())
+        .map(|t| crate::persist::Cleanup {
+            tool: t.to_string(),
+            args: v.get("cleanup_args").and_then(|a| a.as_object().cloned()),
+        });
     let id = state
-        .schedule_summary(chat_id, server.clone(), tool.clone(), args, minutes)
+        .schedule_summary(
+            chat_id,
+            server.clone(),
+            tool.clone(),
+            args,
+            minutes,
+            cleanup,
+        )
         .await;
-    format!("scheduled watch #{id}: {server}/{tool} every {minutes}m (first result shortly)")
+    format!("scheduled watch #{id}: {server}/{tool} every {minutes}m (first result shortly; /unwatch {id} stops it and cancels the job)")
 }
 
 fn parse_args(raw: &str) -> Option<rmcp::model::JsonObject> {

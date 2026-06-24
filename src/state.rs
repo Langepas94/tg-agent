@@ -215,6 +215,7 @@ impl BotState {
         tool: String,
         args: Option<rmcp::model::JsonObject>,
         interval_min: u64,
+        cleanup: Option<crate::persist::Cleanup>,
     ) -> u64 {
         if let Some(existing) = self.watches.lock().await.iter().find(|w| {
             w.chat_id == chat_id && w.server == server && w.tool == tool && w.args == args
@@ -229,15 +230,15 @@ impl BotState {
             tool,
             args,
             interval_min: interval_min.max(1),
+            cleanup,
         };
         self.add_watch(spec.clone()).await;
         self.start_watch(spec).await;
         id
     }
 
-    /// Stop and remove every watch (bot side). Returns how many were removed.
-    /// Does not touch MCP-side cron jobs — those are cancelled via the MCP's
-    /// own cancel tool.
+    /// Stop and remove every watch (bot side), tearing down each linked MCP
+    /// resource. Returns how many were removed.
     pub async fn remove_all_watches(&self) -> usize {
         let ids: Vec<u64> = self.watches.lock().await.iter().map(|w| w.id).collect();
         let n = ids.len();
@@ -247,17 +248,36 @@ impl BotState {
         n
     }
 
+    /// Remove a watch and tear down its linked MCP-side resource (e.g. cancel
+    /// the collection cron job) so nothing is orphaned.
     pub async fn remove_watch(&self, id: u64) -> bool {
-        let before = self.watches.lock().await.len();
-        self.watches.lock().await.retain(|w| w.id != id);
-        let removed = self.watches.lock().await.len() != before;
+        // Capture and remove the spec under the lock, then act without it held.
+        let removed_spec = {
+            let mut guard = self.watches.lock().await;
+            if let Some(pos) = guard.iter().position(|w| w.id == id) {
+                Some(guard.remove(pos))
+            } else {
+                None
+            }
+        };
         if let Some(h) = self.watch_tasks.lock().await.remove(&id) {
             h.abort();
         }
-        if removed {
-            self.persist().await;
+        let Some(spec) = removed_spec else {
+            return false;
+        };
+        // Best-effort teardown of the MCP-side resource this watch owned.
+        if let Some(cleanup) = &spec.cleanup {
+            match self
+                .call_tool(&spec.server, &cleanup.tool, cleanup.args.clone())
+                .await
+            {
+                Ok(_) => tracing::info!("watch #{id}: cleaned up {}/{}", spec.server, cleanup.tool),
+                Err(e) => tracing::warn!("watch #{id} cleanup failed: {e}"),
+            }
         }
-        removed
+        self.persist().await;
+        true
     }
 
     pub async fn list_watches(&self) -> Vec<WatchSpec> {
@@ -361,16 +381,37 @@ mod tests {
     async fn schedule_summary_dedups_identical() {
         let s = state();
         let id1 = s
-            .schedule_summary(7, "weather".into(), "get_weather_summary".into(), None, 10)
+            .schedule_summary(
+                7,
+                "weather".into(),
+                "get_weather_summary".into(),
+                None,
+                10,
+                None,
+            )
             .await;
         let id2 = s
-            .schedule_summary(7, "weather".into(), "get_weather_summary".into(), None, 10)
+            .schedule_summary(
+                7,
+                "weather".into(),
+                "get_weather_summary".into(),
+                None,
+                10,
+                None,
+            )
             .await;
         assert_eq!(id1, id2, "identical watch should be reused");
         assert_eq!(s.list_watches().await.len(), 1);
         // different chat → separate watch
         let id3 = s
-            .schedule_summary(8, "weather".into(), "get_weather_summary".into(), None, 10)
+            .schedule_summary(
+                8,
+                "weather".into(),
+                "get_weather_summary".into(),
+                None,
+                10,
+                None,
+            )
             .await;
         assert_ne!(id1, id3);
         assert_eq!(s.list_watches().await.len(), 2);
@@ -379,9 +420,33 @@ mod tests {
     #[tokio::test]
     async fn remove_all_watches_clears() {
         let s = state();
-        s.schedule_summary(7, "a".into(), "t".into(), None, 5).await;
-        s.schedule_summary(7, "b".into(), "t".into(), None, 5).await;
+        s.schedule_summary(7, "a".into(), "t".into(), None, 5, None)
+            .await;
+        s.schedule_summary(7, "b".into(), "t".into(), None, 5, None)
+            .await;
         assert_eq!(s.remove_all_watches().await, 2);
+        assert!(s.list_watches().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn remove_watch_with_cleanup_succeeds_even_if_server_absent() {
+        let s = state();
+        let cleanup = crate::persist::Cleanup {
+            tool: "cancel_job".into(),
+            args: None,
+        };
+        let id = s
+            .schedule_summary(
+                7,
+                "weather".into(),
+                "get_weather_summary".into(),
+                None,
+                10,
+                Some(cleanup),
+            )
+            .await;
+        // cleanup tool call fails (no MCP connected) but removal still succeeds
+        assert!(s.remove_watch(id).await);
         assert!(s.list_watches().await.is_empty());
     }
 

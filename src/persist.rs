@@ -8,8 +8,19 @@ use serde::{Deserialize, Serialize};
 
 use crate::mcp_client::ConnectParams;
 
+/// How to tear down the MCP-side resource a watch depends on (e.g. cancel the
+/// collection cron job). Called on the same `server` when the watch is removed,
+/// making the watch the single owner of its underlying resource's lifecycle.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Cleanup {
+    pub tool: String,
+    #[serde(default)]
+    pub args: Option<JsonObject>,
+}
+
 /// One periodic watch: call `server`/`tool` with `args` every `interval_min`,
-/// posting the result to `chat_id`.
+/// posting the result to `chat_id`. Optionally owns an MCP-side resource that
+/// is torn down via `cleanup` when the watch is removed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WatchSpec {
     pub id: u64,
@@ -19,6 +30,8 @@ pub struct WatchSpec {
     #[serde(default)]
     pub args: Option<JsonObject>,
     pub interval_min: u64,
+    #[serde(default)]
+    pub cleanup: Option<Cleanup>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
