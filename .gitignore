@@ -1,2 +1,4 @@
 target/
 .env
+state.json
+state.json.tmp

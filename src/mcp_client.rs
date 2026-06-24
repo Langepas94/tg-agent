@@ -25,7 +25,7 @@ pub enum McpEvent {
 pub type EventSender = broadcast::Sender<McpEvent>;
 
 /// User-supplied connection parameters for one MCP server
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ConnectParams {
     pub name: String,
     pub url: String,

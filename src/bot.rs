@@ -24,6 +24,12 @@ pub enum Command {
     Tools(String),
     #[command(description = "call a tool: /call <server> <tool> [json-args]")]
     Call(String),
+    #[command(description = "periodic poll: /watch <server> <tool> <minutes> [json-args]")]
+    Watch(String),
+    #[command(description = "stop a watch: /unwatch <id>")]
+    Unwatch(String),
+    #[command(description = "list active watches")]
+    Watches,
     #[command(description = "disconnect a server: /disconnect <name>")]
     Disconnect(String),
 }
@@ -94,6 +100,38 @@ async fn handle_command(
         }
         Command::Call(args) => {
             handle_call(&bot, chat, &state, &args).await?;
+        }
+        Command::Watch(args) => {
+            handle_watch(&bot, chat, &state, &args).await?;
+        }
+        Command::Unwatch(arg) => match arg.trim().parse::<u64>() {
+            Ok(id) if state.remove_watch(id).await => {
+                bot.send_message(chat, format!("✅ watch #{id} stopped."))
+                    .await?;
+            }
+            Ok(id) => {
+                bot.send_message(chat, format!("No watch #{id}. See /watches."))
+                    .await?;
+            }
+            Err(_) => {
+                bot.send_message(chat, "Usage: /unwatch <id>").await?;
+            }
+        },
+        Command::Watches => {
+            let watches = state.list_watches().await;
+            if watches.is_empty() {
+                bot.send_message(chat, "No active watches. Use /watch.")
+                    .await?;
+            } else {
+                let mut lines = vec![format!("Active watches ({}):", watches.len())];
+                for w in &watches {
+                    lines.push(format!(
+                        "#{} — {}/{} every {}m",
+                        w.id, w.server, w.tool, w.interval_min
+                    ));
+                }
+                bot.send_message(chat, lines.join("\n")).await?;
+            }
         }
         Command::Disconnect(arg) => {
             let name = arg.trim();
@@ -198,6 +236,47 @@ async fn handle_call(bot: &Bot, chat: ChatId, state: &BotState, args: &str) -> a
             bot.send_message(chat, format!("❌ {e}")).await?;
         }
     }
+    Ok(())
+}
+
+/// `/watch <server> <tool> <minutes> [json-args]`
+async fn handle_watch(bot: &Bot, chat: ChatId, state: &BotState, args: &str) -> anyhow::Result<()> {
+    let (server, tool, minutes, json) = match parse_watch(args) {
+        Ok(t) => t,
+        Err(e) => {
+            bot.send_message(
+                chat,
+                format!(
+                    "❌ {e}\n\nUsage:\n/watch <server> <tool> <minutes> [json-args]\n\n\
+                     Example:\n/watch weather get_weather_summary 60 {{\"job_id\":\"abc\"}}"
+                ),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+    // Validate the server exists before registering.
+    if !state.mcp_names().await.iter().any(|n| n == &server) {
+        bot.send_message(chat, format!("Unknown server '{server}'. See /mcps."))
+            .await?;
+        return Ok(());
+    }
+    let id = state.alloc_watch_id();
+    let spec = crate::persist::WatchSpec {
+        id,
+        chat_id: chat.0,
+        server: server.clone(),
+        tool: tool.clone(),
+        args: json,
+        interval_min: minutes,
+    };
+    state.add_watch(spec.clone()).await;
+    crate::scheduler::spawn_watch(bot.clone(), state.clone(), spec).await;
+    bot.send_message(
+        chat,
+        format!("✅ watch #{id}: {server}/{tool} every {minutes}m. First result shortly. /unwatch {id} to stop."),
+    )
+    .await?;
     Ok(())
 }
 
@@ -330,6 +409,39 @@ fn parse_call(args: &str) -> Result<(String, String, Option<rmcp::model::JsonObj
         }
     };
     Ok((server.to_string(), tool.to_string(), json))
+}
+
+/// Parse `/watch <server> <tool> <minutes> [json-args]`.
+#[allow(clippy::type_complexity)]
+fn parse_watch(
+    args: &str,
+) -> Result<(String, String, u64, Option<rmcp::model::JsonObject>), String> {
+    let mut it = args.trim().splitn(4, char::is_whitespace);
+    let server = it
+        .next()
+        .filter(|s| !s.is_empty())
+        .ok_or("missing <server>")?;
+    let tool = it
+        .next()
+        .filter(|s| !s.is_empty())
+        .ok_or("missing <tool>")?;
+    let minutes = it
+        .next()
+        .filter(|s| !s.is_empty())
+        .ok_or("missing <minutes>")?
+        .parse::<u64>()
+        .map_err(|_| "minutes must be a positive integer")?;
+    if minutes == 0 {
+        return Err("minutes must be >= 1".into());
+    }
+    let json = match it.next().map(str::trim).filter(|s| !s.is_empty()) {
+        None => None,
+        Some(raw) => match serde_json::from_str(raw).map_err(|e| format!("bad JSON args: {e}"))? {
+            serde_json::Value::Object(map) => Some(map),
+            _ => return Err("json-args must be an object".into()),
+        },
+    };
+    Ok((server.to_string(), tool.to_string(), minutes, json))
 }
 
 /// Derive a short server name from a URL: host[:port], sanitized.
@@ -486,6 +598,36 @@ mod tests {
     #[test]
     fn parse_call_non_object_json() {
         assert!(parse_call("w t [1,2,3]").is_err());
+    }
+
+    #[test]
+    fn parse_watch_full() {
+        let (s, t, m, j) =
+            parse_watch("weather get_weather_summary 60 {\"job_id\":\"x\"}").unwrap();
+        assert_eq!(
+            (s.as_str(), t.as_str(), m),
+            ("weather", "get_weather_summary", 60)
+        );
+        assert_eq!(j.unwrap().get("job_id").unwrap(), "x");
+    }
+
+    #[test]
+    fn parse_watch_no_json() {
+        let (s, t, m, j) = parse_watch("weather list_jobs 30").unwrap();
+        assert_eq!((s.as_str(), t.as_str(), m), ("weather", "list_jobs", 30));
+        assert!(j.is_none());
+    }
+
+    #[test]
+    fn parse_watch_bad_minutes() {
+        assert!(parse_watch("w t notnum").is_err());
+        assert!(parse_watch("w t 0").is_err());
+    }
+
+    #[test]
+    fn parse_watch_missing_parts() {
+        assert!(parse_watch("w").is_err());
+        assert!(parse_watch("w t").is_err());
     }
 
     #[test]
