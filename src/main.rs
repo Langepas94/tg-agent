@@ -42,12 +42,9 @@ async fn main() -> Result<()> {
     // Restore persisted state: reconnect MCP servers, subscribers, watches.
     restore_state(&state).await;
 
-    scheduler::spawn(bot.clone(), cfg.digest_interval_minutes, state.clone());
+    scheduler::spawn(bot.clone(), state.clone());
 
-    info!(
-        "Dispatcher starting, digest every {} min",
-        cfg.digest_interval_minutes
-    );
+    info!("Dispatcher starting");
     Dispatcher::builder(bot, bot::handler_schema())
         .dependencies(dptree::deps![state])
         .enable_ctrlc_handler()
