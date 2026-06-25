@@ -31,6 +31,8 @@ pub struct BotState {
     pub llm: Option<Arc<Llm>>,
     /// bot handle (set at startup) so watches/agent can post to chats
     pub bot: Arc<Mutex<Option<teloxide::Bot>>>,
+    /// durable server-push subscriptions (re-applied on MCP reconnect)
+    pub push_subs: Arc<Mutex<Vec<crate::persist::PushSub>>>,
 }
 
 impl BotState {
@@ -48,6 +50,7 @@ impl BotState {
             events,
             llm,
             bot: Arc::new(Mutex::new(None)),
+            push_subs: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -160,6 +163,12 @@ impl BotState {
         }
     }
 
+    /// Humanize a server-pushed summary payload (reuses the watch formatter).
+    pub async fn humanize_summary(&self, data: &serde_json::Value) -> String {
+        let raw = serde_json::to_string(data).unwrap_or_default();
+        self.humanize_watch("get_weather_summary", &raw).await
+    }
+
     pub fn alloc_watch_id(&self) -> u64 {
         self.next_watch_id.fetch_add(1, Ordering::SeqCst)
     }
@@ -179,9 +188,69 @@ impl BotState {
         }
         let client = McpClient::connect(params, self.events.clone()).await?;
         let count = client.tools().await.len();
-        self.mcps.lock().await.insert(name, client);
+        self.mcps.lock().await.insert(name.clone(), client);
         self.persist().await;
+        // Re-apply durable push subscriptions for this server (survives restarts).
+        self.reapply_push_subs(&name).await;
         Ok(count)
+    }
+
+    /// Re-call subscribe_summaries for every persisted push-sub on `server`.
+    /// The MCP keeps subscriptions in memory keyed by the (new) session, so this
+    /// restores push delivery after a reconnect.
+    async fn reapply_push_subs(&self, server: &str) {
+        let subs: Vec<_> = self
+            .push_subs
+            .lock()
+            .await
+            .iter()
+            .filter(|s| s.server == server)
+            .cloned()
+            .collect();
+        for sub in subs {
+            let mut args = serde_json::Map::new();
+            args.insert("session_id".into(), sub.chat_id.to_string().into());
+            args.insert("period".into(), sub.period.clone().into());
+            if let Err(e) = self
+                .call_tool(server, "subscribe_summaries", Some(args))
+                .await
+            {
+                tracing::warn!("reapply push-sub chat {} on {server}: {e}", sub.chat_id);
+            }
+        }
+    }
+
+    /// Record a durable push subscription (idempotent per chat+server).
+    pub async fn add_push_sub(&self, chat_id: i64, server: String, period: String) {
+        let mut guard = self.push_subs.lock().await;
+        if let Some(s) = guard
+            .iter_mut()
+            .find(|s| s.chat_id == chat_id && s.server == server)
+        {
+            s.period = period;
+        } else {
+            guard.push(crate::persist::PushSub {
+                chat_id,
+                server,
+                period,
+            });
+        }
+        drop(guard);
+        self.persist().await;
+    }
+
+    /// Remove durable push subscriptions for a chat (optionally a single server).
+    pub async fn remove_push_subs(&self, chat_id: i64, server: Option<&str>) -> usize {
+        let mut guard = self.push_subs.lock().await;
+        let before = guard.len();
+        guard
+            .retain(|s| !(s.chat_id == chat_id && server.map(|sv| sv == s.server).unwrap_or(true)));
+        let removed = before - guard.len();
+        drop(guard);
+        if removed > 0 {
+            self.persist().await;
+        }
+        removed
     }
 
     pub async fn disconnect_mcp(&self, name: &str) -> bool {
@@ -335,11 +404,13 @@ impl BotState {
         let mut subscribers: Vec<i64> = self.subscribers.lock().await.iter().cloned().collect();
         subscribers.sort();
         let watches = self.watches.lock().await.clone();
+        let push_subs = self.push_subs.lock().await.clone();
         Persisted {
             servers,
             subscribers,
             watches,
             next_watch_id: self.next_watch_id.load(Ordering::SeqCst),
+            push_subs,
         }
     }
 
@@ -457,6 +528,23 @@ mod tests {
             .await;
         assert_ne!(id1, id3);
         assert_eq!(s.list_watches().await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn push_subs_add_dedup_remove() {
+        let s = state();
+        s.add_push_sub(5, "weather".into(), "1h".into()).await;
+        s.add_push_sub(5, "weather".into(), "6h".into()).await; // same chat+server → update
+        assert_eq!(s.push_subs.lock().await.len(), 1);
+        assert_eq!(s.push_subs.lock().await[0].period, "6h");
+        s.add_push_sub(6, "weather".into(), "1h".into()).await;
+        assert_eq!(s.push_subs.lock().await.len(), 2);
+        // scoped removal
+        assert_eq!(s.remove_push_subs(5, None).await, 1);
+        assert_eq!(s.push_subs.lock().await.len(), 1);
+        assert_eq!(s.remove_push_subs(6, Some("other")).await, 0);
+        assert_eq!(s.remove_push_subs(6, Some("weather")).await, 1);
+        assert!(s.push_subs.lock().await.is_empty());
     }
 
     #[tokio::test]

@@ -27,6 +27,21 @@ pub fn spawn(bot: Bot, state: BotState) {
                 }) => {
                     broadcast(&bot, &state, &format!("📋 {server} [{level}]: {data}")).await;
                 }
+                // Server-pushed summary → route to the owning chat (session_id =
+                // chat_id, injected on the tool call), humanize, deliver.
+                Ok(McpEvent::PushSummary { server: _, data }) => {
+                    let Some(chat_id) = data
+                        .get("session_id")
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| s.parse::<i64>().ok())
+                    else {
+                        continue; // not a chat-scoped session_id; can't route
+                    };
+                    let body = state.humanize_summary(&data).await;
+                    let _ = bot
+                        .send_message(ChatId(chat_id), format!("📬 {body}"))
+                        .await;
+                }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }

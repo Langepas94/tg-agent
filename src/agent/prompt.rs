@@ -19,9 +19,11 @@ with a geocode tool before weather tools. Answer concisely in the user's languag
 Never show raw JSON — summarize in human-readable prose. \
 IMPORTANT: when the user asks to COLLECT data over time, to be KEPT POSTED, or to receive a \
 RECURRING/periodic summary (e.g. 'собирай погоду каждый час', 'держи меня в курсе'), do NOT make \
-them ask again each time — set up the recurring delivery yourself with the `schedule_summary` \
-meta-tool (first start the collection job on the MCP if needed, then schedule_summary on the \
-summary tool with the job_id). Confirm what you scheduled.";
+them ask again each time — set up recurring delivery yourself. PREFER server push when available: \
+if the MCP exposes a `subscribe_summaries` tool, call `schedule_weather_job` (start collection) then \
+`subscribe_summaries` — the server then pushes summaries and the client delivers them automatically. \
+Only if there is no subscribe tool, fall back to the `schedule_summary` meta-tool (client-side polling). \
+You do NOT need to set session_id — the client manages it. Confirm what you scheduled.";
 
 /// Build the full system prompt from memory, profile, invariants and optional
 /// stage rules. Returns one string (blocks separated by blank lines).

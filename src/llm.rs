@@ -102,6 +102,9 @@ impl Llm {
         chat_id: Option<i64>,
     ) -> Result<String> {
         let (mut tool_defs, tool_to_server) = collect_tools(state).await;
+        // Tools that accept a `session_id` param — the bot forces it to the
+        // chat id so jobs are chat-isolated AND server pushes route back here.
+        let session_tools = tools_with_session_param(&tool_defs);
         if chat_id.is_some() {
             tool_defs.push(schedule_summary_def());
             tool_defs.push(cancel_summary_def());
@@ -123,7 +126,13 @@ impl Llm {
                         let id = call["id"].as_str().unwrap_or("").to_string();
                         let name = call["function"]["name"].as_str().unwrap_or("").to_string();
                         let args_raw = call["function"]["arguments"].as_str().unwrap_or("{}");
-                        let args = parse_args(args_raw);
+                        let mut args = parse_args(args_raw);
+
+                        // Force session_id = chat id on session-scoped tools.
+                        if let (Some(cid), true) = (chat_id, session_tools.contains(&name)) {
+                            let map = args.get_or_insert_with(serde_json::Map::new);
+                            map.insert("session_id".into(), cid.to_string().into());
+                        }
 
                         let content = if name == "schedule_summary" {
                             handle_schedule_summary(state, chat_id, args_raw).await
@@ -132,10 +141,27 @@ impl Llm {
                         } else {
                             match tool_to_server.get(&name) {
                                 None => format!("error: tool '{name}' is not available"),
-                                Some(server) => match state.call_tool(server, &name, args).await {
-                                    Ok(out) => truncate(&out, 6000),
-                                    Err(e) => format!("error: {e}"),
-                                },
+                                Some(server) => {
+                                    let period = args
+                                        .as_ref()
+                                        .and_then(|m| m.get("period"))
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("1h")
+                                        .to_string();
+                                    let res = state.call_tool(server, &name, args).await;
+                                    // Record/clear durable push-subs so they survive restarts.
+                                    if let (Some(cid), Ok(_)) = (chat_id, &res) {
+                                        if name == "subscribe_summaries" {
+                                            state.add_push_sub(cid, server.clone(), period).await;
+                                        } else if name == "unsubscribe_summaries" {
+                                            state.remove_push_subs(cid, Some(server)).await;
+                                        }
+                                    }
+                                    match res {
+                                        Ok(out) => truncate(&out, 6000),
+                                        Err(e) => format!("error: {e}"),
+                                    }
+                                }
                             }
                         };
                         messages.push(json!({
@@ -240,16 +266,39 @@ fn cancel_summary_def() -> Value {
     })
 }
 
-/// Execute `cancel_summary`: remove all of this chat's watches (with cleanup).
+/// Execute `cancel_summary`: stop this chat's recurring delivery — both
+/// client-side polling watches (with linked job cleanup) and server-push
+/// subscriptions (unsubscribe on the MCP + drop the durable record).
 async fn handle_cancel_summary(state: &BotState, chat_id: Option<i64>) -> String {
     let Some(chat_id) = chat_id else {
         return "error: cannot cancel outside a chat".into();
     };
-    let n = state.remove_watches_for_chat(chat_id).await;
-    if n == 0 {
+    // 1. polling watches (cancels linked collection jobs via cleanup)
+    let watches = state.remove_watches_for_chat(chat_id).await;
+
+    // 2. server-push subscriptions: tell each MCP to stop pushing, then forget.
+    let servers: Vec<String> = state
+        .push_subs
+        .lock()
+        .await
+        .iter()
+        .filter(|s| s.chat_id == chat_id)
+        .map(|s| s.server.clone())
+        .collect();
+    for server in &servers {
+        let mut args = serde_json::Map::new();
+        args.insert("session_id".into(), chat_id.to_string().into());
+        let _ = state
+            .call_tool(server, "unsubscribe_summaries", Some(args))
+            .await;
+    }
+    let pushes = state.remove_push_subs(chat_id, None).await;
+
+    let total = watches + pushes;
+    if total == 0 {
         "no active subscriptions to cancel".into()
     } else {
-        format!("cancelled {n} subscription(s) and their collection jobs")
+        format!("cancelled {total} subscription(s)")
     }
 }
 
@@ -292,6 +341,21 @@ async fn handle_schedule_summary(state: &BotState, chat_id: Option<i64>, args_ra
     format!("scheduled watch #{id}: {server}/{tool} every {minutes}m (first result shortly; /unwatch {id} stops it and cancels the job)")
 }
 
+/// Names of tools whose input schema declares a `session_id` property.
+fn tools_with_session_param(defs: &[Value]) -> std::collections::HashSet<String> {
+    let mut set = std::collections::HashSet::new();
+    for d in defs {
+        let f = &d["function"];
+        let has = f["parameters"]["properties"].get("session_id").is_some();
+        if has {
+            if let Some(name) = f["name"].as_str() {
+                set.insert(name.to_string());
+            }
+        }
+    }
+    set
+}
+
 fn parse_args(raw: &str) -> Option<rmcp::model::JsonObject> {
     match serde_json::from_str::<Value>(raw) {
         Ok(Value::Object(m)) => Some(m),
@@ -304,5 +368,22 @@ fn truncate(s: &str, max: usize) -> String {
         s.to_string()
     } else {
         format!("{}…(truncated)", &s[..max])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn session_param_detection() {
+        let defs = vec![
+            json!({"function":{"name":"subscribe_summaries","parameters":{"properties":{"session_id":{},"period":{}}}}}),
+            json!({"function":{"name":"geocode","parameters":{"properties":{"name":{}}}}}),
+        ];
+        let set = tools_with_session_param(&defs);
+        assert!(set.contains("subscribe_summaries"));
+        assert!(!set.contains("geocode"));
     }
 }
