@@ -20,6 +20,12 @@ pub enum McpEvent {
         level: String,
         data: String,
     },
+    /// Server-pushed summary (logging notification, logger="weather_summary").
+    /// `data` is the structured summary payload (carries session_id, stats, …).
+    PushSummary {
+        server: String,
+        data: serde_json::Value,
+    },
 }
 
 pub type EventSender = broadcast::Sender<McpEvent>;
@@ -176,8 +182,20 @@ impl ClientHandler for NotificationHandler {
         _ctx: NotificationContext<RoleClient>,
     ) -> impl std::future::Future<Output = ()> + Send + '_ {
         async move {
+            // Structured summary push (server-driven periodic delivery).
+            if params.logger.as_deref() == Some("weather_summary") {
+                let _ = self.tx.send(McpEvent::PushSummary {
+                    server: self.server.clone(),
+                    data: params.data.clone(),
+                });
+                return;
+            }
             let level = format!("{:?}", params.level);
-            let data = params.data.as_str().unwrap_or("").to_string();
+            let data = params
+                .data
+                .as_str()
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| params.data.to_string());
             let _ = self.tx.send(McpEvent::LogMessage {
                 server: self.server.clone(),
                 level,

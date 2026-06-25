@@ -108,6 +108,34 @@ async fn agent_self_subscribes_on_collect_request() {
 
 #[tokio::test]
 #[ignore]
+async fn agent_uses_server_push_and_records_sub() {
+    let (llm, state) = setup().await;
+    state.set_bot(teloxide::Bot::new("123:dummy")).await;
+
+    let mut session = ChatSession::new(505);
+    let result = agent::run_turn(
+        &llm,
+        &state,
+        &mut session,
+        "Собирай погоду в Волгограде и подписывай меня на сводки.",
+    )
+    .await
+    .expect("turn");
+    println!("\n=== ANSWER ===\n{}\n", result.answer);
+
+    // The agent should have used the server-push path → a durable push-sub
+    // recorded for THIS chat (session_id forced to the chat id).
+    let subs = state.push_subs.lock().await.clone();
+    println!("push_subs: {subs:?}");
+    assert!(
+        subs.iter()
+            .any(|s| s.chat_id == 505 && s.server == "weather"),
+        "agent did not subscribe to server push"
+    );
+}
+
+#[tokio::test]
+#[ignore]
 async fn agent_cancels_subscription_on_request() {
     let (llm, state) = setup().await;
     state.set_bot(teloxide::Bot::new("123:dummy")).await;

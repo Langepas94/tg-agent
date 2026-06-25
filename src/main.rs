@@ -58,20 +58,32 @@ async fn main() -> Result<()> {
 /// Reload persisted state from disk and bring it back to life.
 async fn restore_state(state: &state::BotState) {
     let saved = persist::load();
-    if saved.servers.is_empty() && saved.subscribers.is_empty() && saved.watches.is_empty() {
+    if saved.servers.is_empty()
+        && saved.subscribers.is_empty()
+        && saved.watches.is_empty()
+        && saved.push_subs.is_empty()
+    {
         return;
     }
     info!(
-        "Restoring state: {} servers, {} subscribers, {} watches",
+        "Restoring state: {} servers, {} subscribers, {} watches, {} push-subs",
         saved.servers.len(),
         saved.subscribers.len(),
-        saved.watches.len()
+        saved.watches.len(),
+        saved.push_subs.len()
     );
 
     state.set_next_watch_id(saved.next_watch_id);
 
     for id in saved.subscribers {
         state.subscribe(id).await;
+    }
+
+    // Load push-subs BEFORE connecting so reconnect re-applies them.
+    for sub in saved.push_subs {
+        state
+            .add_push_sub(sub.chat_id, sub.server, sub.period)
+            .await;
     }
 
     for params in saved.servers {

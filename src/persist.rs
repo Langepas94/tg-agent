@@ -34,6 +34,21 @@ pub struct WatchSpec {
     pub cleanup: Option<Cleanup>,
 }
 
+/// A durable push subscription: this chat wants server-pushed summaries from
+/// `server`. Re-applied (subscribe_summaries) whenever the MCP reconnects, so
+/// push survives bot/MCP restarts even though the MCP keeps subs in memory.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PushSub {
+    pub chat_id: i64,
+    pub server: String,
+    #[serde(default = "default_period")]
+    pub period: String,
+}
+
+fn default_period() -> String {
+    "1h".to_string()
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Persisted {
     #[serde(default)]
@@ -44,6 +59,8 @@ pub struct Persisted {
     pub watches: Vec<WatchSpec>,
     #[serde(default)]
     pub next_watch_id: u64,
+    #[serde(default)]
+    pub push_subs: Vec<PushSub>,
 }
 
 /// State file location: `$STATE_FILE` or `./state.json`.
