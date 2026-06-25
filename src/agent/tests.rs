@@ -3,7 +3,7 @@
 
 use super::{
     invariants::{self, Invariant, InvariantCheck, InvariantStatus},
-    memory::{AgentMemory, MemoryLayer, RECENT_WINDOW},
+    memory::{AgentMemory, MemoryLayer, MAX_RECENT},
     profile::UserProfile,
     prompt,
     session::ChatSession,
@@ -26,16 +26,31 @@ fn layer_parse_and_display() {
 }
 
 #[test]
-fn recent_window_caps() {
+fn recent_window_caps_at_hard_ceiling() {
+    // push_message now only trims at the hard MAX_RECENT ceiling; trimming to
+    // RECENT_WINDOW is done by budget-aware compaction (which preserves dropped
+    // turns in the summary), so it isn't exercised here.
     let mut m = AgentMemory::default();
-    for i in 0..(RECENT_WINDOW + 5) {
+    let total = MAX_RECENT + 5;
+    for i in 0..total {
         m.push_message("user", &format!("m{i}"));
     }
-    assert_eq!(m.recent.len(), RECENT_WINDOW);
-    assert_eq!(
-        m.recent.last().unwrap().1,
-        format!("m{}", RECENT_WINDOW + 4)
-    );
+    assert_eq!(m.recent.len(), MAX_RECENT);
+    assert_eq!(m.recent.last().unwrap().1, format!("m{}", total - 1));
+}
+
+#[test]
+fn drain_oldest_keeps_tail() {
+    let mut m = AgentMemory::default();
+    for i in 0..6 {
+        m.push_message("user", &format!("m{i}"));
+    }
+    let drained = m.drain_oldest(2);
+    assert_eq!(drained.len(), 4);
+    assert_eq!(m.recent.len(), 2);
+    assert_eq!(m.recent[0].1, "m4");
+    // history_for_answer excludes the trailing (current) message.
+    assert_eq!(m.history_for_answer().len(), 1);
 }
 
 #[test]
@@ -97,6 +112,37 @@ fn keyword_fallback_extracts_home_city() {
     assert_eq!(m.facts[0].key, "home_city");
 }
 
+#[test]
+fn append_summary_merges_and_caps() {
+    let mut m = AgentMemory::default();
+    m.append_summary("first");
+    m.append_summary("second");
+    assert!(m.summary.contains("first") && m.summary.contains("second"));
+    assert!(m.summary.contains("\n\n"));
+    // blank additions are ignored
+    m.append_summary("   ");
+    let before = m.summary.clone();
+    assert_eq!(before, m.summary);
+    // hard cap keeps the tail, never grows unbounded
+    m.append_summary(&"x".repeat(8000));
+    assert!(m.summary.chars().count() <= 4000);
+}
+
+#[test]
+fn history_for_answer_excludes_current_and_empty_safe() {
+    let mut m = AgentMemory::default();
+    assert!(m.history_for_answer().is_empty()); // empty doesn't panic
+    m.push_message("user", "a");
+    // single message = current turn only → no prior history
+    assert!(m.history_for_answer().is_empty());
+    m.push_message("assistant", "b");
+    m.push_message("user", "c");
+    let h = m.history_for_answer();
+    assert_eq!(h.len(), 2);
+    assert_eq!(h[0], ("user", "a"));
+    assert_eq!(h[1], ("assistant", "b"));
+}
+
 // ---------- profile ----------
 
 #[test]
@@ -122,6 +168,35 @@ fn profile_merge_skips_secrets() {
     assert_eq!(n, 1);
     assert!(p.fields.contains_key("home_city"));
     assert!(!p.fields.contains_key("api"));
+}
+
+#[test]
+fn interests_union_merge() {
+    let mut p = UserProfile::default();
+    p.set("interests", "kayaking, basketball");
+    p.set("interests", "Basketball, hiking"); // dup (case-insensitive) dropped
+    assert_eq!(p.fields["interests"], "kayaking, basketball, hiking");
+}
+
+#[test]
+fn inline_markers_apply_and_strip() {
+    let mut p = UserProfile::default();
+    let raw = "В Сочи +24°C, тепло.\n⟦profile:age=80⟧\n⟦profile:interests=байдарки⟧";
+    let n = p.apply_inline_markers(raw);
+    assert_eq!(n, 2);
+    assert_eq!(p.fields["age"], "80");
+    assert_eq!(p.fields["interests"], "байдарки");
+    let clean = super::profile::strip_inline_markers(raw);
+    assert_eq!(clean, "В Сочи +24°C, тепло.");
+    assert!(!clean.contains("profile:"));
+}
+
+#[test]
+fn inline_markers_reject_secrets() {
+    let mut p = UserProfile::default();
+    let n = p.apply_inline_markers("⟦profile:token=sk-abcdef1234567890abcdef⟧");
+    assert_eq!(n, 0);
+    assert!(p.is_empty());
 }
 
 // ---------- invariants ----------
@@ -194,6 +269,37 @@ fn prompt_layers_in_order_and_dedup() {
         long < prof && prof < work && work < invs,
         "layer order wrong:\n{s}"
     );
+}
+
+#[test]
+fn prompt_includes_summary_block_after_longterm() {
+    let mut memory = AgentMemory::default();
+    memory.upsert_fact("home_city", "Sochi", MemoryLayer::LongTerm);
+    memory.append_summary("user planning a kayaking trip");
+    let mut profile = UserProfile::default();
+    profile.set("language", "ru");
+
+    let s = prompt::build_system_prompt(&memory, &profile, &[], None, None);
+    let long = s.find("[memory:long-term]").unwrap();
+    let summ = s.find("[memory:summary]").unwrap();
+    let prof = s.find("[user-profile]").unwrap();
+    assert!(long < summ && summ < prof, "summary misplaced:\n{s}");
+    assert!(s.contains("kayaking trip"));
+}
+
+#[test]
+fn prompt_omits_summary_when_empty() {
+    let memory = AgentMemory::default();
+    let profile = UserProfile::default();
+    let s = prompt::build_system_prompt(&memory, &profile, &[], None, None);
+    assert!(!s.contains("[memory:summary]"));
+}
+
+#[test]
+fn strip_inline_markers_preserves_paragraphs() {
+    let raw = "Первый абзац.\n\nВторой абзац.\n⟦profile:age=80⟧";
+    let clean = super::profile::strip_inline_markers(raw);
+    assert_eq!(clean, "Первый абзац.\n\nВторой абзац.");
 }
 
 #[test]

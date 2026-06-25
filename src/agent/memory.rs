@@ -6,8 +6,13 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Number of recent messages kept as short-term context.
+/// Target number of recent messages kept verbatim as short-term context and
+/// sent with each answer. Older turns are summarized into `summary`, not lost.
 pub const RECENT_WINDOW: usize = 10;
+
+/// Hard safety ceiling on `recent` (compaction normally keeps it at
+/// RECENT_WINDOW; this only bounds paths that skip compaction).
+pub const MAX_RECENT: usize = 40;
 
 pub const FACTS_EXTRACTION_PROMPT: &str = "You maintain the layered local memory of a chat agent. \
 After each user message, extract only DURABLE facts and choose a memory layer for each. \
@@ -123,16 +128,66 @@ pub struct AgentMemory {
     /// Recent messages as (role, text); capped at RECENT_WINDOW.
     #[serde(default)]
     pub recent: Vec<(String, String)>,
+    /// Rolling prose summary of older turns that aged out of `recent` or were
+    /// compacted to stay under the model's context budget. Injected into the
+    /// prompt as `[memory:summary]` so long conversations keep continuity.
+    #[serde(default)]
+    pub summary: String,
 }
 
 impl AgentMemory {
-    /// Push a message into the short-term window, trimming to RECENT_WINDOW.
+    /// Push a message into the short-term window. Trims only at the hard
+    /// safety ceiling (`MAX_RECENT`); normal trimming to `RECENT_WINDOW` is
+    /// done by budget-aware compaction, which preserves dropped turns in the
+    /// rolling summary instead of discarding them.
     pub fn push_message(&mut self, role: &str, text: &str) {
         self.recent.push((role.to_string(), text.to_string()));
-        let overflow = self.recent.len().saturating_sub(RECENT_WINDOW);
+        let overflow = self.recent.len().saturating_sub(MAX_RECENT);
         if overflow > 0 {
             self.recent.drain(0..overflow);
         }
+    }
+
+    /// Recent messages as OpenAI chat objects, excluding the trailing entry
+    /// (the current user message, sent separately by the answering loop).
+    pub fn history_for_answer(&self) -> Vec<(&str, &str)> {
+        let n = self.recent.len();
+        let upto = n.saturating_sub(1);
+        self.recent[..upto]
+            .iter()
+            .map(|(r, t)| (r.as_str(), t.as_str()))
+            .collect()
+    }
+
+    /// Fold an addition into the rolling summary (blank-line separated, kept
+    /// to a sane length so the summary itself never grows unbounded).
+    pub fn append_summary(&mut self, addition: &str) {
+        let addition = addition.trim();
+        if addition.is_empty() {
+            return;
+        }
+        if self.summary.is_empty() {
+            self.summary = addition.to_string();
+        } else {
+            self.summary.push_str("\n\n");
+            self.summary.push_str(addition);
+        }
+        // Hard cap the rolling summary so it can't itself blow the budget.
+        const MAX_SUMMARY_CHARS: usize = 4000;
+        if self.summary.chars().count() > MAX_SUMMARY_CHARS {
+            let start = self.summary.chars().count() - MAX_SUMMARY_CHARS;
+            self.summary = self.summary.chars().skip(start).collect();
+        }
+    }
+
+    /// Remove the oldest messages from `recent`, keeping the last `keep_tail`.
+    /// Returns the drained messages (oldest→newest) for summarization.
+    pub fn drain_oldest(&mut self, keep_tail: usize) -> Vec<(String, String)> {
+        let n = self.recent.len();
+        if n <= keep_tail {
+            return Vec::new();
+        }
+        self.recent.drain(0..n - keep_tail).collect()
     }
 
     /// Upsert a fact, rejecting sensitive values from durable layers.

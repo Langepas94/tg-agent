@@ -23,6 +23,11 @@ impl Llm {
         }
     }
 
+    /// Configured model id (used for context-window budgeting).
+    pub fn model(&self) -> &str {
+        &self.cfg.model
+    }
+
     /// Single completion with a custom system prompt and no tools.
     /// Used by staged service agents (planner, fact/profile extractor).
     pub async fn complete(&self, system: &str, user: &str) -> Result<String> {
@@ -88,7 +93,8 @@ impl Llm {
         system: &str,
         user_text: &str,
     ) -> Result<String> {
-        self.answer_in_chat(state, system, user_text, None).await
+        self.answer_in_chat(state, system, user_text, &[], None)
+            .await
     }
 
     /// Agentic tool-calling loop. When `chat_id` is set, the agent also gets a
@@ -99,6 +105,7 @@ impl Llm {
         state: &BotState,
         system: &str,
         user_text: &str,
+        history: &[(&str, &str)],
         chat_id: Option<i64>,
     ) -> Result<String> {
         let (mut tool_defs, tool_to_server) = collect_tools(state).await;
@@ -110,10 +117,17 @@ impl Llm {
             tool_defs.push(cancel_summary_def());
         }
 
-        let mut messages = vec![
-            json!({ "role": "system", "content": system }),
-            json!({ "role": "user", "content": user_text }),
-        ];
+        let mut messages = vec![json!({ "role": "system", "content": system })];
+        // Prior turns (short-term window) give multi-turn continuity.
+        for (role, text) in history {
+            let role = if *role == "assistant" {
+                "assistant"
+            } else {
+                "user"
+            };
+            messages.push(json!({ "role": role, "content": text }));
+        }
+        messages.push(json!({ "role": "user", "content": user_text }));
 
         for _ in 0..MAX_STEPS {
             let msg = self.chat(&messages, &tool_defs).await?;
