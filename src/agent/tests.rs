@@ -112,6 +112,37 @@ fn keyword_fallback_extracts_home_city() {
     assert_eq!(m.facts[0].key, "home_city");
 }
 
+#[test]
+fn append_summary_merges_and_caps() {
+    let mut m = AgentMemory::default();
+    m.append_summary("first");
+    m.append_summary("second");
+    assert!(m.summary.contains("first") && m.summary.contains("second"));
+    assert!(m.summary.contains("\n\n"));
+    // blank additions are ignored
+    m.append_summary("   ");
+    let before = m.summary.clone();
+    assert_eq!(before, m.summary);
+    // hard cap keeps the tail, never grows unbounded
+    m.append_summary(&"x".repeat(8000));
+    assert!(m.summary.chars().count() <= 4000);
+}
+
+#[test]
+fn history_for_answer_excludes_current_and_empty_safe() {
+    let mut m = AgentMemory::default();
+    assert!(m.history_for_answer().is_empty()); // empty doesn't panic
+    m.push_message("user", "a");
+    // single message = current turn only → no prior history
+    assert!(m.history_for_answer().is_empty());
+    m.push_message("assistant", "b");
+    m.push_message("user", "c");
+    let h = m.history_for_answer();
+    assert_eq!(h.len(), 2);
+    assert_eq!(h[0], ("user", "a"));
+    assert_eq!(h[1], ("assistant", "b"));
+}
+
 // ---------- profile ----------
 
 #[test]
@@ -238,6 +269,37 @@ fn prompt_layers_in_order_and_dedup() {
         long < prof && prof < work && work < invs,
         "layer order wrong:\n{s}"
     );
+}
+
+#[test]
+fn prompt_includes_summary_block_after_longterm() {
+    let mut memory = AgentMemory::default();
+    memory.upsert_fact("home_city", "Sochi", MemoryLayer::LongTerm);
+    memory.append_summary("user planning a kayaking trip");
+    let mut profile = UserProfile::default();
+    profile.set("language", "ru");
+
+    let s = prompt::build_system_prompt(&memory, &profile, &[], None, None);
+    let long = s.find("[memory:long-term]").unwrap();
+    let summ = s.find("[memory:summary]").unwrap();
+    let prof = s.find("[user-profile]").unwrap();
+    assert!(long < summ && summ < prof, "summary misplaced:\n{s}");
+    assert!(s.contains("kayaking trip"));
+}
+
+#[test]
+fn prompt_omits_summary_when_empty() {
+    let memory = AgentMemory::default();
+    let profile = UserProfile::default();
+    let s = prompt::build_system_prompt(&memory, &profile, &[], None, None);
+    assert!(!s.contains("[memory:summary]"));
+}
+
+#[test]
+fn strip_inline_markers_preserves_paragraphs() {
+    let raw = "Первый абзац.\n\nВторой абзац.\n⟦profile:age=80⟧";
+    let clean = super::profile::strip_inline_markers(raw);
+    assert_eq!(clean, "Первый абзац.\n\nВторой абзац.");
 }
 
 #[test]
