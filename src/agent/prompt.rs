@@ -23,7 +23,12 @@ them ask again each time — set up recurring delivery yourself. PREFER server p
 if the MCP exposes a `subscribe_summaries` tool, call `schedule_weather_job` (start collection) then \
 `subscribe_summaries` — the server then pushes summaries and the client delivers them automatically. \
 Only if there is no subscribe tool, fall back to the `schedule_summary` meta-tool (client-side polling). \
-You do NOT need to set session_id — the client manages it. Confirm what you scheduled.";
+You do NOT need to set session_id — the client manages it. Confirm what you scheduled. \
+If during the conversation you learn a STABLE personal trait about the user that will shape future \
+weather/travel questions (home city, language, age, occupation, household, comfort preferences, or \
+hobbies/sports/interests), append it at the very END of your reply, one per line, as \
+⟦profile:key=value⟧ (snake_case key; for hobbies use key `interests`). These markers are stripped \
+before the user sees them — never mention them. Emit none if you learned nothing new.";
 
 /// Build the full system prompt from memory, profile, invariants and optional
 /// stage rules. Returns one string (blocks separated by blank lines).
@@ -46,6 +51,14 @@ pub fn build_system_prompt(
             lines.push(format!("- {}: {}", f.key, f.value));
         }
         blocks.push(lines.join("\n"));
+    }
+
+    // [memory:summary] — compacted older conversation (continuity for long chats)
+    if !memory.summary.trim().is_empty() {
+        blocks.push(format!(
+            "[memory:summary] Summary of earlier conversation:\n{}",
+            memory.summary.trim()
+        ));
     }
 
     // [user-profile] — dedup against long-term values already shown
