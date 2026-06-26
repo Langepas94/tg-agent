@@ -4,10 +4,18 @@
 
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
+use std::time::Duration;
 
 use crate::{config::LlmConfig, state::BotState};
 
-const MAX_STEPS: usize = 6;
+const MAX_STEPS: usize = 12;
+/// Per-tool-result char cap before feeding it back to the model. Sized for a
+/// 7-day hourly forecast (~10–15k chars); `fit_to_context` reclaims the window
+/// if many such results accumulate across the loop.
+const TOOL_RESULT_CAP: usize = 12_000;
+/// Hard ceiling on a single LLM HTTP round. Without this, `reqwest` waits
+/// forever on a stalled connection — the cause of the multi-minute hangs.
+const LLM_TIMEOUT: Duration = Duration::from_secs(90);
 
 #[derive(Clone)]
 pub struct Llm {
@@ -19,7 +27,11 @@ impl Llm {
     pub fn new(cfg: LlmConfig) -> Self {
         Self {
             cfg,
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .timeout(LLM_TIMEOUT)
+                .connect_timeout(Duration::from_secs(10))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
         }
     }
 
@@ -61,7 +73,23 @@ impl Llm {
             .json(&body)
             .send()
             .await
-            .context("LLM request failed")?;
+            .map_err(|e| {
+                // Turn reqwest's opaque error into something a human can act on.
+                let why = if e.is_timeout() {
+                    format!(
+                        "no response from {} within {LLM_TIMEOUT:?} (provider slow or hung)",
+                        self.cfg.base_url
+                    )
+                } else if e.is_connect() {
+                    format!(
+                        "cannot reach LLM at {} (network/DNS/down)",
+                        self.cfg.base_url
+                    )
+                } else {
+                    format!("request to {} failed: {e}", self.cfg.base_url)
+                };
+                anyhow::anyhow!(why)
+            })?;
 
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
@@ -130,6 +158,10 @@ impl Llm {
         messages.push(json!({ "role": "user", "content": user_text }));
 
         for _ in 0..MAX_STEPS {
+            // Keep the growing tool transcript under the model's window. MCP
+            // results (multi-city forecasts) can overflow it mid-loop; clip the
+            // oldest results BEFORE the call so the provider never 400s.
+            fit_to_context(&mut messages, &self.cfg.model);
             let msg = self.chat(&messages, &tool_defs).await?;
 
             let tool_calls = msg.get("tool_calls").and_then(|v| v.as_array()).cloned();
@@ -172,7 +204,7 @@ impl Llm {
                                         }
                                     }
                                     match res {
-                                        Ok(out) => truncate(&out, 6000),
+                                        Ok(out) => truncate(&out, TOOL_RESULT_CAP),
                                         Err(e) => format!("error: {e}"),
                                     }
                                 }
@@ -195,6 +227,48 @@ impl Llm {
             }
         }
         Ok("Stopped after too many tool calls. Try rephrasing.".into())
+    }
+}
+
+/// Clip the running tool-loop transcript back under the model's compaction
+/// threshold. MCP tool results (e.g. multi-city forecasts) can blow the context
+/// window mid-loop; rather than let the provider reject the request with a 400,
+/// we shrink the OLDEST `tool` results first — preserving the system prompt and
+/// the most recent exchange the model is actively reasoning over.
+fn fit_to_context(messages: &mut [Value], model: &str) {
+    use crate::agent::context_budget::{compact_threshold, estimate_tokens};
+
+    let budget = compact_threshold(model);
+    let total = |m: &[Value]| -> usize {
+        m.iter()
+            .map(|v| estimate_tokens(v["content"].as_str().unwrap_or("")))
+            .sum()
+    };
+    if total(messages) <= budget {
+        return;
+    }
+
+    // Never touch the system prompt (index 0) or the last two messages (the
+    // live exchange). Clip from oldest to newest until we fit.
+    const CLIP_CHARS: usize = 400;
+    let last_keep = messages.len().saturating_sub(2);
+    for i in 1..last_keep {
+        if total(messages) <= budget {
+            break;
+        }
+        if messages[i]["role"] != "tool" {
+            continue;
+        }
+        let Some(c) = messages[i]["content"].as_str() else {
+            continue;
+        };
+        if c.chars().count() <= CLIP_CHARS {
+            continue;
+        }
+        // char-safe clip (tool output may be Cyrillic/multi-byte).
+        let head: String = c.chars().take(CLIP_CHARS).collect();
+        messages[i]["content"] =
+            format!("{head}…[older tool result trimmed to fit context]").into();
     }
 }
 
@@ -379,10 +453,15 @@ fn parse_args(raw: &str) -> Option<rmcp::model::JsonObject> {
 
 fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
-        s.to_string()
-    } else {
-        format!("{}…(truncated)", &s[..max])
+        return s.to_string();
     }
+    // char-safe: byte-slicing `&s[..max]` panics if `max` lands mid-codepoint
+    // (Cyrillic city names in tool JSON would hit this). Back off to a boundary.
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…(truncated)", &s[..end])
 }
 
 #[cfg(test)]
@@ -399,5 +478,41 @@ mod tests {
         let set = tools_with_session_param(&defs);
         assert!(set.contains("subscribe_summaries"));
         assert!(!set.contains("geocode"));
+    }
+
+    #[test]
+    fn truncate_is_char_safe_on_multibyte() {
+        // 'ё' is 2 bytes; cutting at an odd byte must not panic.
+        let s = "ёёёёё"; // 10 bytes
+        let out = truncate(s, 5);
+        assert!(out.ends_with("…(truncated)"));
+        assert!(out.starts_with("ёё")); // backed off to a char boundary
+    }
+
+    #[test]
+    fn fit_to_context_clips_oldest_tool_results() {
+        // deepseek window 65_536 → threshold ~52_428 tokens (~157k chars).
+        std::env::remove_var("LLM_CONTEXT_TOKENS");
+        let big = "a".repeat(90_000); // ~30_000 tokens each; 3× overflows badly
+        let mut messages = vec![
+            json!({ "role": "system", "content": "sys" }),
+            json!({ "role": "tool", "tool_call_id": "1", "content": big }),
+            json!({ "role": "tool", "tool_call_id": "2", "content": big }),
+            json!({ "role": "assistant", "content": "thinking" }),
+            json!({ "role": "tool", "tool_call_id": "3", "content": big }),
+        ];
+        fit_to_context(&mut messages, "deepseek-chat");
+
+        // Oldest two tool results clipped...
+        assert!(messages[1]["content"]
+            .as_str()
+            .unwrap()
+            .contains("trimmed to fit context"));
+        assert!(messages[2]["content"]
+            .as_str()
+            .unwrap()
+            .contains("trimmed to fit context"));
+        // ...the freshest tool result (in the protected last-two window) is intact.
+        assert_eq!(messages[4]["content"].as_str().unwrap().len(), 90_000);
     }
 }

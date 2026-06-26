@@ -7,7 +7,7 @@ use rmcp::{
     },
     ClientHandler, Peer, ServiceExt,
 };
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::sync::{broadcast, Mutex};
 use tracing::{error, info};
 
@@ -29,6 +29,10 @@ pub enum McpEvent {
 }
 
 pub type EventSender = broadcast::Sender<McpEvent>;
+
+/// Per-tool-call ceiling. A geocode/forecast that stalls past this errors out
+/// (surfaced to the model as a tool error) instead of hanging the chat turn.
+const TOOL_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// User-supplied connection parameters for one MCP server
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -134,10 +138,11 @@ impl McpClient {
         if let Some(args) = arguments {
             params = params.with_arguments(args);
         }
-        let result = self
-            .peer
-            .call_tool(params)
+        // Bound every tool call — a stalled MCP server must not hang the agent
+        // (and therefore the whole chat turn) indefinitely.
+        let result = tokio::time::timeout(TOOL_TIMEOUT, self.peer.call_tool(params))
             .await
+            .with_context(|| format!("call_tool '{tool}' timed out after {TOOL_TIMEOUT:?}"))?
             .with_context(|| format!("call_tool '{tool}' failed"))?;
 
         let mut out = String::new();
