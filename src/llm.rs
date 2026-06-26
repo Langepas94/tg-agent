@@ -136,14 +136,11 @@ impl Llm {
         history: &[(&str, &str)],
         chat_id: Option<i64>,
     ) -> Result<String> {
-        let (mut tool_defs, tool_map) = collect_tools(state).await;
+        let (mut tool_defs, mut tool_map) = collect_tools(state).await;
         // Tools that accept a `session_id` param — the bot forces it to the
         // chat id so jobs are chat-isolated AND server pushes route back here.
-        let session_tools = tools_with_session_param(&tool_defs);
-        if chat_id.is_some() {
-            tool_defs.push(schedule_summary_def());
-            tool_defs.push(cancel_summary_def());
-        }
+        let mut session_tools = tools_with_session_param(&tool_defs);
+        append_meta_defs(&mut tool_defs, chat_id);
 
         let mut messages = vec![json!({ "role": "system", "content": system })];
         // Prior turns (short-term window) give multi-turn continuity.
@@ -168,6 +165,10 @@ impl Llm {
             match tool_calls {
                 Some(calls) if !calls.is_empty() => {
                     messages.push(msg.clone()); // assistant turn carrying the calls
+                                                // The agent may connect/disconnect servers mid-loop; when it
+                                                // does, the live tool set changes and must be rebuilt before
+                                                // the next model call so new tools become callable at once.
+                    let mut tools_dirty = false;
                     for call in calls {
                         let id = call["id"].as_str().unwrap_or("").to_string();
                         let name = call["function"]["name"].as_str().unwrap_or("").to_string();
@@ -180,7 +181,15 @@ impl Llm {
                             map.insert("session_id".into(), cid.to_string().into());
                         }
 
-                        let content = if name == "schedule_summary" {
+                        let content = if name == "mcp_connect" {
+                            let out = handle_mcp_connect(state, args_raw).await;
+                            tools_dirty |= !out.starts_with("error");
+                            out
+                        } else if name == "mcp_disconnect" {
+                            let out = handle_mcp_disconnect(state, args_raw).await;
+                            tools_dirty |= !out.starts_with("error");
+                            out
+                        } else if name == "schedule_summary" {
                             handle_schedule_summary(state, chat_id, args_raw).await
                         } else if name == "cancel_summary" {
                             handle_cancel_summary(state, chat_id).await
@@ -215,6 +224,14 @@ impl Llm {
                             "tool_call_id": id,
                             "content": content,
                         }));
+                    }
+                    // Rebuild the tool registry if the agent changed connections.
+                    if tools_dirty {
+                        let (d, m) = collect_tools(state).await;
+                        tool_defs = d;
+                        tool_map = m;
+                        session_tools = tools_with_session_param(&tool_defs);
+                        append_meta_defs(&mut tool_defs, chat_id);
                     }
                 }
                 _ => {
@@ -400,6 +417,157 @@ fn cancel_summary_def() -> Value {
     })
 }
 
+/// Append the always-available meta-tools (connect/disconnect MCP servers) and,
+/// when running inside a chat, the recurring-summary meta-tools.
+fn append_meta_defs(tool_defs: &mut Vec<Value>, chat_id: Option<i64>) {
+    tool_defs.push(mcp_connect_def());
+    tool_defs.push(mcp_disconnect_def());
+    if chat_id.is_some() {
+        tool_defs.push(schedule_summary_def());
+        tool_defs.push(cancel_summary_def());
+    }
+}
+
+/// Meta-tool: let the agent connect to ANY MCP server on demand. The agent
+/// supplies the launch spec itself — for popular servers it knows the `npx`/
+/// `uvx` command from training; for HTTP servers it gives the URL. Credentials
+/// are NOT hardcoded: when a server needs a token/key, the agent should ask the
+/// user in chat and pass the value here via `auth`/`headers`/`env`.
+fn mcp_connect_def() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "mcp_connect",
+            "description": "Connect to an MCP server so its tools become available. Use this whenever \
+                fulfilling the request needs a capability no currently-connected server provides \
+                (e.g. the user asks to add a calendar event, send mail, read files) — connect the \
+                right server, then call its tools. Pick the transport: \
+                'http' for a remote Streamable-HTTP endpoint (give `url`); \
+                'stdio' to launch a local server process (give `command` as an argv array, e.g. \
+                [\"npx\",\"-y\",\"@cocal/google-calendar-mcp\"] or [\"uvx\",\"some-mcp\"]). \
+                For well-known servers supply the standard command from your own knowledge. \
+                If the server needs credentials, FIRST ask the user for them in chat, then pass them \
+                via `auth` (bearer token), `headers` (HTTP servers), or `env` (stdio servers). \
+                Never invent secrets. After connecting, the new tools are immediately callable.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "short server alias (optional; derived if omitted)" },
+                    "transport": { "type": "string", "enum": ["http", "stdio"], "description": "connection type" },
+                    "url": { "type": "string", "description": "http(s):// endpoint (transport=http)" },
+                    "auth": { "type": "string", "description": "bearer token, sent as Authorization: Bearer … (optional)" },
+                    "headers": { "type": "object", "description": "extra HTTP headers, e.g. {\"X-Api-Key\":\"…\"} (http, optional)" },
+                    "command": { "type": "array", "items": { "type": "string" }, "description": "argv to spawn (transport=stdio), e.g. [\"npx\",\"-y\",\"<pkg>\"]" },
+                    "env": { "type": "object", "description": "environment variables for the spawned process (stdio, optional)" }
+                },
+                "required": ["transport"]
+            }
+        }
+    })
+}
+
+/// Meta-tool: disconnect a server the agent (or user) connected.
+fn mcp_disconnect_def() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "mcp_disconnect",
+            "description": "Disconnect a connected MCP server by its name (frees it / removes its \
+                tools). Use when the user asks to remove a server or it is no longer needed.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "the connected server's name" }
+                },
+                "required": ["name"]
+            }
+        }
+    })
+}
+
+/// Execute `mcp_connect`: build [`ConnectParams`] from the agent's args and open
+/// the connection. Returns a token-free status line (never echoes secrets).
+async fn handle_mcp_connect(state: &BotState, args_raw: &str) -> String {
+    use crate::mcp_client::ConnectParams;
+    let v: Value = match serde_json::from_str(args_raw) {
+        Ok(v) => v,
+        Err(e) => return format!("error: bad args: {e}"),
+    };
+
+    let obj_pairs = |val: Option<&Value>| -> Vec<(String, String)> {
+        val.and_then(|h| h.as_object())
+            .map(|m| {
+                m.iter()
+                    .map(|(k, v)| {
+                        let s = v
+                            .as_str()
+                            .map(str::to_string)
+                            .unwrap_or_else(|| v.to_string());
+                        (k.clone(), s)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+
+    let transport = v["transport"].as_str().unwrap_or("").to_lowercase();
+    let url = v["url"].as_str().unwrap_or("").to_string();
+    let command: Vec<String> = v["command"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // Infer transport if the model omitted/mismatched it.
+    let is_stdio = transport == "stdio" || (transport.is_empty() && !command.is_empty());
+    if is_stdio && command.is_empty() {
+        return "error: stdio transport needs a non-empty command array".into();
+    }
+    if !is_stdio && url.is_empty() {
+        return "error: http transport needs a url".into();
+    }
+
+    let name = match v["name"].as_str().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(n) => n.to_string(),
+        None if is_stdio => crate::bot::default_stdio_name(&command),
+        None => crate::bot::default_name(&url),
+    };
+
+    let params = ConnectParams {
+        name: name.clone(),
+        url,
+        auth: v["auth"].as_str().map(str::to_string),
+        headers: obj_pairs(v.get("headers")),
+        command,
+        env: obj_pairs(v.get("env")),
+    };
+
+    match state.connect_mcp(params).await {
+        Ok(n) => format!("connected '{name}' — {n} tools now available"),
+        Err(e) => format!("error: connect '{name}' failed: {e}"),
+    }
+}
+
+/// Execute `mcp_disconnect`.
+async fn handle_mcp_disconnect(state: &BotState, args_raw: &str) -> String {
+    let v: Value = match serde_json::from_str(args_raw) {
+        Ok(v) => v,
+        Err(e) => return format!("error: bad args: {e}"),
+    };
+    let name = v["name"].as_str().unwrap_or("").trim().to_string();
+    if name.is_empty() {
+        return "error: need the server name".into();
+    }
+    if state.disconnect_mcp(&name).await {
+        format!("disconnected '{name}'")
+    } else {
+        format!("error: no connected server named '{name}'")
+    }
+}
+
 /// Execute `cancel_summary`: stop this chat's recurring delivery — both
 /// client-side polling watches (with linked job cleanup) and server-push
 /// subscriptions (unsubscribe on the MCP + drop the durable record).
@@ -527,6 +695,42 @@ mod tests {
             unique_exposed_name("acme.io srv", "search", &taken),
             "acme_io_srv__search"
         );
+    }
+
+    fn tool_names(defs: &[Value]) -> Vec<String> {
+        defs.iter()
+            .filter_map(|d| d["function"]["name"].as_str().map(str::to_string))
+            .collect()
+    }
+
+    #[test]
+    fn meta_defs_always_include_connect_disconnect() {
+        let mut defs = Vec::new();
+        append_meta_defs(&mut defs, None);
+        let names = tool_names(&defs);
+        assert!(names.contains(&"mcp_connect".to_string()));
+        assert!(names.contains(&"mcp_disconnect".to_string()));
+        // outside a chat, no recurring-summary meta-tools
+        assert!(!names.contains(&"schedule_summary".to_string()));
+    }
+
+    #[test]
+    fn meta_defs_add_summary_tools_in_chat() {
+        let mut defs = Vec::new();
+        append_meta_defs(&mut defs, Some(42));
+        let names = tool_names(&defs);
+        assert!(names.contains(&"mcp_connect".to_string()));
+        assert!(names.contains(&"schedule_summary".to_string()));
+        assert!(names.contains(&"cancel_summary".to_string()));
+    }
+
+    #[test]
+    fn mcp_connect_def_requires_transport() {
+        let def = mcp_connect_def();
+        let required = def["function"]["parameters"]["required"]
+            .as_array()
+            .unwrap();
+        assert!(required.iter().any(|v| v == "transport"));
     }
 
     #[test]
