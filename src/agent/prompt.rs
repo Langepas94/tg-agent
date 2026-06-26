@@ -36,6 +36,30 @@ hobbies/sports/interests), append it at the very END of your reply, one per line
 ⟦profile:key=value⟧ (snake_case key; for hobbies use key `interests`). These markers are stripped \
 before the user sees them — never mention them. Emit none if you learned nothing new.";
 
+/// Always-on capability block: how to run a multi-server "plan an outdoor trip
+/// and let me share it" flow. These are product constants (file formats, step
+/// order), NOT user-configurable — the user states a goal in plain language and
+/// the agent orchestrates the tools across servers itself.
+pub const TRIP_FLOW: &str =
+    "[capability:trip-planning] When the user wants to plan an outdoor activity/trip and pick the \
+best option by weather (e.g. 'where should we kayak/hike this weekend', 'plan it and let me share \
+with friends'), drive the whole flow yourself — the user will NOT name tools, fields, dates or file \
+formats; infer them. Steps, in this order: \
+(1) Resolve each candidate place to coordinates and compare weather over the relevant dates using \
+the weather server; pick the best place and day for the activity (consider temperature, wind, rain, \
+daylight). State your pick and why, briefly. \
+(2) Write the trip plan as a MARKDOWN file via the filesystem server (e.g. `kayak-plan.md`): place, \
+date, weather summary, daylight window, a short gear checklist. The .md FILE uses normal Markdown — \
+this is a saved artifact and the file-format rule above (plain text) applies ONLY to chat messages, \
+not to files you write. \
+(3) Offer a reminder: create a calendar event for the chosen day and place via the calendar server, \
+and give the user the event link. \
+(4) Produce a shareable invite as an `.ics` file so the user can forward it to friends, and deliver \
+it to the user as a document via the messaging server. \
+Adapt to whichever servers are actually connected; if one (filesystem/calendar/messaging) is missing, \
+do the steps you can and tell the user which server to connect for the rest. Keep the chat reply a \
+short plain-text summary; the files are the shareable output.";
+
 /// Build the full system prompt from memory, profile, invariants and optional
 /// stage rules. Returns one string (blocks separated by blank lines).
 pub fn build_system_prompt(
@@ -45,7 +69,7 @@ pub fn build_system_prompt(
     stage_rules: Option<&str>,
     violation_feedback: Option<&[String]>,
 ) -> String {
-    let mut blocks: Vec<String> = vec![BASE_SYSTEM.to_string()];
+    let mut blocks: Vec<String> = vec![BASE_SYSTEM.to_string(), TRIP_FLOW.to_string()];
     let mut seen_values: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     // [memory:long-term]
