@@ -136,7 +136,7 @@ impl Llm {
         history: &[(&str, &str)],
         chat_id: Option<i64>,
     ) -> Result<String> {
-        let (mut tool_defs, tool_to_server) = collect_tools(state).await;
+        let (mut tool_defs, tool_map) = collect_tools(state).await;
         // Tools that accept a `session_id` param — the bot forces it to the
         // chat id so jobs are chat-isolated AND server pushes route back here.
         let session_tools = tools_with_session_param(&tool_defs);
@@ -185,21 +185,21 @@ impl Llm {
                         } else if name == "cancel_summary" {
                             handle_cancel_summary(state, chat_id).await
                         } else {
-                            match tool_to_server.get(&name) {
+                            match tool_map.get(&name) {
                                 None => format!("error: tool '{name}' is not available"),
-                                Some(server) => {
+                                Some((server, real_tool)) => {
                                     let period = args
                                         .as_ref()
                                         .and_then(|m| m.get("period"))
                                         .and_then(|v| v.as_str())
                                         .unwrap_or("1h")
                                         .to_string();
-                                    let res = state.call_tool(server, &name, args).await;
+                                    let res = state.call_tool(server, real_tool, args).await;
                                     // Record/clear durable push-subs so they survive restarts.
                                     if let (Some(cid), Ok(_)) = (chat_id, &res) {
-                                        if name == "subscribe_summaries" {
+                                        if real_tool == "subscribe_summaries" {
                                             state.add_push_sub(cid, server.clone(), period).await;
-                                        } else if name == "unsubscribe_summaries" {
+                                        } else if real_tool == "unsubscribe_summaries" {
                                             state.remove_push_subs(cid, Some(server)).await;
                                         }
                                     }
@@ -273,28 +273,74 @@ fn fit_to_context(messages: &mut [Value], model: &str) {
 }
 
 /// Build OpenAI tool definitions from every connected server's tools, plus a
-/// map from tool name to the server that owns it (last writer wins on clash).
+/// map from the EXPOSED name to `(server, real_tool)`. Tool names are namespaced
+/// `{server}__{tool}` so identically-named tools on different servers never
+/// collide — the LLM addresses each unambiguously and we route by the map
+/// instead of guessing the owner.
 async fn collect_tools(
     state: &BotState,
-) -> (Vec<Value>, std::collections::HashMap<String, String>) {
+) -> (
+    Vec<Value>,
+    std::collections::HashMap<String, (String, String)>,
+) {
     let mut defs = Vec::new();
-    let mut map = std::collections::HashMap::new();
+    let mut map: std::collections::HashMap<String, (String, String)> =
+        std::collections::HashMap::new();
     let guard = state.mcps.lock().await;
     for (server, client) in guard.iter() {
         for t in client.tools().await {
-            let name = t.name.to_string();
+            let real = t.name.to_string();
+            let exposed = unique_exposed_name(server, &real, &map);
             defs.push(json!({
                 "type": "function",
                 "function": {
-                    "name": name,
+                    "name": exposed,
                     "description": t.description.as_deref().unwrap_or(""),
                     "parameters": Value::Object((*t.input_schema).clone()),
                 }
             }));
-            map.insert(name, server.clone());
+            map.insert(exposed, (server.clone(), real));
         }
     }
     (defs, map)
+}
+
+/// Sanitize to the OpenAI function-name charset `[A-Za-z0-9_-]`.
+fn sanitize_fn(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// `{server}__{tool}`, sanitized and capped to 64 chars (OpenAI limit), then
+/// de-duplicated against already-collected names with a numeric suffix.
+fn unique_exposed_name(
+    server: &str,
+    tool: &str,
+    taken: &std::collections::HashMap<String, (String, String)>,
+) -> String {
+    let mut base = format!("{}__{}", sanitize_fn(server), sanitize_fn(tool));
+    base.truncate(64);
+    if !taken.contains_key(&base) {
+        return base;
+    }
+    for i in 2..1000 {
+        let suffix = format!("_{i}");
+        let keep = 64 - suffix.len();
+        let mut cand = base.clone();
+        cand.truncate(keep);
+        cand.push_str(&suffix);
+        if !taken.contains_key(&cand) {
+            return cand;
+        }
+    }
+    base
 }
 
 /// Meta-tool definition: lets the agent subscribe the user to a recurring
@@ -468,6 +514,40 @@ fn truncate(s: &str, max: usize) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn exposed_name_namespaces_and_sanitizes() {
+        let taken = std::collections::HashMap::new();
+        assert_eq!(
+            unique_exposed_name("weather", "get_forecast", &taken),
+            "weather__get_forecast"
+        );
+        // dots/spaces in a server name are sanitized to underscores
+        assert_eq!(
+            unique_exposed_name("acme.io srv", "search", &taken),
+            "acme_io_srv__search"
+        );
+    }
+
+    #[test]
+    fn exposed_name_dedupes_collisions() {
+        // Two servers expose a tool whose namespaced names collide → suffix.
+        let mut taken: std::collections::HashMap<String, (String, String)> =
+            std::collections::HashMap::new();
+        let a = unique_exposed_name("svc", "search", &taken);
+        taken.insert(a.clone(), ("svc".into(), "search".into()));
+        let b = unique_exposed_name("svc", "search", &taken);
+        assert_eq!(a, "svc__search");
+        assert_eq!(b, "svc__search_2");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn exposed_name_capped_at_64() {
+        let taken = std::collections::HashMap::new();
+        let n = unique_exposed_name(&"s".repeat(40), &"t".repeat(40), &taken);
+        assert!(n.len() <= 64, "len was {}", n.len());
+    }
 
     #[test]
     fn session_param_detection() {
