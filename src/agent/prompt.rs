@@ -37,9 +37,10 @@ hobbies/sports/interests), append it at the very END of your reply, one per line
 before the user sees them — never mention them. Emit none if you learned nothing new.";
 
 /// Always-on capability block: how to run a multi-server "plan an outdoor trip
-/// and let me share it" flow. These are product constants (file formats, step
-/// order), NOT user-configurable — the user states a goal in plain language and
-/// the agent orchestrates the tools across servers itself.
+/// and let me share it" flow. Describes the step ORDER and which server does
+/// what; the user states a goal in plain language and the agent orchestrates
+/// the tools itself. File formats are NOT hardcoded here — they come from the
+/// user's saved notes (conditionally injected) with a sensible default.
 pub const TRIP_FLOW: &str =
     "[capability:trip-planning] When the user wants to plan an outdoor activity/trip and pick the \
 best option by weather (e.g. 'where should we kayak/hike this weekend', 'plan it and let me share \
@@ -48,14 +49,15 @@ formats; infer them. Steps, in this order: \
 (1) Resolve each candidate place to coordinates and compare weather over the relevant dates using \
 the weather server; pick the best place and day for the activity (consider temperature, wind, rain, \
 daylight). State your pick and why, briefly. \
-(2) Write the trip plan as a MARKDOWN file via the filesystem server (e.g. `kayak-plan.md`): place, \
-date, weather summary, daylight window, a short gear checklist. The .md FILE uses normal Markdown — \
-this is a saved artifact and the file-format rule above (plain text) applies ONLY to chat messages, \
-not to files you write. \
+(2) Write the trip plan as a file via the filesystem server: place, date, weather summary, daylight \
+window, a short gear checklist. Use the file format/naming from the user's saved preferences if one \
+is given (in the saved-preferences block, when present); otherwise default to Markdown. The file is \
+a saved artifact — \
+the plain-text rule above applies ONLY to chat messages, not to files you write. \
 (3) Offer a reminder: create a calendar event for the chosen day and place via the calendar server, \
 and give the user the event link. \
-(4) Produce a shareable invite as an `.ics` file so the user can forward it to friends, and deliver \
-it to the user as a document via the messaging server. \
+(4) Produce a shareable invite as a calendar file (`.ics` by default, or the user's preferred format) \
+so they can forward it to friends, and deliver it as a document via the messaging server. \
 Adapt to whichever servers are actually connected; if one (filesystem/calendar/messaging) is missing, \
 do the steps you can and tell the user which server to connect for the rest. Keep the chat reply a \
 short plain-text summary; the files are the shareable output.";
@@ -65,6 +67,7 @@ short plain-text summary; the files are the shareable output.";
 pub fn build_system_prompt(
     memory: &AgentMemory,
     profile: &UserProfile,
+    notes: &[(String, String)],
     invariants: &[Invariant],
     stage_rules: Option<&str>,
     violation_feedback: Option<&[String]>,
@@ -97,6 +100,17 @@ pub fn build_system_prompt(
         for (k, v) in &profile.fields {
             seen_values.insert(v.to_ascii_lowercase());
             lines.push(format!("- {k}: {v}"));
+        }
+        blocks.push(lines.join("\n"));
+    }
+
+    // [user-notes] — only the notes the router judged relevant to this turn,
+    // so unused preferences don't cost tokens on unrelated messages.
+    if !notes.is_empty() {
+        let mut lines =
+            vec!["[user-notes] Saved preferences to honor for this request:".to_string()];
+        for (label, text) in notes {
+            lines.push(format!("- {label}: {text}"));
         }
         blocks.push(lines.join("\n"));
     }

@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use super::{invariants::Invariant, memory::AgentMemory, profile::UserProfile};
+use super::{invariants::Invariant, memory::AgentMemory, notes::UserNotes, profile::UserProfile};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatSession {
@@ -14,6 +14,9 @@ pub struct ChatSession {
     pub memory: AgentMemory,
     #[serde(default)]
     pub profile: UserProfile,
+    /// Free-form labelled preferences ("доп инфа"), conditionally injected.
+    #[serde(default)]
+    pub notes: UserNotes,
     /// Custom invariants; empty → defaults are used at prompt-build time.
     #[serde(default)]
     pub invariants: Vec<Invariant>,
@@ -25,6 +28,7 @@ impl ChatSession {
             chat_id,
             memory: AgentMemory::default(),
             profile: UserProfile::default(),
+            notes: UserNotes::default(),
             invariants: Vec::new(),
         }
     }

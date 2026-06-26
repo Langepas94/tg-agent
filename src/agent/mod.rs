@@ -7,6 +7,7 @@ pub mod context_budget;
 pub mod flow;
 pub mod invariants;
 pub mod memory;
+pub mod notes;
 pub mod profile;
 pub mod prompt;
 pub mod session;
@@ -70,6 +71,12 @@ pub async fn run_turn(
     // --- context-budget compaction (summarize older turns at 80% of window) ---
     maybe_compact(llm, session).await;
 
+    // --- context router: pick which saved notes are relevant to THIS turn ---
+    // Token-frugal: skipped entirely when no notes exist; otherwise one small
+    // selector call decides what (if anything) to inject — an unused preference
+    // never bloats the answering prompt.
+    let notes_ctx = select_notes(llm, session, user_text).await;
+
     // --- build layered prompt + answer ---
     let invariants = session.effective_invariants();
     let history = session.memory.history_for_answer();
@@ -87,6 +94,7 @@ pub async fn run_turn(
         let system = prompt::build_system_prompt(
             &session.memory,
             &session.profile,
+            &notes_ctx,
             &invariants,
             None,
             feedback,
@@ -136,6 +144,28 @@ async fn extract_facts(llm: &Llm, session: &mut ChatSession, user_text: &str) ->
         }
         // No LLM / error → keyword fallback keeps memory working offline.
         Err(_) => session.memory.extract_keyword_fallback(user_text),
+    }
+}
+
+/// Context-router agent: choose which of the user's saved notes ("доп инфа")
+/// are relevant to the current message. Returns the `(label, text)` pairs to
+/// inject. Cheap by construction:
+/// - no notes → returns empty, makes no LLM call;
+/// - LLM picks only relevant labels (a file-format note is left out on a turn
+///   that has nothing to do with files);
+/// - on LLM failure, falls back to a keyword match so it still works offline.
+async fn select_notes(llm: &Llm, session: &ChatSession, user_text: &str) -> Vec<(String, String)> {
+    if session.notes.is_empty() {
+        return Vec::new();
+    }
+    let listing = session.notes.render_lines().join("\n");
+    let input = format!("User message:\n{user_text}\n\nSaved notes:\n{listing}");
+    match llm.complete(notes::NOTES_SELECTOR_PROMPT, &input).await {
+        Ok(json) => {
+            let labels = notes::parse_selected_labels(&strip_fence(&json));
+            session.notes.pick(&labels)
+        }
+        Err(_) => session.notes.keyword_candidates(user_text),
     }
 }
 

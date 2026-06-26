@@ -34,6 +34,8 @@ pub enum Command {
     Disconnect(String),
     #[command(description = "view/set profile: /profile [key value | clear]")]
     Profile(String),
+    #[command(description = "extra info the agent uses when relevant: /info [label text | clear]")]
+    Info(String),
     #[command(description = "show learned facts (layered memory)")]
     Facts,
     #[command(description = "travel-weather flow: /trip <cities/dates>")]
@@ -224,6 +226,9 @@ async fn handle_command(
         Command::Profile(args) => {
             handle_profile(&bot, chat, &args).await?;
         }
+        Command::Info(args) => {
+            handle_info(&bot, chat, &args).await?;
+        }
         Command::Facts => {
             handle_facts(&bot, chat).await?;
         }
@@ -279,6 +284,55 @@ async fn handle_profile(bot: &Bot, chat: ChatId, args: &str) -> anyhow::Result<(
     session.profile.set(key, value);
     let _ = crate::agent::session::save(&session);
     bot.send_message(chat, format!("✅ profile.{key} = {value}"))
+        .await?;
+    Ok(())
+}
+
+/// `/info` — show; `/info <label> <text>` — set; `/info clear`.
+/// Free-form labelled preferences ("доп инфа"). Unlike /profile these are only
+/// mixed into the prompt when the router judges them relevant to a turn.
+async fn handle_info(bot: &Bot, chat: ChatId, args: &str) -> anyhow::Result<()> {
+    let mut session = crate::agent::session::load(chat.0);
+    let args = args.trim();
+    if args.is_empty() {
+        let n = &session.notes;
+        if n.is_empty() {
+            bot.send_message(
+                chat,
+                "No extra info saved. Add some with: /info <label> <text>\n\
+                 e.g. /info files Файлы в формате .docx, имя с датой\n\
+                 The agent uses a note only when it's relevant to your request.",
+            )
+            .await?;
+        } else {
+            bot.send_message(
+                chat,
+                format!("📝 Extra info:\n{}", n.render_lines().join("\n")),
+            )
+            .await?;
+        }
+        return Ok(());
+    }
+    if args.eq_ignore_ascii_case("clear") {
+        session.notes.clear();
+        let _ = crate::agent::session::save(&session);
+        bot.send_message(chat, "✅ Extra info cleared.").await?;
+        return Ok(());
+    }
+    let (label, text) = match args.split_once(char::is_whitespace) {
+        Some((l, t)) => (l, t.trim()),
+        None => {
+            bot.send_message(
+                chat,
+                "Usage: /info <label> <text>  |  /info clear\n(empty text removes a label)",
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+    session.notes.set(label, text);
+    let _ = crate::agent::session::save(&session);
+    bot.send_message(chat, format!("✅ info.{} saved.", label.to_lowercase()))
         .await?;
     Ok(())
 }

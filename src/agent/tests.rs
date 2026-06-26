@@ -4,6 +4,7 @@
 use super::{
     invariants::{self, Invariant, InvariantCheck, InvariantStatus},
     memory::{AgentMemory, MemoryLayer, MAX_RECENT},
+    notes::{self, UserNotes},
     profile::UserProfile,
     prompt,
     session::ChatSession,
@@ -260,7 +261,7 @@ fn prompt_layers_in_order_and_dedup() {
     profile.set("language", "ru");
     let inv = invariants::travel_weather_defaults();
 
-    let s = prompt::build_system_prompt(&memory, &profile, &inv, None, None);
+    let s = prompt::build_system_prompt(&memory, &profile, &[], &inv, None, None);
     let long = s.find("[memory:long-term]").unwrap();
     let prof = s.find("[user-profile]").unwrap();
     let work = s.find("[memory:working]").unwrap();
@@ -279,7 +280,7 @@ fn prompt_includes_summary_block_after_longterm() {
     let mut profile = UserProfile::default();
     profile.set("language", "ru");
 
-    let s = prompt::build_system_prompt(&memory, &profile, &[], None, None);
+    let s = prompt::build_system_prompt(&memory, &profile, &[], &[], None, None);
     let long = s.find("[memory:long-term]").unwrap();
     let summ = s.find("[memory:summary]").unwrap();
     let prof = s.find("[user-profile]").unwrap();
@@ -291,7 +292,7 @@ fn prompt_includes_summary_block_after_longterm() {
 fn prompt_omits_summary_when_empty() {
     let memory = AgentMemory::default();
     let profile = UserProfile::default();
-    let s = prompt::build_system_prompt(&memory, &profile, &[], None, None);
+    let s = prompt::build_system_prompt(&memory, &profile, &[], &[], None, None);
     assert!(!s.contains("[memory:summary]"));
 }
 
@@ -310,11 +311,78 @@ fn prompt_includes_violation_feedback() {
         &memory,
         &profile,
         &[],
+        &[],
         None,
         Some(&["needs a number".to_string()]),
     );
     assert!(s.contains("violated these"));
     assert!(s.contains("needs a number"));
+}
+
+// ---------- notes ("доп инфа") ----------
+
+#[test]
+fn notes_set_remove_and_lowercase_label() {
+    let mut n = UserNotes::default();
+    n.set("Files", "always .docx");
+    assert_eq!(
+        n.entries.get("files").map(String::as_str),
+        Some("always .docx")
+    );
+    // empty text removes
+    n.set("files", "  ");
+    assert!(n.is_empty());
+}
+
+#[test]
+fn notes_pick_resolves_known_labels_only() {
+    let mut n = UserNotes::default();
+    n.set("files", "docx");
+    n.set("tone", "brief");
+    let picked = n.pick(&["files".into(), "unknown".into()]);
+    assert_eq!(picked, vec![("files".to_string(), "docx".to_string())]);
+}
+
+#[test]
+fn notes_keyword_fallback_matches_overlap() {
+    let mut n = UserNotes::default();
+    n.set("files", "Формат файлов docx");
+    n.set("tone", "коротко");
+    // "формат" overlaps the files note, nothing overlaps tone.
+    let hits = n.keyword_candidates("сделай в нужном формате");
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].0, "files");
+}
+
+#[test]
+fn parse_selected_labels_tolerates_prose() {
+    let labels = notes::parse_selected_labels("sure: {\"labels\":[\"files\",\"tone\"]} ok");
+    assert_eq!(labels, vec!["files".to_string(), "tone".to_string()]);
+    assert!(notes::parse_selected_labels("garbage").is_empty());
+}
+
+#[test]
+fn prompt_injects_notes_between_profile_and_working() {
+    let mut memory = AgentMemory::default();
+    memory.upsert_fact("goal", "weekend trip", MemoryLayer::Working);
+    let mut profile = UserProfile::default();
+    profile.set("language", "ru");
+    let notes_ctx = vec![("files".to_string(), "always .docx".to_string())];
+
+    let s = prompt::build_system_prompt(&memory, &profile, &notes_ctx, &[], None, None);
+    let prof = s.find("[user-profile]").unwrap();
+    let note = s.find("[user-notes]").unwrap();
+    let work = s.find("[memory:working]").unwrap();
+    assert!(prof < note && note < work, "notes misplaced:\n{s}");
+    assert!(s.contains("always .docx"));
+}
+
+#[test]
+fn prompt_omits_notes_block_when_empty() {
+    let memory = AgentMemory::default();
+    let profile = UserProfile::default();
+    let s = prompt::build_system_prompt(&memory, &profile, &[], &[], None, None);
+    assert!(!s.contains("[user-notes]"));
 }
 
 // ---------- session ----------
