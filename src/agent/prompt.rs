@@ -41,6 +41,7 @@ before the user sees them — never mention them. Emit none if you learned nothi
 pub fn build_system_prompt(
     memory: &AgentMemory,
     profile: &UserProfile,
+    notes: &[(String, String)],
     invariants: &[Invariant],
     stage_rules: Option<&str>,
     violation_feedback: Option<&[String]>,
@@ -73,6 +74,17 @@ pub fn build_system_prompt(
         for (k, v) in &profile.fields {
             seen_values.insert(v.to_ascii_lowercase());
             lines.push(format!("- {k}: {v}"));
+        }
+        blocks.push(lines.join("\n"));
+    }
+
+    // [user-notes] — only the notes the router judged relevant to this turn,
+    // so unused preferences don't cost tokens on unrelated messages.
+    if !notes.is_empty() {
+        let mut lines =
+            vec!["[user-notes] Saved preferences to honor for this request:".to_string()];
+        for (label, text) in notes {
+            lines.push(format!("- {label}: {text}"));
         }
         blocks.push(lines.join("\n"));
     }
