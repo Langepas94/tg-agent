@@ -681,7 +681,7 @@ fn parse_connect_stdio<'a>(toks: impl Iterator<Item = &'a str>) -> Result<Connec
 
 /// Derive a server name from a stdio command: last path segment of the last
 /// argument (usually the package name), sanitized. Falls back to the program.
-fn default_stdio_name(command: &[String]) -> String {
+pub fn default_stdio_name(command: &[String]) -> String {
     let pick = command
         .iter()
         .rev()
@@ -766,7 +766,7 @@ fn parse_watch(
 }
 
 /// Derive a short server name from a URL: host[:port], sanitized.
-fn default_name(url: &str) -> String {
+pub fn default_name(url: &str) -> String {
     let rest = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
     let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
     let cleaned: String = authority

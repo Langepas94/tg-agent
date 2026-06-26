@@ -15,6 +15,11 @@ natural language using their tools, and runs periodic jobs 24/7.
 - **Natural-language agent** — free-text questions go through an LLM
   (OpenAI-compatible, DeepSeek by default) tool-calling loop over the connected
   MCP tools.
+- **Agent self-connect** — the agent can attach MCP servers on its own via the
+  `mcp_connect` / `mcp_disconnect` meta-tools: when a request needs a capability
+  no connected server provides, it picks the server, asks the user for any
+  credentials in chat, connects (HTTP or stdio), and the new tools become
+  callable in the same turn. No curated list, no platform assumptions.
 - **Periodic summaries** — `/watch <server> <tool> <minutes> [json]` polls a
   tool on a schedule and posts the result. The agent can also subscribe the user
   itself via the `schedule_summary` meta-tool ("collect weather hourly and keep
