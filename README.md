@@ -5,9 +5,13 @@ natural language using their tools, and runs periodic jobs 24/7.
 
 ## Features
 
-- **Runtime MCP management** — `/connect <url> [name= auth= Header:Value]`,
-  `/mcps`, `/tools`, `/call`, `/disconnect`. Streamable-HTTP transport with
-  per-server credentials.
+- **Runtime MCP management** — `/connect`, `/mcps`, `/tools`, `/call`,
+  `/disconnect`. Two transports:
+  - **HTTP**: `/connect <url> [name= auth= Header:Value]` — remote
+    Streamable-HTTP servers, per-server credentials.
+  - **stdio**: `/connect stdio <program> [args...] [name=N] [env=KEY=VAL ...]` —
+    spawns a local child process (npx/uvx servers, no HTTP bridge needed),
+    e.g. `/connect stdio npx -y @cocal/google-calendar-mcp name=gcal`.
 - **Natural-language agent** — free-text questions go through an LLM
   (OpenAI-compatible, DeepSeek by default) tool-calling loop over the connected
   MCP tools.

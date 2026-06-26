@@ -35,6 +35,8 @@ async fn answers_weather_in_natural_language() {
             url: "http://5.129.234.9:3000/mcp".into(),
             auth: None,
             headers: vec![],
+            command: vec![],
+            env: vec![],
         })
         .await
         .expect("connect MCP");

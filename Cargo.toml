@@ -1,6 +1,6 @@
 [package]
 name = "tg-agent"
-version = "0.2.3"
+version = "0.3.0"
 edition = "2021"
 description = "Telegram AI agent with MCP support"
 
@@ -18,6 +18,8 @@ rmcp = { version = "1.8", features = [
     "client",
     "transport-streamable-http-client",
     "transport-streamable-http-client-reqwest",
+    "transport-child-process",
+    "which-command",
 ] }
 http = "1"
 dotenvy = "0.15"
