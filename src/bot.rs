@@ -109,8 +109,12 @@ async fn handle_text(bot: Bot, msg: Message, state: BotState) -> anyhow::Result<
             }
         }
         Err(e) => {
-            bot.send_message(chat, format!("❌ agent error: {e}"))
-                .await?;
+            // `{e:#}` renders the full anyhow cause chain (stage → reason),
+            // e.g. "answering failed: LLM request failed: operation timed out".
+            // Plain `{e}` would drop everything below the top context and is
+            // why hangs/errors used to surface as an unhelpful one-liner.
+            tracing::error!("agent turn for chat {}: {e:#}", chat.0);
+            bot.send_message(chat, format!("❌ {e:#}")).await?;
         }
     }
     Ok(())

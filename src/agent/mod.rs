@@ -91,9 +91,12 @@ pub async fn run_turn(
             None,
             feedback,
         );
-        answer = llm
-            .answer_in_chat(state, &system, user_text, &history, Some(session.chat_id))
-            .await?;
+        answer = {
+            use anyhow::Context;
+            llm.answer_in_chat(state, &system, user_text, &history, Some(session.chat_id))
+                .await
+                .context("answering failed")?
+        };
 
         // Agent self-extraction: pull any ⟦profile:k=v⟧ markers, then strip them
         // so the invariant check and the user both see clean prose.
