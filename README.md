@@ -5,12 +5,21 @@ natural language using their tools, and runs periodic jobs 24/7.
 
 ## Features
 
-- **Runtime MCP management** — `/connect <url> [name= auth= Header:Value]`,
-  `/mcps`, `/tools`, `/call`, `/disconnect`. Streamable-HTTP transport with
-  per-server credentials.
+- **Runtime MCP management** — `/connect`, `/mcps`, `/tools`, `/call`,
+  `/disconnect`. Two transports:
+  - **HTTP**: `/connect <url> [name= auth= Header:Value]` — remote
+    Streamable-HTTP servers, per-server credentials.
+  - **stdio**: `/connect stdio <program> [args...] [name=N] [env=KEY=VAL ...]` —
+    spawns a local child process (npx/uvx servers, no HTTP bridge needed),
+    e.g. `/connect stdio npx -y @cocal/google-calendar-mcp name=gcal`.
 - **Natural-language agent** — free-text questions go through an LLM
   (OpenAI-compatible, DeepSeek by default) tool-calling loop over the connected
   MCP tools.
+- **Agent self-connect** — the agent can attach MCP servers on its own via the
+  `mcp_connect` / `mcp_disconnect` meta-tools: when a request needs a capability
+  no connected server provides, it picks the server, asks the user for any
+  credentials in chat, connects (HTTP or stdio), and the new tools become
+  callable in the same turn. No curated list, no platform assumptions.
 - **Periodic summaries** — `/watch <server> <tool> <minutes> [json]` polls a
   tool on a schedule and posts the result. The agent can also subscribe the user
   itself via the `schedule_summary` meta-tool ("collect weather hourly and keep
@@ -18,6 +27,9 @@ natural language using their tools, and runs periodic jobs 24/7.
 - **Agent runtime** (ported from the ai-playground project):
   - layered **sticky-facts memory** (short-term / working / long-term)
   - editable **user profile** + interview extraction
+  - **extra info** (`/info`) — free-form labelled preferences a **router agent**
+    mixes into the prompt only when relevant to the turn (e.g. a file-format
+    note is injected when you ask for a document, ignored otherwise)
   - **invariants** checked in code (Pass/Fail/Advisory) and injected into the
     system prompt
   - layered **PromptBuilder**
@@ -54,4 +66,4 @@ cargo test -- --ignored --nocapture          # live tests (need MCP + LLM key)
 ## Commands
 
 `/start` `/help` `/connect` `/mcps` `/tools` `/call` `/watch` `/unwatch`
-`/watches` `/disconnect` `/profile` `/facts` `/trip` `/reset`
+`/watches` `/disconnect` `/profile` `/info` `/facts` `/trip` `/reset`

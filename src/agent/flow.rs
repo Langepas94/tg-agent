@@ -137,6 +137,7 @@ fn build_execution_system(session: &ChatSession, invariants: &[Invariant]) -> St
     super::prompt::build_system_prompt(
         &session.memory,
         &session.profile,
+        &[],
         invariants,
         Some("You are the EXECUTION agent. Use tools to gather real weather data, then recommend."),
         None,

@@ -3,7 +3,8 @@
 
 use super::{
     invariants::{self, Invariant, InvariantCheck, InvariantStatus},
-    memory::{AgentMemory, MemoryLayer, RECENT_WINDOW},
+    memory::{AgentMemory, MemoryLayer, MAX_RECENT},
+    notes::{self, UserNotes},
     profile::UserProfile,
     prompt,
     session::ChatSession,
@@ -26,16 +27,31 @@ fn layer_parse_and_display() {
 }
 
 #[test]
-fn recent_window_caps() {
+fn recent_window_caps_at_hard_ceiling() {
+    // push_message now only trims at the hard MAX_RECENT ceiling; trimming to
+    // RECENT_WINDOW is done by budget-aware compaction (which preserves dropped
+    // turns in the summary), so it isn't exercised here.
     let mut m = AgentMemory::default();
-    for i in 0..(RECENT_WINDOW + 5) {
+    let total = MAX_RECENT + 5;
+    for i in 0..total {
         m.push_message("user", &format!("m{i}"));
     }
-    assert_eq!(m.recent.len(), RECENT_WINDOW);
-    assert_eq!(
-        m.recent.last().unwrap().1,
-        format!("m{}", RECENT_WINDOW + 4)
-    );
+    assert_eq!(m.recent.len(), MAX_RECENT);
+    assert_eq!(m.recent.last().unwrap().1, format!("m{}", total - 1));
+}
+
+#[test]
+fn drain_oldest_keeps_tail() {
+    let mut m = AgentMemory::default();
+    for i in 0..6 {
+        m.push_message("user", &format!("m{i}"));
+    }
+    let drained = m.drain_oldest(2);
+    assert_eq!(drained.len(), 4);
+    assert_eq!(m.recent.len(), 2);
+    assert_eq!(m.recent[0].1, "m4");
+    // history_for_answer excludes the trailing (current) message.
+    assert_eq!(m.history_for_answer().len(), 1);
 }
 
 #[test]
@@ -97,6 +113,37 @@ fn keyword_fallback_extracts_home_city() {
     assert_eq!(m.facts[0].key, "home_city");
 }
 
+#[test]
+fn append_summary_merges_and_caps() {
+    let mut m = AgentMemory::default();
+    m.append_summary("first");
+    m.append_summary("second");
+    assert!(m.summary.contains("first") && m.summary.contains("second"));
+    assert!(m.summary.contains("\n\n"));
+    // blank additions are ignored
+    m.append_summary("   ");
+    let before = m.summary.clone();
+    assert_eq!(before, m.summary);
+    // hard cap keeps the tail, never grows unbounded
+    m.append_summary(&"x".repeat(8000));
+    assert!(m.summary.chars().count() <= 4000);
+}
+
+#[test]
+fn history_for_answer_excludes_current_and_empty_safe() {
+    let mut m = AgentMemory::default();
+    assert!(m.history_for_answer().is_empty()); // empty doesn't panic
+    m.push_message("user", "a");
+    // single message = current turn only → no prior history
+    assert!(m.history_for_answer().is_empty());
+    m.push_message("assistant", "b");
+    m.push_message("user", "c");
+    let h = m.history_for_answer();
+    assert_eq!(h.len(), 2);
+    assert_eq!(h[0], ("user", "a"));
+    assert_eq!(h[1], ("assistant", "b"));
+}
+
 // ---------- profile ----------
 
 #[test]
@@ -122,6 +169,35 @@ fn profile_merge_skips_secrets() {
     assert_eq!(n, 1);
     assert!(p.fields.contains_key("home_city"));
     assert!(!p.fields.contains_key("api"));
+}
+
+#[test]
+fn interests_union_merge() {
+    let mut p = UserProfile::default();
+    p.set("interests", "kayaking, basketball");
+    p.set("interests", "Basketball, hiking"); // dup (case-insensitive) dropped
+    assert_eq!(p.fields["interests"], "kayaking, basketball, hiking");
+}
+
+#[test]
+fn inline_markers_apply_and_strip() {
+    let mut p = UserProfile::default();
+    let raw = "В Сочи +24°C, тепло.\n⟦profile:age=80⟧\n⟦profile:interests=байдарки⟧";
+    let n = p.apply_inline_markers(raw);
+    assert_eq!(n, 2);
+    assert_eq!(p.fields["age"], "80");
+    assert_eq!(p.fields["interests"], "байдарки");
+    let clean = super::profile::strip_inline_markers(raw);
+    assert_eq!(clean, "В Сочи +24°C, тепло.");
+    assert!(!clean.contains("profile:"));
+}
+
+#[test]
+fn inline_markers_reject_secrets() {
+    let mut p = UserProfile::default();
+    let n = p.apply_inline_markers("⟦profile:token=sk-abcdef1234567890abcdef⟧");
+    assert_eq!(n, 0);
+    assert!(p.is_empty());
 }
 
 // ---------- invariants ----------
@@ -185,7 +261,7 @@ fn prompt_layers_in_order_and_dedup() {
     profile.set("language", "ru");
     let inv = invariants::travel_weather_defaults();
 
-    let s = prompt::build_system_prompt(&memory, &profile, &inv, None, None);
+    let s = prompt::build_system_prompt(&memory, &profile, &[], &inv, None, None);
     let long = s.find("[memory:long-term]").unwrap();
     let prof = s.find("[user-profile]").unwrap();
     let work = s.find("[memory:working]").unwrap();
@@ -197,6 +273,37 @@ fn prompt_layers_in_order_and_dedup() {
 }
 
 #[test]
+fn prompt_includes_summary_block_after_longterm() {
+    let mut memory = AgentMemory::default();
+    memory.upsert_fact("home_city", "Sochi", MemoryLayer::LongTerm);
+    memory.append_summary("user planning a kayaking trip");
+    let mut profile = UserProfile::default();
+    profile.set("language", "ru");
+
+    let s = prompt::build_system_prompt(&memory, &profile, &[], &[], None, None);
+    let long = s.find("[memory:long-term]").unwrap();
+    let summ = s.find("[memory:summary]").unwrap();
+    let prof = s.find("[user-profile]").unwrap();
+    assert!(long < summ && summ < prof, "summary misplaced:\n{s}");
+    assert!(s.contains("kayaking trip"));
+}
+
+#[test]
+fn prompt_omits_summary_when_empty() {
+    let memory = AgentMemory::default();
+    let profile = UserProfile::default();
+    let s = prompt::build_system_prompt(&memory, &profile, &[], &[], None, None);
+    assert!(!s.contains("[memory:summary]"));
+}
+
+#[test]
+fn strip_inline_markers_preserves_paragraphs() {
+    let raw = "Первый абзац.\n\nВторой абзац.\n⟦profile:age=80⟧";
+    let clean = super::profile::strip_inline_markers(raw);
+    assert_eq!(clean, "Первый абзац.\n\nВторой абзац.");
+}
+
+#[test]
 fn prompt_includes_violation_feedback() {
     let memory = AgentMemory::default();
     let profile = UserProfile::default();
@@ -204,11 +311,78 @@ fn prompt_includes_violation_feedback() {
         &memory,
         &profile,
         &[],
+        &[],
         None,
         Some(&["needs a number".to_string()]),
     );
     assert!(s.contains("violated these"));
     assert!(s.contains("needs a number"));
+}
+
+// ---------- notes ("доп инфа") ----------
+
+#[test]
+fn notes_set_remove_and_lowercase_label() {
+    let mut n = UserNotes::default();
+    n.set("Files", "always .docx");
+    assert_eq!(
+        n.entries.get("files").map(String::as_str),
+        Some("always .docx")
+    );
+    // empty text removes
+    n.set("files", "  ");
+    assert!(n.is_empty());
+}
+
+#[test]
+fn notes_pick_resolves_known_labels_only() {
+    let mut n = UserNotes::default();
+    n.set("files", "docx");
+    n.set("tone", "brief");
+    let picked = n.pick(&["files".into(), "unknown".into()]);
+    assert_eq!(picked, vec![("files".to_string(), "docx".to_string())]);
+}
+
+#[test]
+fn notes_keyword_fallback_matches_overlap() {
+    let mut n = UserNotes::default();
+    n.set("files", "Формат файлов docx");
+    n.set("tone", "коротко");
+    // "формат" overlaps the files note, nothing overlaps tone.
+    let hits = n.keyword_candidates("сделай в нужном формате");
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].0, "files");
+}
+
+#[test]
+fn parse_selected_labels_tolerates_prose() {
+    let labels = notes::parse_selected_labels("sure: {\"labels\":[\"files\",\"tone\"]} ok");
+    assert_eq!(labels, vec!["files".to_string(), "tone".to_string()]);
+    assert!(notes::parse_selected_labels("garbage").is_empty());
+}
+
+#[test]
+fn prompt_injects_notes_between_profile_and_working() {
+    let mut memory = AgentMemory::default();
+    memory.upsert_fact("goal", "weekend trip", MemoryLayer::Working);
+    let mut profile = UserProfile::default();
+    profile.set("language", "ru");
+    let notes_ctx = vec![("files".to_string(), "always .docx".to_string())];
+
+    let s = prompt::build_system_prompt(&memory, &profile, &notes_ctx, &[], None, None);
+    let prof = s.find("[user-profile]").unwrap();
+    let note = s.find("[user-notes]").unwrap();
+    let work = s.find("[memory:working]").unwrap();
+    assert!(prof < note && note < work, "notes misplaced:\n{s}");
+    assert!(s.contains("always .docx"));
+}
+
+#[test]
+fn prompt_omits_notes_block_when_empty() {
+    let memory = AgentMemory::default();
+    let profile = UserProfile::default();
+    let s = prompt::build_system_prompt(&memory, &profile, &[], &[], None, None);
+    assert!(!s.contains("[user-notes]"));
 }
 
 // ---------- session ----------

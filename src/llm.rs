@@ -4,10 +4,18 @@
 
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
+use std::time::Duration;
 
 use crate::{config::LlmConfig, state::BotState};
 
-const MAX_STEPS: usize = 6;
+const MAX_STEPS: usize = 12;
+/// Per-tool-result char cap before feeding it back to the model. Sized for a
+/// 7-day hourly forecast (~10–15k chars); `fit_to_context` reclaims the window
+/// if many such results accumulate across the loop.
+const TOOL_RESULT_CAP: usize = 12_000;
+/// Hard ceiling on a single LLM HTTP round. Without this, `reqwest` waits
+/// forever on a stalled connection — the cause of the multi-minute hangs.
+const LLM_TIMEOUT: Duration = Duration::from_secs(90);
 
 #[derive(Clone)]
 pub struct Llm {
@@ -19,8 +27,17 @@ impl Llm {
     pub fn new(cfg: LlmConfig) -> Self {
         Self {
             cfg,
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .timeout(LLM_TIMEOUT)
+                .connect_timeout(Duration::from_secs(10))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
         }
+    }
+
+    /// Configured model id (used for context-window budgeting).
+    pub fn model(&self) -> &str {
+        &self.cfg.model
     }
 
     /// Single completion with a custom system prompt and no tools.
@@ -56,7 +73,23 @@ impl Llm {
             .json(&body)
             .send()
             .await
-            .context("LLM request failed")?;
+            .map_err(|e| {
+                // Turn reqwest's opaque error into something a human can act on.
+                let why = if e.is_timeout() {
+                    format!(
+                        "no response from {} within {LLM_TIMEOUT:?} (provider slow or hung)",
+                        self.cfg.base_url
+                    )
+                } else if e.is_connect() {
+                    format!(
+                        "cannot reach LLM at {} (network/DNS/down)",
+                        self.cfg.base_url
+                    )
+                } else {
+                    format!("request to {} failed: {e}", self.cfg.base_url)
+                };
+                anyhow::anyhow!(why)
+            })?;
 
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
@@ -88,7 +121,8 @@ impl Llm {
         system: &str,
         user_text: &str,
     ) -> Result<String> {
-        self.answer_in_chat(state, system, user_text, None).await
+        self.answer_in_chat(state, system, user_text, &[], None)
+            .await
     }
 
     /// Agentic tool-calling loop. When `chat_id` is set, the agent also gets a
@@ -99,29 +133,42 @@ impl Llm {
         state: &BotState,
         system: &str,
         user_text: &str,
+        history: &[(&str, &str)],
         chat_id: Option<i64>,
     ) -> Result<String> {
-        let (mut tool_defs, tool_to_server) = collect_tools(state).await;
+        let (mut tool_defs, mut tool_map) = collect_tools(state).await;
         // Tools that accept a `session_id` param — the bot forces it to the
         // chat id so jobs are chat-isolated AND server pushes route back here.
-        let session_tools = tools_with_session_param(&tool_defs);
-        if chat_id.is_some() {
-            tool_defs.push(schedule_summary_def());
-            tool_defs.push(cancel_summary_def());
-        }
+        let mut session_tools = tools_with_session_param(&tool_defs);
+        append_meta_defs(&mut tool_defs, chat_id);
 
-        let mut messages = vec![
-            json!({ "role": "system", "content": system }),
-            json!({ "role": "user", "content": user_text }),
-        ];
+        let mut messages = vec![json!({ "role": "system", "content": system })];
+        // Prior turns (short-term window) give multi-turn continuity.
+        for (role, text) in history {
+            let role = if *role == "assistant" {
+                "assistant"
+            } else {
+                "user"
+            };
+            messages.push(json!({ "role": role, "content": text }));
+        }
+        messages.push(json!({ "role": "user", "content": user_text }));
 
         for _ in 0..MAX_STEPS {
+            // Keep the growing tool transcript under the model's window. MCP
+            // results (multi-city forecasts) can overflow it mid-loop; clip the
+            // oldest results BEFORE the call so the provider never 400s.
+            fit_to_context(&mut messages, &self.cfg.model);
             let msg = self.chat(&messages, &tool_defs).await?;
 
             let tool_calls = msg.get("tool_calls").and_then(|v| v.as_array()).cloned();
             match tool_calls {
                 Some(calls) if !calls.is_empty() => {
                     messages.push(msg.clone()); // assistant turn carrying the calls
+                                                // The agent may connect/disconnect servers mid-loop; when it
+                                                // does, the live tool set changes and must be rebuilt before
+                                                // the next model call so new tools become callable at once.
+                    let mut tools_dirty = false;
                     for call in calls {
                         let id = call["id"].as_str().unwrap_or("").to_string();
                         let name = call["function"]["name"].as_str().unwrap_or("").to_string();
@@ -134,31 +181,39 @@ impl Llm {
                             map.insert("session_id".into(), cid.to_string().into());
                         }
 
-                        let content = if name == "schedule_summary" {
+                        let content = if name == "mcp_connect" {
+                            let out = handle_mcp_connect(state, args_raw).await;
+                            tools_dirty |= !out.starts_with("error");
+                            out
+                        } else if name == "mcp_disconnect" {
+                            let out = handle_mcp_disconnect(state, args_raw).await;
+                            tools_dirty |= !out.starts_with("error");
+                            out
+                        } else if name == "schedule_summary" {
                             handle_schedule_summary(state, chat_id, args_raw).await
                         } else if name == "cancel_summary" {
                             handle_cancel_summary(state, chat_id).await
                         } else {
-                            match tool_to_server.get(&name) {
+                            match tool_map.get(&name) {
                                 None => format!("error: tool '{name}' is not available"),
-                                Some(server) => {
+                                Some((server, real_tool)) => {
                                     let period = args
                                         .as_ref()
                                         .and_then(|m| m.get("period"))
                                         .and_then(|v| v.as_str())
                                         .unwrap_or("1h")
                                         .to_string();
-                                    let res = state.call_tool(server, &name, args).await;
+                                    let res = state.call_tool(server, real_tool, args).await;
                                     // Record/clear durable push-subs so they survive restarts.
                                     if let (Some(cid), Ok(_)) = (chat_id, &res) {
-                                        if name == "subscribe_summaries" {
+                                        if real_tool == "subscribe_summaries" {
                                             state.add_push_sub(cid, server.clone(), period).await;
-                                        } else if name == "unsubscribe_summaries" {
+                                        } else if real_tool == "unsubscribe_summaries" {
                                             state.remove_push_subs(cid, Some(server)).await;
                                         }
                                     }
                                     match res {
-                                        Ok(out) => truncate(&out, 6000),
+                                        Ok(out) => truncate(&out, TOOL_RESULT_CAP),
                                         Err(e) => format!("error: {e}"),
                                     }
                                 }
@@ -169,6 +224,14 @@ impl Llm {
                             "tool_call_id": id,
                             "content": content,
                         }));
+                    }
+                    // Rebuild the tool registry if the agent changed connections.
+                    if tools_dirty {
+                        let (d, m) = collect_tools(state).await;
+                        tool_defs = d;
+                        tool_map = m;
+                        session_tools = tools_with_session_param(&tool_defs);
+                        append_meta_defs(&mut tool_defs, chat_id);
                     }
                 }
                 _ => {
@@ -184,29 +247,117 @@ impl Llm {
     }
 }
 
+/// Clip the running tool-loop transcript back under the model's compaction
+/// threshold. MCP tool results (e.g. multi-city forecasts) can blow the context
+/// window mid-loop; rather than let the provider reject the request with a 400,
+/// we shrink the OLDEST `tool` results first — preserving the system prompt and
+/// the most recent exchange the model is actively reasoning over.
+fn fit_to_context(messages: &mut [Value], model: &str) {
+    use crate::agent::context_budget::{compact_threshold, estimate_tokens};
+
+    let budget = compact_threshold(model);
+    let total = |m: &[Value]| -> usize {
+        m.iter()
+            .map(|v| estimate_tokens(v["content"].as_str().unwrap_or("")))
+            .sum()
+    };
+    if total(messages) <= budget {
+        return;
+    }
+
+    // Never touch the system prompt (index 0) or the last two messages (the
+    // live exchange). Clip from oldest to newest until we fit.
+    const CLIP_CHARS: usize = 400;
+    let last_keep = messages.len().saturating_sub(2);
+    for i in 1..last_keep {
+        if total(messages) <= budget {
+            break;
+        }
+        if messages[i]["role"] != "tool" {
+            continue;
+        }
+        let Some(c) = messages[i]["content"].as_str() else {
+            continue;
+        };
+        if c.chars().count() <= CLIP_CHARS {
+            continue;
+        }
+        // char-safe clip (tool output may be Cyrillic/multi-byte).
+        let head: String = c.chars().take(CLIP_CHARS).collect();
+        messages[i]["content"] =
+            format!("{head}…[older tool result trimmed to fit context]").into();
+    }
+}
+
 /// Build OpenAI tool definitions from every connected server's tools, plus a
-/// map from tool name to the server that owns it (last writer wins on clash).
+/// map from the EXPOSED name to `(server, real_tool)`. Tool names are namespaced
+/// `{server}__{tool}` so identically-named tools on different servers never
+/// collide — the LLM addresses each unambiguously and we route by the map
+/// instead of guessing the owner.
 async fn collect_tools(
     state: &BotState,
-) -> (Vec<Value>, std::collections::HashMap<String, String>) {
+) -> (
+    Vec<Value>,
+    std::collections::HashMap<String, (String, String)>,
+) {
     let mut defs = Vec::new();
-    let mut map = std::collections::HashMap::new();
+    let mut map: std::collections::HashMap<String, (String, String)> =
+        std::collections::HashMap::new();
     let guard = state.mcps.lock().await;
     for (server, client) in guard.iter() {
         for t in client.tools().await {
-            let name = t.name.to_string();
+            let real = t.name.to_string();
+            let exposed = unique_exposed_name(server, &real, &map);
             defs.push(json!({
                 "type": "function",
                 "function": {
-                    "name": name,
+                    "name": exposed,
                     "description": t.description.as_deref().unwrap_or(""),
                     "parameters": Value::Object((*t.input_schema).clone()),
                 }
             }));
-            map.insert(name, server.clone());
+            map.insert(exposed, (server.clone(), real));
         }
     }
     (defs, map)
+}
+
+/// Sanitize to the OpenAI function-name charset `[A-Za-z0-9_-]`.
+fn sanitize_fn(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// `{server}__{tool}`, sanitized and capped to 64 chars (OpenAI limit), then
+/// de-duplicated against already-collected names with a numeric suffix.
+fn unique_exposed_name(
+    server: &str,
+    tool: &str,
+    taken: &std::collections::HashMap<String, (String, String)>,
+) -> String {
+    let mut base = format!("{}__{}", sanitize_fn(server), sanitize_fn(tool));
+    base.truncate(64);
+    if !taken.contains_key(&base) {
+        return base;
+    }
+    for i in 2..1000 {
+        let suffix = format!("_{i}");
+        let keep = 64 - suffix.len();
+        let mut cand = base.clone();
+        cand.truncate(keep);
+        cand.push_str(&suffix);
+        if !taken.contains_key(&cand) {
+            return cand;
+        }
+    }
+    base
 }
 
 /// Meta-tool definition: lets the agent subscribe the user to a recurring
@@ -264,6 +415,157 @@ fn cancel_summary_def() -> Value {
             "parameters": { "type": "object", "properties": {} }
         }
     })
+}
+
+/// Append the always-available meta-tools (connect/disconnect MCP servers) and,
+/// when running inside a chat, the recurring-summary meta-tools.
+fn append_meta_defs(tool_defs: &mut Vec<Value>, chat_id: Option<i64>) {
+    tool_defs.push(mcp_connect_def());
+    tool_defs.push(mcp_disconnect_def());
+    if chat_id.is_some() {
+        tool_defs.push(schedule_summary_def());
+        tool_defs.push(cancel_summary_def());
+    }
+}
+
+/// Meta-tool: let the agent connect to ANY MCP server on demand. The agent
+/// supplies the launch spec itself — for popular servers it knows the `npx`/
+/// `uvx` command from training; for HTTP servers it gives the URL. Credentials
+/// are NOT hardcoded: when a server needs a token/key, the agent should ask the
+/// user in chat and pass the value here via `auth`/`headers`/`env`.
+fn mcp_connect_def() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "mcp_connect",
+            "description": "Connect to an MCP server so its tools become available. Use this whenever \
+                fulfilling the request needs a capability no currently-connected server provides \
+                (e.g. the user asks to add a calendar event, send mail, read files) — connect the \
+                right server, then call its tools. Pick the transport: \
+                'http' for a remote Streamable-HTTP endpoint (give `url`); \
+                'stdio' to launch a local server process (give `command` as an argv array, e.g. \
+                [\"npx\",\"-y\",\"@cocal/google-calendar-mcp\"] or [\"uvx\",\"some-mcp\"]). \
+                For well-known servers supply the standard command from your own knowledge. \
+                If the server needs credentials, FIRST ask the user for them in chat, then pass them \
+                via `auth` (bearer token), `headers` (HTTP servers), or `env` (stdio servers). \
+                Never invent secrets. After connecting, the new tools are immediately callable.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "short server alias (optional; derived if omitted)" },
+                    "transport": { "type": "string", "enum": ["http", "stdio"], "description": "connection type" },
+                    "url": { "type": "string", "description": "http(s):// endpoint (transport=http)" },
+                    "auth": { "type": "string", "description": "bearer token, sent as Authorization: Bearer … (optional)" },
+                    "headers": { "type": "object", "description": "extra HTTP headers, e.g. {\"X-Api-Key\":\"…\"} (http, optional)" },
+                    "command": { "type": "array", "items": { "type": "string" }, "description": "argv to spawn (transport=stdio), e.g. [\"npx\",\"-y\",\"<pkg>\"]" },
+                    "env": { "type": "object", "description": "environment variables for the spawned process (stdio, optional)" }
+                },
+                "required": ["transport"]
+            }
+        }
+    })
+}
+
+/// Meta-tool: disconnect a server the agent (or user) connected.
+fn mcp_disconnect_def() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "mcp_disconnect",
+            "description": "Disconnect a connected MCP server by its name (frees it / removes its \
+                tools). Use when the user asks to remove a server or it is no longer needed.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "the connected server's name" }
+                },
+                "required": ["name"]
+            }
+        }
+    })
+}
+
+/// Execute `mcp_connect`: build [`ConnectParams`] from the agent's args and open
+/// the connection. Returns a token-free status line (never echoes secrets).
+async fn handle_mcp_connect(state: &BotState, args_raw: &str) -> String {
+    use crate::mcp_client::ConnectParams;
+    let v: Value = match serde_json::from_str(args_raw) {
+        Ok(v) => v,
+        Err(e) => return format!("error: bad args: {e}"),
+    };
+
+    let obj_pairs = |val: Option<&Value>| -> Vec<(String, String)> {
+        val.and_then(|h| h.as_object())
+            .map(|m| {
+                m.iter()
+                    .map(|(k, v)| {
+                        let s = v
+                            .as_str()
+                            .map(str::to_string)
+                            .unwrap_or_else(|| v.to_string());
+                        (k.clone(), s)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+
+    let transport = v["transport"].as_str().unwrap_or("").to_lowercase();
+    let url = v["url"].as_str().unwrap_or("").to_string();
+    let command: Vec<String> = v["command"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // Infer transport if the model omitted/mismatched it.
+    let is_stdio = transport == "stdio" || (transport.is_empty() && !command.is_empty());
+    if is_stdio && command.is_empty() {
+        return "error: stdio transport needs a non-empty command array".into();
+    }
+    if !is_stdio && url.is_empty() {
+        return "error: http transport needs a url".into();
+    }
+
+    let name = match v["name"].as_str().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(n) => n.to_string(),
+        None if is_stdio => crate::bot::default_stdio_name(&command),
+        None => crate::bot::default_name(&url),
+    };
+
+    let params = ConnectParams {
+        name: name.clone(),
+        url,
+        auth: v["auth"].as_str().map(str::to_string),
+        headers: obj_pairs(v.get("headers")),
+        command,
+        env: obj_pairs(v.get("env")),
+    };
+
+    match state.connect_mcp(params).await {
+        Ok(n) => format!("connected '{name}' — {n} tools now available"),
+        Err(e) => format!("error: connect '{name}' failed: {e}"),
+    }
+}
+
+/// Execute `mcp_disconnect`.
+async fn handle_mcp_disconnect(state: &BotState, args_raw: &str) -> String {
+    let v: Value = match serde_json::from_str(args_raw) {
+        Ok(v) => v,
+        Err(e) => return format!("error: bad args: {e}"),
+    };
+    let name = v["name"].as_str().unwrap_or("").trim().to_string();
+    if name.is_empty() {
+        return "error: need the server name".into();
+    }
+    if state.disconnect_mcp(&name).await {
+        format!("disconnected '{name}'")
+    } else {
+        format!("error: no connected server named '{name}'")
+    }
 }
 
 /// Execute `cancel_summary`: stop this chat's recurring delivery — both
@@ -365,16 +667,91 @@ fn parse_args(raw: &str) -> Option<rmcp::model::JsonObject> {
 
 fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
-        s.to_string()
-    } else {
-        format!("{}…(truncated)", &s[..max])
+        return s.to_string();
     }
+    // char-safe: byte-slicing `&s[..max]` panics if `max` lands mid-codepoint
+    // (Cyrillic city names in tool JSON would hit this). Back off to a boundary.
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…(truncated)", &s[..end])
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn exposed_name_namespaces_and_sanitizes() {
+        let taken = std::collections::HashMap::new();
+        assert_eq!(
+            unique_exposed_name("weather", "get_forecast", &taken),
+            "weather__get_forecast"
+        );
+        // dots/spaces in a server name are sanitized to underscores
+        assert_eq!(
+            unique_exposed_name("acme.io srv", "search", &taken),
+            "acme_io_srv__search"
+        );
+    }
+
+    fn tool_names(defs: &[Value]) -> Vec<String> {
+        defs.iter()
+            .filter_map(|d| d["function"]["name"].as_str().map(str::to_string))
+            .collect()
+    }
+
+    #[test]
+    fn meta_defs_always_include_connect_disconnect() {
+        let mut defs = Vec::new();
+        append_meta_defs(&mut defs, None);
+        let names = tool_names(&defs);
+        assert!(names.contains(&"mcp_connect".to_string()));
+        assert!(names.contains(&"mcp_disconnect".to_string()));
+        // outside a chat, no recurring-summary meta-tools
+        assert!(!names.contains(&"schedule_summary".to_string()));
+    }
+
+    #[test]
+    fn meta_defs_add_summary_tools_in_chat() {
+        let mut defs = Vec::new();
+        append_meta_defs(&mut defs, Some(42));
+        let names = tool_names(&defs);
+        assert!(names.contains(&"mcp_connect".to_string()));
+        assert!(names.contains(&"schedule_summary".to_string()));
+        assert!(names.contains(&"cancel_summary".to_string()));
+    }
+
+    #[test]
+    fn mcp_connect_def_requires_transport() {
+        let def = mcp_connect_def();
+        let required = def["function"]["parameters"]["required"]
+            .as_array()
+            .unwrap();
+        assert!(required.iter().any(|v| v == "transport"));
+    }
+
+    #[test]
+    fn exposed_name_dedupes_collisions() {
+        // Two servers expose a tool whose namespaced names collide → suffix.
+        let mut taken: std::collections::HashMap<String, (String, String)> =
+            std::collections::HashMap::new();
+        let a = unique_exposed_name("svc", "search", &taken);
+        taken.insert(a.clone(), ("svc".into(), "search".into()));
+        let b = unique_exposed_name("svc", "search", &taken);
+        assert_eq!(a, "svc__search");
+        assert_eq!(b, "svc__search_2");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn exposed_name_capped_at_64() {
+        let taken = std::collections::HashMap::new();
+        let n = unique_exposed_name(&"s".repeat(40), &"t".repeat(40), &taken);
+        assert!(n.len() <= 64, "len was {}", n.len());
+    }
 
     #[test]
     fn session_param_detection() {
@@ -385,5 +762,41 @@ mod tests {
         let set = tools_with_session_param(&defs);
         assert!(set.contains("subscribe_summaries"));
         assert!(!set.contains("geocode"));
+    }
+
+    #[test]
+    fn truncate_is_char_safe_on_multibyte() {
+        // 'ё' is 2 bytes; cutting at an odd byte must not panic.
+        let s = "ёёёёё"; // 10 bytes
+        let out = truncate(s, 5);
+        assert!(out.ends_with("…(truncated)"));
+        assert!(out.starts_with("ёё")); // backed off to a char boundary
+    }
+
+    #[test]
+    fn fit_to_context_clips_oldest_tool_results() {
+        // deepseek window 65_536 → threshold ~52_428 tokens (~157k chars).
+        std::env::remove_var("LLM_CONTEXT_TOKENS");
+        let big = "a".repeat(90_000); // ~30_000 tokens each; 3× overflows badly
+        let mut messages = vec![
+            json!({ "role": "system", "content": "sys" }),
+            json!({ "role": "tool", "tool_call_id": "1", "content": big }),
+            json!({ "role": "tool", "tool_call_id": "2", "content": big }),
+            json!({ "role": "assistant", "content": "thinking" }),
+            json!({ "role": "tool", "tool_call_id": "3", "content": big }),
+        ];
+        fit_to_context(&mut messages, "deepseek-chat");
+
+        // Oldest two tool results clipped...
+        assert!(messages[1]["content"]
+            .as_str()
+            .unwrap()
+            .contains("trimmed to fit context"));
+        assert!(messages[2]["content"]
+            .as_str()
+            .unwrap()
+            .contains("trimmed to fit context"));
+        // ...the freshest tool result (in the protected last-two window) is intact.
+        assert_eq!(messages[4]["content"].as_str().unwrap().len(), 90_000);
     }
 }

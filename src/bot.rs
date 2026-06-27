@@ -15,7 +15,7 @@ pub enum Command {
     #[command(description = "show help")]
     Help,
     #[command(
-        description = "connect MCP: /connect <url> [name=N] [auth=TOKEN] [Header:Value ...]"
+        description = "connect MCP: /connect <url> [name=N] [auth=TOKEN] [Header:Value] | /connect stdio <program> [args...] [name=N] [env=KEY=VAL]"
     )]
     Connect(String),
     #[command(description = "list connected MCP servers")]
@@ -34,6 +34,8 @@ pub enum Command {
     Disconnect(String),
     #[command(description = "view/set profile: /profile [key value | clear]")]
     Profile(String),
+    #[command(description = "extra info the agent uses when relevant: /info [label text | clear]")]
+    Info(String),
     #[command(description = "show learned facts (layered memory)")]
     Facts,
     #[command(description = "travel-weather flow: /trip <cities/dates>")]
@@ -109,8 +111,12 @@ async fn handle_text(bot: Bot, msg: Message, state: BotState) -> anyhow::Result<
             }
         }
         Err(e) => {
-            bot.send_message(chat, format!("❌ agent error: {e}"))
-                .await?;
+            // `{e:#}` renders the full anyhow cause chain (stage → reason),
+            // e.g. "answering failed: LLM request failed: operation timed out".
+            // Plain `{e}` would drop everything below the top context and is
+            // why hangs/errors used to surface as an unhelpful one-liner.
+            tracing::error!("agent turn for chat {}: {e:#}", chat.0);
+            bot.send_message(chat, format!("❌ {e:#}")).await?;
         }
     }
     Ok(())
@@ -220,6 +226,9 @@ async fn handle_command(
         Command::Profile(args) => {
             handle_profile(&bot, chat, &args).await?;
         }
+        Command::Info(args) => {
+            handle_info(&bot, chat, &args).await?;
+        }
         Command::Facts => {
             handle_facts(&bot, chat).await?;
         }
@@ -275,6 +284,55 @@ async fn handle_profile(bot: &Bot, chat: ChatId, args: &str) -> anyhow::Result<(
     session.profile.set(key, value);
     let _ = crate::agent::session::save(&session);
     bot.send_message(chat, format!("✅ profile.{key} = {value}"))
+        .await?;
+    Ok(())
+}
+
+/// `/info` — show; `/info <label> <text>` — set; `/info clear`.
+/// Free-form labelled preferences ("доп инфа"). Unlike /profile these are only
+/// mixed into the prompt when the router judges them relevant to a turn.
+async fn handle_info(bot: &Bot, chat: ChatId, args: &str) -> anyhow::Result<()> {
+    let mut session = crate::agent::session::load(chat.0);
+    let args = args.trim();
+    if args.is_empty() {
+        let n = &session.notes;
+        if n.is_empty() {
+            bot.send_message(
+                chat,
+                "No extra info saved. Add some with: /info <label> <text>\n\
+                 e.g. /info files Файлы в формате .docx, имя с датой\n\
+                 The agent uses a note only when it's relevant to your request.",
+            )
+            .await?;
+        } else {
+            bot.send_message(
+                chat,
+                format!("📝 Extra info:\n{}", n.render_lines().join("\n")),
+            )
+            .await?;
+        }
+        return Ok(());
+    }
+    if args.eq_ignore_ascii_case("clear") {
+        session.notes.clear();
+        let _ = crate::agent::session::save(&session);
+        bot.send_message(chat, "✅ Extra info cleared.").await?;
+        return Ok(());
+    }
+    let (label, text) = match args.split_once(char::is_whitespace) {
+        Some((l, t)) => (l, t.trim()),
+        None => {
+            bot.send_message(
+                chat,
+                "Usage: /info <label> <text>  |  /info clear\n(empty text removes a label)",
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+    session.notes.set(label, text);
+    let _ = crate::agent::session::save(&session);
+    bot.send_message(chat, format!("✅ info.{} saved.", label.to_lowercase()))
         .await?;
     Ok(())
 }
@@ -371,8 +429,12 @@ async fn do_connect(bot: &Bot, chat: ChatId, state: &BotState, args: &str) -> an
             bot.send_message(
                 chat,
                 format!(
-                    "❌ {e}\n\nUsage:\n/connect <url> [name=N] [auth=TOKEN] [Header:Value ...]\n\n\
-                     Example:\nhttps://host/mcp auth=SECRET X-Tracker-Token:abc X-Tracker-Org-Id:42"
+                    "❌ {e}\n\nUsage:\n\
+                     HTTP:  /connect <url> [name=N] [auth=TOKEN] [Header:Value ...]\n\
+                     stdio: /connect stdio <program> [args...] [name=N] [env=KEY=VAL ...]\n\n\
+                     Examples:\n\
+                     https://host/mcp auth=SECRET X-Tracker-Token:abc\n\
+                     stdio npx -y @cocal/google-calendar-mcp name=gcal"
                 ),
             )
             .await?;
@@ -476,7 +538,7 @@ async fn send_mcp_list(bot: &Bot, chat: ChatId, state: &BotState) -> anyhow::Res
     for n in &names {
         if let Some(c) = guard.get(n) {
             let tc = c.tools().await.len();
-            bot.send_message(chat, format!("• {n} — {tc} tools\n{}", c.params.url))
+            bot.send_message(chat, format!("• {n} — {tc} tools\n{}", c.params.target()))
                 .reply_markup(server_keyboard(n))
                 .await?;
         }
@@ -533,16 +595,29 @@ fn server_keyboard(name: &str) -> InlineKeyboardMarkup {
     ]])
 }
 
-/// Parse `/connect` args. URL-first and forgiving (newlines, order-agnostic):
-/// `/connect <url> [name=NAME] [auth=TOKEN] [Header:Value ...]`
-/// Only the URL is required; name defaults to the URL host (sanitized).
+/// Parse `/connect` args. Two forms:
+///
+/// HTTP (URL-first, order-agnostic):
+///   `/connect <url> [name=NAME] [auth=TOKEN] [Header:Value ...]`
+///
+/// stdio (spawn a child process — for npx/uvx servers):
+///   `/connect stdio <program> [args...] [name=NAME] [env=KEY=VALUE ...]`
+///
+/// In stdio form the leading `stdio` keyword switches modes; every token that
+/// is not `name=…` / `env=…` becomes part of the spawn command, in order.
 fn parse_connect(args: &str) -> Result<ConnectParams, String> {
+    let mut toks = args.split_whitespace().peekable();
+    if toks.peek().is_some_and(|t| *t == "stdio") {
+        toks.next(); // consume the keyword
+        return parse_connect_stdio(toks);
+    }
+
     let mut url: Option<String> = None;
     let mut name: Option<String> = None;
     let mut auth = None;
     let mut headers = Vec::new();
 
-    for tok in args.split_whitespace() {
+    for tok in toks {
         if tok.starts_with("http://") || tok.starts_with("https://") {
             url = Some(tok.to_string());
         } else if let Some(v) = tok.strip_prefix("name=") {
@@ -565,7 +640,68 @@ fn parse_connect(args: &str) -> Result<ConnectParams, String> {
         url,
         auth,
         headers,
+        command: Vec::new(),
+        env: Vec::new(),
     })
+}
+
+/// Parse the tail of a `/connect stdio …` command (keyword already consumed).
+fn parse_connect_stdio<'a>(toks: impl Iterator<Item = &'a str>) -> Result<ConnectParams, String> {
+    let mut name: Option<String> = None;
+    let mut command: Vec<String> = Vec::new();
+    let mut env: Vec<(String, String)> = Vec::new();
+
+    for tok in toks {
+        if let Some(v) = tok.strip_prefix("name=") {
+            name = Some(v.to_string());
+        } else if let Some(kv) = tok.strip_prefix("env=") {
+            let (k, v) = kv
+                .split_once('=')
+                .ok_or_else(|| format!("bad env '{kv}' (expected env=KEY=VALUE)"))?;
+            env.push((k.to_string(), v.to_string()));
+        } else {
+            // Everything else is part of the spawn command, order preserved.
+            command.push(tok.to_string());
+        }
+    }
+
+    if command.is_empty() {
+        return Err("no program after 'stdio' — e.g. stdio npx -y <package>".into());
+    }
+    let name = name.unwrap_or_else(|| default_stdio_name(&command));
+    Ok(ConnectParams {
+        name,
+        url: String::new(),
+        auth: None,
+        headers: Vec::new(),
+        command,
+        env,
+    })
+}
+
+/// Derive a server name from a stdio command: last path segment of the last
+/// argument (usually the package name), sanitized. Falls back to the program.
+pub fn default_stdio_name(command: &[String]) -> String {
+    let pick = command
+        .iter()
+        .rev()
+        .find(|a| !a.starts_with('-'))
+        .map(String::as_str)
+        .unwrap_or(&command[0]);
+    let seg = pick
+        .rsplit(['/', '@'])
+        .find(|s| !s.is_empty())
+        .unwrap_or(pick);
+    let cleaned: String = seg
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '_' })
+        .collect();
+    let trimmed = cleaned.trim_matches('_');
+    if trimmed.is_empty() {
+        "mcp".to_string()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 /// Parse `/call <server> <tool> [json-args]`.
@@ -630,7 +766,7 @@ fn parse_watch(
 }
 
 /// Derive a short server name from a URL: host[:port], sanitized.
-fn default_name(url: &str) -> String {
+pub fn default_name(url: &str) -> String {
     let rest = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
     let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
     let cleaned: String = authority
@@ -725,6 +861,42 @@ mod tests {
     #[test]
     fn parse_connect_bare_word_errors() {
         assert!(parse_connect("https://h plainword").is_err());
+    }
+
+    #[test]
+    fn parse_connect_stdio_basic_autoname() {
+        let p = parse_connect("stdio npx -y @cocal/google-calendar-mcp").unwrap();
+        assert!(p.is_stdio());
+        assert_eq!(p.command, vec!["npx", "-y", "@cocal/google-calendar-mcp"]);
+        assert_eq!(p.name, "google_calendar_mcp");
+        assert!(p.url.is_empty());
+    }
+
+    #[test]
+    fn parse_connect_stdio_name_and_env() {
+        let p = parse_connect(
+            "stdio uvx telegram-mcp name=tg env=TELEGRAM_API_ID=123 env=TELEGRAM_API_HASH=abc",
+        )
+        .unwrap();
+        assert_eq!(p.name, "tg");
+        assert_eq!(p.command, vec!["uvx", "telegram-mcp"]);
+        assert_eq!(
+            p.env,
+            vec![
+                ("TELEGRAM_API_ID".to_string(), "123".to_string()),
+                ("TELEGRAM_API_HASH".to_string(), "abc".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_connect_stdio_empty_command_errors() {
+        assert!(parse_connect("stdio name=x").is_err());
+    }
+
+    #[test]
+    fn parse_connect_stdio_bad_env_errors() {
+        assert!(parse_connect("stdio npx pkg env=NOEQUALS").is_err());
     }
 
     #[test]

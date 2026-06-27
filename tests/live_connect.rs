@@ -13,6 +13,8 @@ async fn connects_and_lists_tools() {
         url: "http://5.129.234.9:3000/mcp".into(),
         auth: None,
         headers: vec![],
+        command: vec![],
+        env: vec![],
     };
     let client = McpClient::connect(params, tx)
         .await
@@ -53,6 +55,8 @@ async fn registry_keeps_connection_across_calls() {
         url: "http://5.129.234.9:3000/mcp".into(),
         auth: None,
         headers: vec![],
+        command: vec![],
+        env: vec![],
     };
     let n = state.connect_mcp(params).await.expect("connect");
     assert_eq!(n, 18, "expected 18 tools");
