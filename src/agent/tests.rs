@@ -397,11 +397,23 @@ fn session_uses_default_invariants_when_empty() {
 // ---------- flow ----------
 
 #[test]
-fn trip_plan_parses_json() {
-    let plan: super::flow::TripPlan = serde_json::from_str(
-        r#"{"cities":["Москва","Сочи"],"dates":["2026-06-28"],"note":"weekend"}"#,
-    )
-    .unwrap();
-    assert_eq!(plan.cities, vec!["Москва", "Сочи"]);
-    assert_eq!(plan.dates.len(), 1);
+fn trip_flow_state_roundtrips() {
+    // The stateful flow must survive session persistence (serde) across turns.
+    let mut st = super::flow::TripFlowState::start();
+    st.brief.fields.insert("area".into(), "Карелия".into());
+    st.brief
+        .fields
+        .insert("date_window".into(), "next 2 weeks".into());
+    let json = serde_json::to_string(&st).unwrap();
+    let back: super::flow::TripFlowState = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.brief.fields.get("area").unwrap(), "Карелия");
+    assert_eq!(back.stage, super::flow::Stage::Clarify);
+}
+
+#[test]
+fn trip_intent_detection() {
+    assert!(super::flow::looks_like_trip(
+        "хочу в поход на байдарках с ночёвкой"
+    ));
+    assert!(!super::flow::looks_like_trip("какая погода в Сочи завтра"));
 }

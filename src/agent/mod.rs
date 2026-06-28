@@ -30,6 +30,9 @@ pub struct TurnResult {
     pub facts_learned: usize,
     pub profile_updated: usize,
     pub invariant_status: InvariantStatus,
+    /// Pipeline trace when this turn ran the trip-planning swarm (one line per
+    /// completed stage); empty for ordinary turns.
+    pub trace: Vec<String>,
 }
 
 /// Run one conversational turn:
@@ -48,6 +51,29 @@ pub async fn run_turn(
 ) -> anyhow::Result<TurnResult> {
     session.memory.push_message("user", user_text);
 
+    // --- trip-planning swarm routing (stateful, suspends across turns) ---
+    // Continue an active flow, or start one when the message looks like a trip
+    // request. The flow does its own clarify → plan → route → camp → schedule →
+    // doc orchestration, so it bypasses the single-shot answer path below.
+    let in_flow = session.trip.is_some();
+    if in_flow || flow::looks_like_trip(user_text) {
+        if !in_flow {
+            session.trip = Some(flow::TripFlowState::start());
+        }
+        let turn = flow::advance(llm, state, session, user_text).await?;
+        if turn.done {
+            session.trip = None;
+        }
+        session.memory.push_message("assistant", &turn.reply);
+        return Ok(TurnResult {
+            answer: turn.reply,
+            facts_learned: 0,
+            profile_updated: 0,
+            invariant_status: InvariantStatus::Passed,
+            trace: turn.trace,
+        });
+    }
+
     // --- topic-scope gate (CODE invariant, runs before any LLM call) ---
     // Off-topic messages are refused here so they cost ~0 tokens: no fact /
     // profile extraction, no answer loop, no invariant retries.
@@ -59,6 +85,7 @@ pub async fn run_turn(
             facts_learned: 0,
             profile_updated: 0,
             invariant_status: InvariantStatus::Passed,
+            trace: vec![],
         });
     }
 
@@ -126,6 +153,7 @@ pub async fn run_turn(
         facts_learned,
         profile_updated: profile_updated + profile_inline,
         invariant_status: status,
+        trace: vec![],
     })
 }
 

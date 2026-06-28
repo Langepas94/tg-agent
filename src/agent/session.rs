@@ -20,6 +20,10 @@ pub struct ChatSession {
     /// Custom invariants; empty → defaults are used at prompt-build time.
     #[serde(default)]
     pub invariants: Vec<Invariant>,
+    /// Active stateful trip-planning flow, if any (Clarify suspends here across
+    /// turns). `None` outside a planning conversation.
+    #[serde(default)]
+    pub trip: Option<super::flow::TripFlowState>,
 }
 
 impl ChatSession {
@@ -30,6 +34,7 @@ impl ChatSession {
             profile: UserProfile::default(),
             notes: UserNotes::default(),
             invariants: Vec::new(),
+            trip: None,
         }
     }
 

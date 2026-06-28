@@ -169,23 +169,36 @@ async fn agent_cancels_subscription_on_request() {
 
 #[tokio::test]
 #[ignore]
-async fn travel_flow_pipeline_runs() {
+async fn trip_swarm_clarifies_then_plans() {
     let (llm, state) = setup().await;
-    let session = ChatSession::new(202);
+    let mut session = ChatSession::new(202);
 
-    let report = agent::flow::run(&llm, &state, &session, "Москва и Сочи на эти выходные")
-        .await
-        .expect("flow");
+    // 1. A trip request auto-starts the flow and should CLARIFY first (ask
+    //    questions), not dump a finished plan.
+    let r1 = agent::run_turn(
+        &llm,
+        &state,
+        &mut session,
+        "Хочу в поход на байдарках с одной ночёвкой",
+    )
+    .await
+    .expect("turn1");
+    println!("\n=== CLARIFY ===\n{}\n", r1.answer);
+    assert!(session.trip.is_some(), "flow did not start");
+    assert!(r1.trace.is_empty(), "should still be clarifying, no pipeline yet");
 
-    println!("\n=== PLAN === {:?}", report.plan);
-    for r in &report.records {
-        println!("[{:?}] {}", r.stage, r.output);
-    }
-    println!("\n=== FINAL ===\n{}\n", report.answer);
-
-    assert!(!report.plan.cities.is_empty(), "planner found no cities");
-    assert!(
-        report.answer.chars().any(|c| c.is_ascii_digit()),
-        "no weather numbers"
-    );
+    // 2. Provide the missing facts and force planning; the swarm runs and
+    //    produces a trace plus a final plan.
+    let r2 = agent::run_turn(
+        &llm,
+        &state,
+        &mut session,
+        "Старт из Москвы, в ближайшие 2 недели. Команда ленивая, любит шашлык. Поехали, планируй.",
+    )
+    .await
+    .expect("turn2");
+    println!("\n=== TRACE ===\n{}", r2.trace.join("\n"));
+    println!("\n=== FINAL ===\n{}\n", r2.answer);
+    assert!(!r2.trace.is_empty(), "pipeline did not run");
+    assert!(session.trip.is_none(), "flow should be cleared when done");
 }
