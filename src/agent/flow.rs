@@ -115,6 +115,12 @@ pub struct TripFlowState {
     pub records: Vec<StageRecord>,
     #[serde(default)]
     pub clarify_rounds: u8,
+    /// When a checkpoint stage (Planning / Camp) has presented options and is
+    /// waiting for the user to choose, this holds that stage. The user's next
+    /// message is their choice: we re-run that stage to FINALIZE it, then
+    /// auto-advance. `None` whenever we are not paused on a checkpoint.
+    #[serde(default)]
+    pub awaiting_choice: Option<Stage>,
 }
 
 impl TripFlowState {
@@ -124,6 +130,7 @@ impl TripFlowState {
             brief: TripBrief::default(),
             records: Vec::new(),
             clarify_rounds: 0,
+            awaiting_choice: None,
         }
     }
 }
@@ -139,66 +146,10 @@ pub struct FlowTurn {
     pub done: bool,
 }
 
-/// Keyword trigger for auto-detecting a trip-planning request in normal chat.
-/// Token-frugal: a substring hit starts the flow, no extra LLM intent call.
-const TRIP_TRIGGERS: &[&str] = &[
-    // RU outdoor / overnight
-    "поход",
-    "сплав",
-    "байдар",
-    "каяк",
-    "каноэ",
-    "рафтинг",
-    "кемпинг",
-    "палатк",
-    "ночёвк",
-    "ночевк",
-    "ночлег",
-    "стоянк",
-    "привал",
-    "костёр",
-    "костер",
-    "шашлык",
-    "барбекю",
-    "сплан",
-    "вылазк",
-    "турпоход",
-    // EN
-    "kayak",
-    "canoe",
-    "rafting",
-    "hike",
-    "hiking",
-    "camp",
-    "camping",
-    "bbq",
-    "getaway",
-    "paddle",
-];
-
-/// Cheap keyword pre-filter: does this message look like a trip-planning request?
-pub fn looks_like_trip(text: &str) -> bool {
-    let low = text.to_lowercase();
-    TRIP_TRIGGERS.iter().any(|t| low.contains(t))
-}
-
-/// User phrases that force planning to start even if the brief is thin.
-const GO_PHRASES: &[&str] = &[
-    "поехали",
-    "планируй",
-    "хватит",
-    "достаточно",
-    "погнали",
-    "давай уже",
-    "just plan",
-    "go ahead",
-    "let's go",
-];
-
-fn user_forces_go(text: &str) -> bool {
-    let low = text.to_lowercase();
-    GO_PHRASES.iter().any(|p| low.contains(p))
-}
+// Trip-intent detection and "user wants to start now" judgement are NOT done
+// here with keyword lists — the semantic router (`super::router`) decides entry
+// into the flow, and the Clarify agent decides, by meaning, when the brief is
+// ready to plan. See `router.rs` and `CLARIFY_PROMPT`.
 
 // ---------------------------------------------------------------------------
 // Clarify agent
@@ -221,8 +172,10 @@ nearby). If the message already conveys these (e.g. 'команда неподг
 'одна ночёвка', 'в ближайшие 2 недели', 'вода в 30 м'), mark them filled — do NOT re-ask. \
 \
 Set `ready=true` as soon as you have a start region (from profile or message) and a rough date \
-window; everything else the planners infer. Only when something essential is genuinely missing, \
-ask up to 2 SHORT questions for it. Reply in the user's language. \
+window; everything else the planners infer. Also set `ready=true` if the user signals they want \
+to start now / stop being asked (judge this by meaning, e.g. 'поехали', 'хватит вопросов', \
+'just plan it'). Only when something essential is genuinely missing, ask up to 2 SHORT questions \
+for it. Reply in the user's language. \
 Return ONLY JSON: {\"brief\":{\"key\":\"value\",...},\"ready\":bool,\"questions\":[\"...\"],\
 \"recap\":\"one short line summarizing the trip so far\"}.";
 
@@ -331,15 +284,29 @@ impl Stage {
         )
     }
 
+    /// Checkpoint stages stop and present the user a choice before the flow
+    /// continues. Planning proposes candidate day+place combos; Camp proposes
+    /// the overnight site(s). On first run they present options and pause; on
+    /// the user's reply they finalize the chosen option and the flow advances.
+    pub fn is_checkpoint(&self) -> bool {
+        matches!(self, Stage::Planning | Stage::Camp)
+    }
+
     /// The worker-agent task for an execution stage (empty for Clarify/Done).
     fn instruction(&self) -> &'static str {
         match self {
             Stage::Planning => {
-                "Pick the single BEST day within the user's date window and the best concrete \
-                 river/area near their start region for this kind of trip. Use the weather tools \
-                 (geocode then forecast) to compare candidate days — favor low rain, light wind, \
-                 comfortable temperature. State the chosen DATE with a one-line weather rationale \
-                 (include numbers) and name the specific waterway/area."
+                "You are a CHECKPOINT stage: you offer the user a choice, you do NOT decide alone. \
+                 Use the weather tools (geocode then forecast) to evaluate candidate days within \
+                 the user's date window for concrete rivers/areas near their start region.\n\
+                 - If [user-choice] below is empty (first run): PROPOSE 2-3 distinct CANDIDATE \
+                 options, each = a specific day + a specific waterway/area + a one-line weather \
+                 rationale WITH NUMBERS (rain, wind, temperature). Make them genuinely different \
+                 (different days and/or places) so the choice is meaningful. End by asking the \
+                 user to pick one (or ask to see other options). Do NOT commit yet.\n\
+                 - If [user-choice] below names the option the user picked (or asks to adjust): \
+                 COMMIT to a single final choice — the chosen DATE and the specific waterway/area \
+                 — with the confirming weather numbers. Output just that final pick."
             }
             Stage::Routing => {
                 "Design the actual on-water route. You MUST call the maps/OSM tools to get REAL \
@@ -351,13 +318,19 @@ impl Stage {
                  party. Keep total distance modest."
             }
             Stage::Camp => {
-                "Choose ONE overnight campsite on the route. You MUST use the maps/OSM tools to \
-                 VERIFY the constraints with real data: query nearby settlements/turbazy/roads to \
-                 confirm the minimum distance from civilization, and confirm the campsite is within \
-                 the required distance to water. NEVER guess coordinates — derive them from tool \
-                 results. Output the campsite's real coordinates, the measured distance to water, \
-                 and the measured distance to the nearest village/turbaza/road. If a query fails, \
-                 say which one and what is still unverified — do not fabricate a passing number."
+                "You are a CHECKPOINT stage: you propose the overnight site and let the user \
+                 confirm, you do NOT silently decide. You MUST use the maps/OSM tools to VERIFY \
+                 constraints with real data: query nearby settlements/turbazy/roads to confirm the \
+                 minimum distance from civilization, and confirm the site is within the required \
+                 distance to water. NEVER guess coordinates — derive them from tool results.\n\
+                 - If [user-choice] below is empty (first run): propose 1-2 candidate campsites on \
+                 the route, each with real coordinates, the measured distance to water, and the \
+                 measured distance to the nearest village/turbaza/road. End by asking the user to \
+                 confirm one (or ask for another). Do NOT finalize yet.\n\
+                 - If [user-choice] below confirms a site (or asks to move it): COMMIT to that one \
+                 site and output its final verified coordinates and distances.\n\
+                 If a query fails, say which one and what is still unverified — do not fabricate a \
+                 passing number."
             }
             Stage::Schedule => {
                 "Create a real calendar event for this trip via the connected Google/calendar \
@@ -420,8 +393,11 @@ no output yet. \
 - If the user's latest message asks to CHANGE or REDO an earlier decision (different date, \
 different river/route, move the campsite, change the event), pick that EARLIER stage (a step \
 back), mode=run — its and all later stages' outputs will be recomputed. \
-- Use mode=ask only when you genuinely need the user to decide something you cannot; put a short \
-question in message. \
+- Always use mode=run for execution stages. The Planning and Camp stages are CHECKPOINTS: they \
+present their own candidate options to the user and pause for a choice, so you do NOT need to ask \
+the user yourself before running them. \
+- Use mode=ask only in the rare case you need a fact no stage can obtain; put a short question in \
+message. \
 - When every stage through Doc has output and the user is not asking for changes, pick \
 next_stage=Done, mode=run.";
 
@@ -534,10 +510,12 @@ fn drop_from(records: &mut Vec<StageRecord>, stage: &Stage) {
 /// Maximum orchestrator steps per user turn (auto-advance bound), so one turn
 /// can walk Planning→…→Doc→Done but never loops forever.
 const MAX_ORCH_STEPS: usize = 12;
-/// Hard wall clock limit for one worker stage. External map/weather/Google
-/// tools can be slow or rate-limited; stop the stage instead of leaving the
-/// Telegram user staring at "typing..." for many minutes.
-const STAGE_TIMEOUT: Duration = Duration::from_secs(150);
+/// Safety net for ONE stage attempt that is genuinely stuck (a stalled external
+/// tool connection), not a planning budget. A normal OSM/weather stage finishes
+/// well under this; we also retry once and never dead-end on a hit, so a high
+/// value just prevents a hang — it does not make the user wait this long in the
+/// common case.
+const STAGE_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Advance the flow by one user turn. The caller guarantees `session.trip` is
 /// `Some`. The ORCHESTRATOR agent decides every transition; the user can step
@@ -559,40 +537,50 @@ pub async fn advance(
         .map(|t| t.records.clone())
         .unwrap_or_default();
     let mut trace: Vec<String> = Vec::new();
-    let forced = user_forces_go(user_text);
+    // If we paused on a checkpoint last turn, the user's message now is their
+    // choice for that stage: re-run it to finalize, then auto-advance.
+    let awaiting = session
+        .trip
+        .as_ref()
+        .and_then(|t| t.awaiting_choice.clone());
     // First contact with a fresh flow: ALWAYS clarify first (never let the
-    // orchestrator dive into the 5-stage pipeline on a raw multi-part request).
-    // Guarantees a fast first reply that asks questions, and avoids the old
-    // single-shot "burn 12 tool calls then give up" failure on a megaprompt.
-    let first_contact =
-        records.is_empty() && session.trip.as_ref().map(|t| t.clarify_rounds).unwrap_or(0) == 0;
+    // orchestrator dive into the pipeline on a raw multi-part request). After
+    // clarifying, the flow advances to the Planning checkpoint, which presents
+    // candidate days/places instead of silently planning everything at once.
+    let first_contact = records.is_empty()
+        && awaiting.is_none()
+        && session.trip.as_ref().map(|t| t.clarify_rounds).unwrap_or(0) == 0;
 
     for step in 0..MAX_ORCH_STEPS {
         let user_empty = step > 0; // only the first step carries the user's message
         let umsg = if user_empty { "" } else { user_text };
+        // True when this exec run finalizes the checkpoint the user just answered.
+        let finalizing = |stage: &Stage| !user_empty && awaiting.as_ref() == Some(stage);
 
-        // ---- Orchestrator agent picks the next transition ----
+        // ---- Pick the next transition ----
         let decision = if step == 0 && first_contact {
-            // Skip the orchestrator call entirely on turn 1: clarify is mandatory.
+            // Turn 1: clarify is mandatory; skip the orchestrator call.
             Decision {
                 next: Stage::Clarify,
                 mode: Mode::Run,
                 message: String::new(),
             }
+        } else if step == 0 && awaiting.is_some() {
+            // The user is replying to a checkpoint → re-run that stage to finalize.
+            Decision {
+                next: awaiting.clone().unwrap(),
+                mode: Mode::Run,
+                message: String::new(),
+            }
         } else {
             let orch_input = format!(
-                "[trip-brief]\n{}\n\n[completed-stages]\n{}\n\n[user-message]\n{}{}",
+                "[trip-brief]\n{}\n\n[completed-stages]\n{}\n\n[user-message]\n{}",
                 brief.render(),
                 completed_list(&records),
                 if umsg.trim().is_empty() {
                     "(none)"
                 } else {
                     umsg
-                },
-                if forced && !user_empty {
-                    "\n[hint] The user signaled they want to proceed with what's known."
-                } else {
-                    ""
                 },
             );
             let raw = llm
@@ -641,14 +629,7 @@ pub async fn advance(
                         t.clarify_rounds
                     })
                     .unwrap_or(0);
-                let enough = parsed.ready || forced || rounds >= MAX_CLARIFY_ROUNDS;
-                if first_contact {
-                    return Ok(FlowTurn {
-                        reply: render_first_contact_reply(&parsed.recap, &parsed.questions, enough),
-                        trace,
-                        done: false,
-                    });
-                }
+                let enough = parsed.ready || rounds >= MAX_CLARIFY_ROUNDS;
                 if !enough {
                     return Ok(FlowTurn {
                         reply: render_clarify_reply(&parsed.recap, &parsed.questions),
@@ -656,7 +637,8 @@ pub async fn advance(
                         done: false,
                     });
                 }
-                // Brief good enough → let the orchestrator advance next step.
+                // Brief good enough → advance to the Planning checkpoint, which
+                // will present candidate days/places for the user to choose.
                 continue;
             }
 
@@ -681,6 +663,7 @@ pub async fn advance(
                         t.stage = stage.clone();
                         t.brief = brief.clone();
                         t.records = records.clone();
+                        t.awaiting_choice = None;
                     }
                     return Ok(FlowTurn {
                         reply: if decision.message.trim().is_empty() {
@@ -692,21 +675,56 @@ pub async fn advance(
                         done: false,
                     });
                 }
-                // Back-step: redoing a stage invalidates it and everything after.
+                let is_final = finalizing(stage);
+                // Back-step / re-run invalidates this stage and everything after.
                 drop_from(&mut records, stage);
-                let output = run_exec_stage(llm, state, session, &brief, &records, stage).await;
+                // Pass the user's choice only when finalizing a checkpoint, so the
+                // stage commits to the option they picked; otherwise it proposes.
+                let choice = if is_final { user_text } else { "" };
+                let output =
+                    run_exec_stage(llm, state, session, &brief, &records, stage, choice).await;
                 set_record(&mut records, stage, output.clone());
                 trace.push(format!("• {}: {}", stage.name(), clip(&output, 90)));
-                if let Some(t) = session.trip.as_mut() {
-                    t.stage = stage.clone();
-                    t.records = records.clone();
-                }
-                if is_stage_failure(&output) {
+                // A failed/timed-out stage is NOT a dead-end. Only a CHECKPOINT
+                // failure pauses (it has nothing to show), with a short honest
+                // note. A non-checkpoint failure is carried forward as
+                // best-effort; the final compose flags whatever stayed
+                // unverified. We never scold the user or ask them to "narrow the
+                // river" — picking the river is the planner's job.
+                if is_stage_failure(&output) && stage.is_checkpoint() {
+                    if let Some(t) = session.trip.as_mut() {
+                        t.stage = stage.clone();
+                        t.brief = brief.clone();
+                        t.records = records.clone();
+                        // Keep awaiting on the checkpoint so the user can retry it.
+                        t.awaiting_choice = Some(stage.clone());
+                    }
                     return Ok(FlowTurn {
-                        reply: render_stage_failure(stage, &output),
+                        reply: render_checkpoint_stall(stage),
                         trace,
                         done: false,
                     });
+                }
+                // Checkpoint: on its FIRST run (not a finalize) present the
+                // options and pause for the user's choice.
+                if stage.is_checkpoint() && !is_final {
+                    if let Some(t) = session.trip.as_mut() {
+                        t.stage = stage.clone();
+                        t.brief = brief.clone();
+                        t.records = records.clone();
+                        t.awaiting_choice = Some(stage.clone());
+                    }
+                    return Ok(FlowTurn {
+                        reply: output,
+                        trace,
+                        done: false,
+                    });
+                }
+                // Non-checkpoint, or a finalized checkpoint → keep advancing.
+                if let Some(t) = session.trip.as_mut() {
+                    t.stage = stage.clone();
+                    t.records = records.clone();
+                    t.awaiting_choice = None;
                 }
                 continue;
             }
@@ -736,22 +754,38 @@ async fn run_exec_stage(
     brief: &TripBrief,
     records: &[StageRecord],
     stage: &Stage,
+    user_choice: &str,
 ) -> String {
     let system = stage_system(session, stage.name());
+    let choice = user_choice.trim();
     let query = format!(
-        "[trip-brief]\n{}\n\n[prior-stages]\n{}\n\n[your-task as the {} agent]\n{}",
+        "[trip-brief]\n{}\n\n[prior-stages]\n{}\n\n[user-choice]\n{}\n\n\
+         [your-task as the {} agent]\n{}",
         brief.render(),
         render_records(records),
+        if choice.is_empty() {
+            "(none yet)"
+        } else {
+            choice
+        },
         stage.name(),
         stage.instruction(),
     );
-    match tokio::time::timeout(
-        STAGE_TIMEOUT,
-        llm.answer_with_system(state, &system, &query),
-    )
-    .await
-    {
-        Err(_) => format!("(stage timed out after {STAGE_TIMEOUT:?})"),
+    // One automatic retry: external map/weather tools (Overpass especially)
+    // return transient 429/504s, so a single retry usually succeeds where the
+    // first attempt timed out or errored. Failures are NOT surfaced to the user
+    // as a dead-end here — the caller carries a best-effort result forward.
+    let mut last = run_stage_once(llm, state, &system, &query).await;
+    if is_stage_failure(&last) {
+        last = run_stage_once(llm, state, &system, &query).await;
+    }
+    last
+}
+
+/// One bounded attempt at a stage's worker agent.
+async fn run_stage_once(llm: &Llm, state: &BotState, system: &str, query: &str) -> String {
+    match tokio::time::timeout(STAGE_TIMEOUT, llm.answer_with_system(state, system, query)).await {
+        Err(_) => "(stage timed out)".to_string(),
         Ok(Ok(o)) if !o.trim().is_empty() => o,
         Ok(Ok(_)) => "(no output)".to_string(),
         Ok(Err(e)) => format!("(stage failed: {e})"),
@@ -797,24 +831,6 @@ fn prevent_auto_repeat(decision: Decision, records: &[StageRecord], user_empty: 
     }
 }
 
-fn render_first_contact_reply(recap: &str, questions: &[String], enough: bool) -> String {
-    if !enough {
-        return render_clarify_reply(recap, questions);
-    }
-    let recap = recap.trim();
-    let mut out = String::new();
-    if recap.is_empty() {
-        out.push_str("Принял вводные по сплаву.");
-    } else {
-        out.push_str(recap);
-    }
-    out.push_str(
-        "\n\nЗадача большая: погода, маршрут, проверка стоянки, календарь и Google Doc. \
-Чтобы не молчать много минут одним сообщением, я разбил её на шаги. Напишите «поехали» — начну планирование по этим вводным.",
-    );
-    out
-}
-
 fn is_stage_failure(output: &str) -> bool {
     let text = output.trim();
     text.starts_with("Stopped after too many tool calls")
@@ -822,11 +838,18 @@ fn is_stage_failure(output: &str) -> bool {
         || text.starts_with("(stage timed out")
 }
 
-fn render_stage_failure(stage: &Stage, output: &str) -> String {
+/// Short, honest stall note for a CHECKPOINT stage whose map/weather tools did
+/// not respond in time (even after a retry). No scolding, and never asks the
+/// user to pick a river/area — that is the planner's job.
+fn render_checkpoint_stall(stage: &Stage) -> String {
+    let what = match stage {
+        Stage::Planning => "подобрать день и место",
+        Stage::Camp => "проверить стоянку по карте",
+        _ => "собрать данные",
+    };
     format!(
-        "Остановился на этапе {}: {}\n\nНе буду крутиться молча дальше. Можно сузить район/реку или написать «продолжай», и я попробую с уже собранными вводными.",
-        stage.name(),
-        clip(output.trim(), 500)
+        "Картографические/погодные сервисы сейчас отвечают медленно — не успел {what}. \
+Напишите «ещё раз» — повторю запрос.",
     )
 }
 
@@ -838,7 +861,12 @@ campsite (with distances), gear/BBQ notes, and — if created — the calendar e
 shareable doc link. Be concrete; do not invent a doc link or coordinates that the stages did \
 not produce. If a stage returned an AUTHORIZATION URL (Google sign-in / start_google_auth), \
 keep that URL VERBATIM in the final message as a clickable link with a one-line 'open and approve \
-access' instruction — never drop it and never turn it into a vague 'нужен токен/доступ'. Keep it tight.";
+access' instruction — never drop it and never turn it into a vague 'нужен токен/доступ'. \
+If a stage output shows it stalled or failed (e.g. '(stage timed out)', '(stage failed: …)'), \
+do NOT fabricate that section's data: present the rest of the plan normally and add one short \
+honest line that that specific part (e.g. the campsite distances) is approximate / still to be \
+verified — without scolding the user and without asking them to choose a river or narrow the \
+area. Keep it tight.";
 
 /// Build a stage's system prompt: the layered base prompt + a stage role line.
 fn stage_system(session: &ChatSession, role: &str) -> String {
@@ -911,19 +939,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn detects_trip_intent() {
-        assert!(looks_like_trip("хочу в поход на байдарках на выходных"));
-        assert!(looks_like_trip("plan a kayak trip with camping"));
-        assert!(!looks_like_trip("какая погода в Москве завтра"));
-    }
-
-    #[test]
-    fn go_phrase_forces_plan() {
-        assert!(user_forces_go("да поехали уже планируй"));
-        assert!(!user_forces_go("а можно поближе к воде?"));
-    }
-
-    #[test]
     fn brief_merge_keeps_nonempty_new_wins() {
         let mut b = TripBrief::default();
         let mut e = BTreeMap::new();
@@ -981,6 +996,32 @@ mod tests {
         assert_eq!(Stage::parse("ROUTE"), Some(Stage::Routing));
         assert_eq!(Stage::parse("calendar"), Some(Stage::Schedule));
         assert_eq!(Stage::parse("garbage"), None);
+    }
+
+    // ---- checkpoint stages ----
+
+    #[test]
+    fn only_planning_and_camp_are_checkpoints() {
+        assert!(Stage::Planning.is_checkpoint());
+        assert!(Stage::Camp.is_checkpoint());
+        assert!(!Stage::Routing.is_checkpoint());
+        assert!(!Stage::Schedule.is_checkpoint());
+        assert!(!Stage::Doc.is_checkpoint());
+        assert!(!Stage::Clarify.is_checkpoint());
+        assert!(!Stage::Done.is_checkpoint());
+    }
+
+    #[test]
+    fn awaiting_choice_survives_serde_roundtrip() {
+        let mut st = TripFlowState::start();
+        assert!(st.awaiting_choice.is_none());
+        st.awaiting_choice = Some(Stage::Planning);
+        let json = serde_json::to_string(&st).unwrap();
+        let back: TripFlowState = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.awaiting_choice, Some(Stage::Planning));
+        // legacy state without the field deserializes to None (serde default)
+        let legacy: TripFlowState = serde_json::from_str(r#"{"stage":"Clarify"}"#).unwrap();
+        assert!(legacy.awaiting_choice.is_none());
     }
 
     // ---- brief.has_minimum heuristic ----
