@@ -32,8 +32,10 @@ use super::session::ChatSession;
 const MAX_CLARIFY_ROUNDS: u8 = 3;
 
 /// Per-stage output is clipped to this many bytes when handed to the next stage,
-/// keeping the cumulative prompt bounded.
-const HANDOFF_CLIP: usize = 700;
+/// keeping the cumulative prompt bounded. A committed stage result (chosen day,
+/// route coords, campsite) fits well under this; the verbose user-facing prose
+/// is for the chat, not the hand-off.
+const HANDOFF_CLIP: usize = 400;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Stage {
@@ -634,7 +636,20 @@ pub async fn advance(
                 mode: Mode::Run,
                 message: String::new(),
             }
+        } else if user_empty {
+            // Auto-advance within a turn: the pipeline is linear, so pick the
+            // next unfilled stage DETERMINISTICALLY. No orchestrator LLM call —
+            // it would only re-derive the same order while re-sending the brief
+            // and every stage summary, burning tokens on each of the ~5 steps.
+            Decision {
+                next: next_exec_after(&records),
+                mode: Mode::Run,
+                message: String::new(),
+            }
         } else {
+            // The user sent a message mid-flow (not first contact, not a pending
+            // checkpoint): consult the orchestrator ONCE — it may route a
+            // back-step like "change the date" / "move the camp".
             let orch_input = format!(
                 "[trip-brief]\n{}\n\n[completed-stages]\n{}\n\n[user-message]\n{}",
                 brief.render(),
@@ -880,7 +895,7 @@ async fn run_exec_stage(
     stage: &Stage,
     user_choice: &str,
 ) -> String {
-    let system = stage_system(session, stage.name());
+    let system = stage_system(session, stage);
     let choice = user_choice.trim();
     let query = format!(
         "[trip-brief]\n{}\n\n[prior-stages]\n{}\n\n[user-choice]\n{}\n\n\
@@ -1036,29 +1051,20 @@ honest line that that specific part (e.g. the overnight-spot distances) is appro
 be verified — without scolding the user and without asking them to choose a specific place or \
 narrow the area. Keep it tight.";
 
-/// Build a stage's system prompt: the layered base prompt + a stage role line.
-fn stage_system(session: &ChatSession, role: &str) -> String {
-    let invariants = session.effective_invariants();
-    super::prompt::build_system_prompt(
-        &session.memory,
-        &session.profile,
-        &[],
-        &invariants,
-        Some(&format!(
-            "You are the {role} agent in a multi-stage trip-planning swarm. Do ONLY your stage's \
-             task, building on the prior stages' outputs. Use the connected MCP tools when you \
-             need live data or to act. For Russian geography with OSM tools, pass region=\"RU\" \
-             and include \"Россия\" in free-text place queries.\n\
+/// The OSM query rules — large, but only the map-using stages (Routing, Camp)
+/// need them. Including them in Planning/Schedule/Doc just re-sends ~500 tokens
+/// of irrelevant instructions on every call, so they're attached per stage.
+const OSM_QUERY_RULES: &str = "\n\
              OSM QUERY RULES (follow EXACTLY — violating them causes Overpass HTTP 400 and wastes \
              minutes):\n\
              1. To locate a NAMED feature (a place, road, or natural feature), call \
              geocode_address FIRST to get coordinates. NEVER put a name in osm_query_bbox tags — \
-             `{{\"name\":\"Медведица\"}}` produces an unquoted-Cyrillic selector that Overpass \
+             `{\"name\":\"Медведица\"}` produces an unquoted-Cyrillic selector that Overpass \
              rejects with 400. After geocoding, query a SMALL bbox around those coordinates with a \
-             generic tag (e.g. {{\"tourism\":\"camp_site\"}}), no name filter.\n\
+             generic tag (e.g. {\"tourism\":\"camp_site\"}), no name filter.\n\
              2. osm_query_bbox `tags` must be a JSON object whose VALUES are single strings: \
-             {{\"tourism\":\"camp_site\"}} or {{\"place\":\"village\"}}. NEVER an array value \
-             (`{{\"place\":[\"village\",\"hamlet\"]}}` is INVALID → 400) and never a plain string \
+             {\"tourism\":\"camp_site\"} or {\"place\":\"village\"}. NEVER an array value \
+             (`{\"place\":[\"village\",\"hamlet\"]}` is INVALID → 400) and never a plain string \
              or array at top level. Need several values? Run separate small queries or query just \
              the key.\n\
              3. Keep every bbox small (tenths of a degree). Big bboxes time out (504).\n\
@@ -1070,8 +1076,28 @@ fn stage_system(session: &ChatSession, role: &str) -> String {
              coordinates already produced by earlier stages (see [prior-stages]) instead of \
              re-querying them. Pick a specific tag + SMALL bbox; NEVER sweep a broad single-key tag \
              ([tourism], [leisure], [highway], [place]) over a large bbox — those are slow and \
-             waste the whole budget. Target the minimum number of queries that answers your task."
-        )),
+             waste the whole budget. Target the minimum number of queries that answers your task.";
+
+/// Build a stage's system prompt: the layered base prompt + a stage role line.
+/// Only the map stages (Routing, Camp) get the bulky OSM rules appended.
+fn stage_system(session: &ChatSession, stage: &Stage) -> String {
+    let invariants = session.effective_invariants();
+    let mut role = format!(
+        "You are the {} agent in a multi-stage trip-planning swarm. Do ONLY your stage's task, \
+         building on the prior stages' outputs. Use the connected MCP tools when you need live \
+         data or to act. For Russian geography with OSM tools, pass region=\"RU\" and include \
+         \"Россия\" in free-text place queries.",
+        stage.name(),
+    );
+    if matches!(stage, Stage::Routing | Stage::Camp) {
+        role.push_str(OSM_QUERY_RULES);
+    }
+    super::prompt::build_system_prompt(
+        &session.memory,
+        &session.profile,
+        &[],
+        &invariants,
+        Some(&role),
         None,
     )
 }
