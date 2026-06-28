@@ -315,7 +315,12 @@ impl Stage {
                  coordinate you state must come from a tool result. Give the put-in and take-out \
                  with real coordinates, 2-4 named intermediate stops (real places from the map) \
                  with distances/times, and a relaxed pace matching an unprepared, BBQ-focused \
-                 party. Keep total distance modest."
+                 party. Keep total distance modest.\n\
+                 HONESTY GATE: if the map service keeps failing (Overpass 429/504) and you CANNOT \
+                 resolve real put-in/take-out coordinates and at least one real intermediate stop, \
+                 do NOT write vague prose like 'маршрут уточняется' or 'точки не определены'. \
+                 Instead end your reply with a line exactly: 'STAGE_INCOMPLETE: <short reason>'. \
+                 Never present a route as ready without real coordinates."
             }
             Stage::Camp => {
                 "You are a CHECKPOINT stage: you propose the overnight site and let the user \
@@ -329,8 +334,10 @@ impl Stage {
                  confirm one (or ask for another). Do NOT finalize yet.\n\
                  - If [user-choice] below confirms a site (or asks to move it): COMMIT to that one \
                  site and output its final verified coordinates and distances.\n\
-                 If a query fails, say which one and what is still unverified — do not fabricate a \
-                 passing number."
+                 HONESTY GATE: if the map service keeps failing and you CANNOT produce a real \
+                 campsite with verified coordinates and the measured distances (to water and to the \
+                 nearest village/turbaza), do NOT write 'место уточняется' or fabricate numbers. \
+                 Instead end your reply with a line exactly: 'STAGE_INCOMPLETE: <short reason>'."
             }
             Stage::Schedule => {
                 "Create a real calendar event for this trip via the connected Google/calendar \
@@ -644,6 +651,21 @@ pub async fn advance(
 
             // ---- Done: compose the shareable plan and finish ----
             Stage::Done => {
+                // GATE: never declare the trip done while an essential geo stage
+                // (day/place, route points, campsite) is missing or unresolved.
+                if let Some(stage) = first_unresolved_essential(&records) {
+                    if let Some(t) = session.trip.as_mut() {
+                        t.stage = stage.clone();
+                        t.brief = brief.clone();
+                        t.records = records.clone();
+                        t.awaiting_choice = Some(stage.clone());
+                    }
+                    return Ok(FlowTurn {
+                        reply: render_incomplete_block(&stage),
+                        trace,
+                        done: false,
+                    });
+                }
                 let final_answer = compose_final(llm, &brief, &records).await;
                 if let Some(t) = session.trip.as_mut() {
                     t.stage = Stage::Done;
@@ -658,6 +680,24 @@ pub async fn advance(
 
             // ---- Execution stage ----
             ref stage if stage.is_exec() => {
+                // GATE: the deliverable stages (calendar event, Google Doc) must
+                // not run on a hollow plan. Block Schedule/Doc until day/place,
+                // route points and campsite are all real and resolved.
+                if matches!(stage, Stage::Schedule | Stage::Doc) {
+                    if let Some(blocker) = first_unresolved_essential(&records) {
+                        if let Some(t) = session.trip.as_mut() {
+                            t.stage = blocker.clone();
+                            t.brief = brief.clone();
+                            t.records = records.clone();
+                            t.awaiting_choice = Some(blocker.clone());
+                        }
+                        return Ok(FlowTurn {
+                            reply: render_incomplete_block(&blocker),
+                            trace,
+                            done: false,
+                        });
+                    }
+                }
                 if decision.mode == Mode::Ask {
                     if let Some(t) = session.trip.as_mut() {
                         t.stage = stage.clone();
@@ -691,7 +731,7 @@ pub async fn advance(
                 // best-effort; the final compose flags whatever stayed
                 // unverified. We never scold the user or ask them to "narrow the
                 // river" — picking the river is the planner's job.
-                if is_stage_failure(&output) && stage.is_checkpoint() {
+                if is_stage_unresolved(&output) && stage.is_checkpoint() {
                     if let Some(t) = session.trip.as_mut() {
                         t.stage = stage.clone();
                         t.brief = brief.clone();
@@ -733,7 +773,21 @@ pub async fn advance(
         }
     }
 
-    // Safety: hit the step cap — compose whatever we have.
+    // Safety: hit the step cap. Still don't ship a hollow plan — if an essential
+    // geo stage never resolved, stop honestly instead of composing a fake "done".
+    if let Some(stage) = first_unresolved_essential(&records) {
+        if let Some(t) = session.trip.as_mut() {
+            t.stage = stage.clone();
+            t.brief = brief.clone();
+            t.records = records.clone();
+            t.awaiting_choice = Some(stage.clone());
+        }
+        return Ok(FlowTurn {
+            reply: render_incomplete_block(&stage),
+            trace,
+            done: false,
+        });
+    }
     let final_answer = compose_final(llm, &brief, &records).await;
     if let Some(t) = session.trip.as_mut() {
         t.stage = Stage::Done;
@@ -836,6 +890,44 @@ fn is_stage_failure(output: &str) -> bool {
     text.starts_with("Stopped after too many tool calls")
         || text.starts_with("(stage failed:")
         || text.starts_with("(stage timed out")
+}
+
+/// A stage output is UNRESOLVED when it failed/timed out, OR the worker agent
+/// itself signalled it could not obtain the real geo data (the `STAGE_INCOMPLETE`
+/// marker we ask it to emit instead of writing vague "уточняется" prose).
+fn is_stage_unresolved(output: &str) -> bool {
+    is_stage_failure(output) || output.contains("STAGE_INCOMPLETE")
+}
+
+/// The essential geo stages that MUST carry real data before we create the
+/// calendar event / Google Doc or declare the plan done. Returns the FIRST one
+/// that is missing or unresolved, so we re-run exactly that step rather than
+/// shipping a hollow "готово" with a real calendar event and doc attached.
+fn first_unresolved_essential(records: &[StageRecord]) -> Option<Stage> {
+    for stage in [Stage::Planning, Stage::Routing, Stage::Camp] {
+        match record_index(records, &stage) {
+            None => return Some(stage),
+            Some(i) if is_stage_unresolved(&records[i].output) => return Some(stage),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Honest "not done yet" note when an essential geo stage has no real data.
+/// We refuse to fabricate a finished plan (calendar + doc) on top of it.
+fn render_incomplete_block(stage: &Stage) -> String {
+    let what = match stage {
+        Stage::Planning => "день и место",
+        Stage::Routing => "точки маршрута (заезд, остановки, выход)",
+        Stage::Camp => "место ночёвки с проверкой расстояний",
+        _ => "данные с карт",
+    };
+    format!(
+        "Финал ещё не готов: не удалось получить {what} — картографический сервис \
+(OSM/Overpass) сейчас перегружен и отдаёт ошибки (504/429). Календарь и документ на \
+неполном плане не создаю. Напишите «ещё раз» — повторю именно этот шаг.",
+    )
 }
 
 /// Short, honest stall note for a CHECKPOINT stage whose map/weather tools did
@@ -1096,6 +1188,46 @@ mod tests {
         assert!(is_stage_failure("(stage failed: LLM HTTP 500)"));
         assert!(is_stage_failure("(stage timed out after 150s)"));
         assert!(!is_stage_failure("Маршрут построен."));
+    }
+
+    #[test]
+    fn unresolved_covers_failure_and_incomplete_marker() {
+        assert!(is_stage_unresolved("(stage timed out)"));
+        assert!(is_stage_unresolved(
+            "Не смог получить точки.\nSTAGE_INCOMPLETE: Overpass 504"
+        ));
+        assert!(!is_stage_unresolved(
+            "Заезд 48.63,43.55; выход 48.70,43.75; стоянка 48.66,43.60."
+        ));
+    }
+
+    #[test]
+    fn gate_blocks_until_essential_geo_stages_resolved() {
+        let mut r = Vec::new();
+        // nothing yet → Planning is the first blocker
+        assert_eq!(first_unresolved_essential(&r), Some(Stage::Planning));
+        set_record(&mut r, &Stage::Planning, "Пятница, Дон".into());
+        // Routing missing → blocks on Routing
+        assert_eq!(first_unresolved_essential(&r), Some(Stage::Routing));
+        set_record(
+            &mut r,
+            &Stage::Routing,
+            "STAGE_INCOMPLETE: Overpass 504".into(),
+        );
+        // Routing present but unresolved → still blocks on Routing
+        assert_eq!(first_unresolved_essential(&r), Some(Stage::Routing));
+        set_record(
+            &mut r,
+            &Stage::Routing,
+            "put-in 48.6,43.5 stop 48.6,43.6".into(),
+        );
+        set_record(
+            &mut r,
+            &Stage::Camp,
+            "site 48.66,43.60, 20m to water".into(),
+        );
+        // all three resolved → no blocker, deliverables may run
+        assert_eq!(first_unresolved_essential(&r), None);
     }
 
     #[test]
