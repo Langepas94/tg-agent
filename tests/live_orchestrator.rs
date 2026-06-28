@@ -59,6 +59,7 @@ async fn orchestrated_turn_uses_profile_and_invariants() {
         &state,
         &mut session,
         "Какая погода у меня дома? Кратко.",
+        None,
     )
     .await
     .expect("turn");
@@ -95,6 +96,7 @@ async fn agent_self_subscribes_on_collect_request() {
         &state,
         &mut session,
         "Собирай погоду в Волгограде каждые 2 минуты и присылай мне сводку.",
+        None,
     )
     .await
     .expect("turn");
@@ -120,6 +122,7 @@ async fn agent_uses_server_push_and_records_sub() {
         &state,
         &mut session,
         "Собирай погоду в Волгограде и подписывай меня на сводки.",
+        None,
     )
     .await
     .expect("turn");
@@ -156,9 +159,15 @@ async fn agent_cancels_subscription_on_request() {
     assert_eq!(state.list_watches().await.len(), 1);
 
     let mut session = ChatSession::new(404);
-    let result = agent::run_turn(&llm, &state, &mut session, "Отмени подписку на погоду.")
-        .await
-        .expect("turn");
+    let result = agent::run_turn(
+        &llm,
+        &state,
+        &mut session,
+        "Отмени подписку на погоду.",
+        None,
+    )
+    .await
+    .expect("turn");
     println!("\n=== ANSWER ===\n{}\n", result.answer);
 
     assert!(
@@ -180,6 +189,7 @@ async fn trip_swarm_clarifies_then_plans() {
         &state,
         &mut session,
         "Хочу в поход на байдарках с одной ночёвкой",
+        None,
     )
     .await
     .expect("turn1");
@@ -197,6 +207,7 @@ async fn trip_swarm_clarifies_then_plans() {
         &state,
         &mut session,
         "Старт из Москвы, в ближайшие 2 недели. Команда ленивая, любит шашлык. Поехали, планируй.",
+        None,
     )
     .await
     .expect("turn2");
@@ -237,6 +248,7 @@ async fn trip_swarm_supports_step_back() {
         &state,
         &mut session,
         "Давай перенесём на другой день, поищи день потеплее.",
+        None,
     )
     .await
     .expect("turn");

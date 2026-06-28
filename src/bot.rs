@@ -88,10 +88,20 @@ async fn handle_text(bot: Bot, msg: Message, state: BotState) -> anyhow::Result<
     };
 
     let typing = spawn_typing(bot.clone(), chat);
+    // Live progress: the trip swarm streams "step in progress" lines; relay each
+    // to Telegram as it arrives so a multi-minute turn is never silent.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let prog_bot = bot.clone();
+    let prog_task = tokio::spawn(async move {
+        while let Some(line) = rx.recv().await {
+            let _ = prog_bot.send_message(chat, line).await;
+        }
+    });
 
     let mut session = crate::agent::session::load(chat.0);
-    let outcome = crate::agent::run_turn(&llm, &state, &mut session, &text).await;
+    let outcome = crate::agent::run_turn(&llm, &state, &mut session, &text, Some(tx)).await;
     typing.abort();
+    let _ = prog_task.await;
     match outcome {
         Ok(result) => {
             if let Err(e) = crate::agent::session::save(&session) {
@@ -381,10 +391,18 @@ async fn handle_trip(bot: &Bot, chat: ChatId, state: &BotState, args: &str) -> a
     // Explicit command just force-starts the same stateful swarm; the normal
     // text path then continues it across turns (clarify → plan → … → doc).
     let typing = spawn_typing(bot.clone(), chat);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let prog_bot = bot.clone();
+    let prog_task = tokio::spawn(async move {
+        while let Some(line) = rx.recv().await {
+            let _ = prog_bot.send_message(chat, line).await;
+        }
+    });
     let mut session = crate::agent::session::load(chat.0);
     session.trip = Some(crate::agent::flow::TripFlowState::start());
-    let outcome = crate::agent::run_turn(&llm, state, &mut session, kick).await;
+    let outcome = crate::agent::run_turn(&llm, state, &mut session, kick, Some(tx)).await;
     typing.abort();
+    let _ = prog_task.await;
     match outcome {
         Ok(result) => {
             if let Err(e) = crate::agent::session::save(&session) {

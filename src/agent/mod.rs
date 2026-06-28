@@ -20,6 +20,11 @@ use crate::{llm::Llm, state::BotState};
 
 use self::{invariants::InvariantStatus, session::ChatSession};
 
+/// Channel for streaming live "step in progress" notes to the user mid-turn.
+/// The trip swarm sends one line before each multi-minute stage so a long turn
+/// is never silent (the bot relays each line to Telegram as it arrives).
+pub type ProgressSender = tokio::sync::mpsc::UnboundedSender<String>;
+
 /// Max invariant retries for a normal turn.
 const MAX_INVARIANT_RETRIES: usize = 1;
 
@@ -48,6 +53,7 @@ pub async fn run_turn(
     state: &BotState,
     session: &mut ChatSession,
     user_text: &str,
+    progress: Option<ProgressSender>,
 ) -> anyhow::Result<TurnResult> {
     session.memory.push_message("user", user_text);
 
@@ -70,7 +76,7 @@ pub async fn run_turn(
         if !in_flow {
             session.trip = Some(flow::TripFlowState::start());
         }
-        let turn = flow::advance(llm, state, session, user_text).await?;
+        let turn = flow::advance(llm, state, session, user_text, progress.as_ref()).await?;
         if turn.done {
             session.trip = None;
         }
