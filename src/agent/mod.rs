@@ -10,8 +10,8 @@ pub mod memory;
 pub mod notes;
 pub mod profile;
 pub mod prompt;
+pub mod router;
 pub mod session;
-pub mod topic;
 
 #[cfg(test)]
 mod tests;
@@ -51,12 +51,22 @@ pub async fn run_turn(
 ) -> anyhow::Result<TurnResult> {
     session.memory.push_message("user", user_text);
 
-    // --- trip-planning swarm routing (stateful, suspends across turns) ---
-    // Continue an active flow, or start one when the message looks like a trip
-    // request. The flow does its own clarify → plan → route → camp → schedule →
-    // doc orchestration, so it bypasses the single-shot answer path below.
+    // --- semantic intent routing ---
+    // A message already inside an active flow always continues it. Otherwise a
+    // single cheap LLM router decides — BY MEANING, not keyword lists — whether
+    // this starts a trip-planning swarm, is a normal chat message, or is
+    // off-topic and should be refused early.
     let in_flow = session.trip.is_some();
-    if in_flow || flow::looks_like_trip(user_text) {
+    let route = if in_flow {
+        router::Route::Trip
+    } else {
+        router::classify(llm, user_text).await
+    };
+
+    // --- trip-planning swarm routing (stateful, suspends across turns) ---
+    // The flow runs its own clarify → plan → route → camp → schedule → doc
+    // orchestration with user checkpoints, so it bypasses the single-shot path.
+    if in_flow || route == router::Route::Trip {
         if !in_flow {
             session.trip = Some(flow::TripFlowState::start());
         }
@@ -74,11 +84,11 @@ pub async fn run_turn(
         });
     }
 
-    // --- topic-scope gate (CODE invariant, runs before any LLM call) ---
-    // Off-topic messages are refused here so they cost ~0 tokens: no fact /
+    // --- off-topic refusal (before any extraction / answer loop) ---
+    // Refused here so it costs ~0 tokens beyond the one router call: no fact /
     // profile extraction, no answer loop, no invariant retries.
-    if topic::classify(user_text) == topic::Scope::OffTopic {
-        let answer = topic::OFF_TOPIC_REPLY.to_string();
+    if route == router::Route::OffTopic {
+        let answer = router::OFF_TOPIC_REPLY.to_string();
         session.memory.push_message("assistant", &answer);
         return Ok(TurnResult {
             answer,

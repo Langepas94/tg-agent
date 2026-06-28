@@ -409,11 +409,3 @@ fn trip_flow_state_roundtrips() {
     assert_eq!(back.brief.fields.get("area").unwrap(), "Карелия");
     assert_eq!(back.stage, super::flow::Stage::Clarify);
 }
-
-#[test]
-fn trip_intent_detection() {
-    assert!(super::flow::looks_like_trip(
-        "хочу в поход на байдарках с ночёвкой"
-    ));
-    assert!(!super::flow::looks_like_trip("какая погода в Сочи завтра"));
-}
