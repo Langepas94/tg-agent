@@ -4,12 +4,14 @@
 # `collect2: ld returned 1`). Run from the repo root:  ./deploy.sh
 #
 # Env overrides: VPS_HOST (default root@5.129.234.9), SSH_KEY
-# (default ~/.ssh/id_ed25519_vps), REMOTE_DIR (default /opt/tg-agent).
+# (default ~/.ssh/id_ed25519_vps), REMOTE_DIR (default /opt/tg-agent),
+# ENABLE_NGINX_PROXY=0 to skip installing/updating the public /admin proxy.
 set -euo pipefail
 
 VPS_HOST="${VPS_HOST:-root@5.129.234.9}"
 SSH_KEY="${SSH_KEY:-$HOME/.ssh/id_ed25519_vps}"
 REMOTE_DIR="${REMOTE_DIR:-/opt/tg-agent}"
+ENABLE_NGINX_PROXY="${ENABLE_NGINX_PROXY:-1}"
 SSH=(ssh -i "$SSH_KEY" -o ConnectTimeout=15)
 
 echo "==> rsync source to $VPS_HOST:$REMOTE_DIR"
@@ -35,6 +37,43 @@ rm -rf target/debug target/tmp
 rm -rf target/release/incremental
 # Trim systemd journal so logs don't grow without bound.
 journalctl --vacuum-size=50M >/dev/null 2>&1 || true
+
+if [ "$ENABLE_NGINX_PROXY" = "1" ]; then
+  echo "--- nginx public /admin proxy ---"
+  if ! command -v nginx >/dev/null 2>&1; then
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -qq
+    apt-get install -y nginx >/dev/null
+  fi
+  cat >/etc/nginx/sites-available/tg-agent <<'NGINX'
+server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    server_name 5.129.234.9 _;
+
+    client_max_body_size 2m;
+
+    location = / {
+        return 302 /admin;
+    }
+
+    location /admin {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+}
+NGINX
+  rm -f /etc/nginx/sites-enabled/default
+  ln -sf /etc/nginx/sites-available/tg-agent /etc/nginx/sites-enabled/tg-agent
+  nginx -t >/dev/null
+  systemctl enable --now nginx >/dev/null
+  systemctl reload nginx
+  systemctl is-active nginx
+fi
 
 echo "--- disk after cleanup ---"
 df -h / | tail -1

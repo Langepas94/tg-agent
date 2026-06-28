@@ -56,11 +56,13 @@ SESSIONS_DIR=sessions
 
 ## Web admin
 
-The bot also starts a small root admin UI at `http://ADMIN_ADDR/admin`.
-It is meant to bind to localhost on the VPS and be exposed through nginx or an
-SSH tunnel. The UI lets the owner inspect users, profile fields, notes, sticky
-facts, compacted summary, recent messages, watches, push subscriptions, raw
-session JSON, and manage access/context/profile/notes.
+The bot starts a small root admin UI at `http://ADMIN_ADDR/admin`. By default
+the Rust process binds to `127.0.0.1:8080`, and `deploy.sh` exposes it through
+nginx as `http://5.129.234.9/admin`.
+
+The UI lets the owner inspect users, profile fields, notes, sticky facts,
+compacted summary, recent messages, watches, push subscriptions, raw session
+JSON, and manage access/context/profile/notes.
 
 ## Run
 
