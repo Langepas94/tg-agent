@@ -333,10 +333,21 @@ impl Stage {
                  constraints with real data: query nearby settlements/turbazy/roads to confirm the \
                  minimum distance from civilization, and confirm the site is within the required \
                  distance to water. NEVER guess coordinates — derive them from tool results.\n\
+                 CRITICAL — the campsite MUST be on DRY LAND on the SHORE, never on the water. Do \
+                 NOT output the centroid of a lake/river/water polygon (an `out center` of a \
+                 natural=water / waterway feature is the MIDDLE OF THE WATER — you cannot pitch a \
+                 tent there). A point near water means dry BANK ground whose distance to the water \
+                 EDGE is within the limit, not a point sitting inside the water. Prefer real \
+                 on-land features for the pitch — a beach (natural=beach), a clearing/meadow \
+                 (landuse=meadow, natural=grassland), or an existing camp_site — adjacent to the \
+                 shoreline; if you only have the water feature, place the camp on its bank (offset \
+                 onto land) and say so. Sanity-check every campsite coordinate is on land before \
+                 proposing it.\n\
                  - If [user-choice] below is empty (first run): propose 1-2 candidate campsites on \
-                 the route, each with real coordinates, the measured distance to water, and the \
-                 measured distance to the nearest village/turbaza/road. End by asking the user to \
-                 confirm one (or ask for another). Do NOT finalize yet.\n\
+                 the route, each a DRY-LAND shoreline spot with real coordinates, the measured \
+                 distance to the water edge, and the measured distance to the nearest \
+                 village/turbaza/road. End by asking the user to confirm one (or ask for another). \
+                 Do NOT finalize yet.\n\
                  - If [user-choice] below confirms a site (or asks to move it): COMMIT to that one \
                  site and output its final verified coordinates and distances.\n\
                  HONESTY GATE: if the map service keeps failing and you CANNOT produce a real \
