@@ -1929,7 +1929,7 @@ dependencies = [
 
 [[package]]
 name = "tg-agent"
-version = "0.6.3"
+version = "0.6.4"
 dependencies = [
  "anyhow",
  "dotenvy",

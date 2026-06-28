@@ -362,21 +362,23 @@ impl Stage {
             Stage::Schedule => {
                 "Create a real calendar event for this trip via the connected Google/calendar \
                  tools (start = chosen date + time, end = next day; title, location, description \
-                 with the plan). Use the user's email from their profile as the organizer/attendee \
-                 — do NOT ask the user for a token or credentials; the Google MCP is already \
-                 connected. Actually CALL the create-event tool, then confirm the event (title, \
-                 date, time) from the tool result. Only if the tool returns an authorization error \
-                 you cannot resolve, report that exact error in one short line and STOP — never \
-                 invent a success."
+                 with the plan). Use the user's email from their profile. NEVER ask the user for a \
+                 token or credentials. Actually CALL the create-event tool, then confirm the event \
+                 from the tool result. If a tool reports the user is NOT authenticated or returns \
+                 an authorization URL (start_google_auth / auth flow), give the user that EXACT URL \
+                 verbatim as a clickable link with a one-line instruction to open it and approve \
+                 access — do NOT paraphrase it into 'нужен токен'. Then STOP. Never invent success."
             }
             Stage::Doc => {
                 "Create a real shareable Google Doc with the full plan (date, route with real \
                  coordinates/stops, campsite with verified distances, gear/BBQ notes) via the \
                  connected Google/docs tools, then return the actual share link from the tool \
-                 result. Do NOT ask the user for a token — the Google MCP is already connected. \
-                 Only if the tool returns an authorization error you cannot resolve, report that \
-                 exact error in one short line plus the plan as plain text, then STOP — never \
-                 fabricate a link."
+                 result. NEVER ask the user for a token. If a tool reports the user is NOT \
+                 authenticated or returns an authorization URL (start_google_auth / auth flow), \
+                 give the user that EXACT URL verbatim as a clickable link with a one-line \
+                 instruction to open it and approve access — do NOT paraphrase it into 'нужен \
+                 доступ'. Also output the full plan as plain text so it is never lost. Then STOP. \
+                 Never fabricate a link."
             }
             Stage::Clarify | Stage::Done => "",
         }
@@ -758,7 +760,9 @@ phone-friendly PLAIN-TEXT message (no Markdown tables, no `|`, no `**`). Use sho
 blocks with emoji headings: chosen day + weather, the route with concrete stops, the overnight \
 campsite (with distances), gear/BBQ notes, and — if created — the calendar event and the \
 shareable doc link. Be concrete; do not invent a doc link or coordinates that the stages did \
-not produce. Keep it tight.";
+not produce. If a stage returned an AUTHORIZATION URL (Google sign-in / start_google_auth), \
+keep that URL VERBATIM in the final message as a clickable link with a one-line 'open and approve \
+access' instruction — never drop it and never turn it into a vague 'нужен токен/доступ'. Keep it tight.";
 
 /// Build a stage's system prompt: the layered base prompt + a stage role line.
 fn stage_system(session: &ChatSession, role: &str) -> String {
