@@ -97,6 +97,12 @@ async fn handle_text(bot: Bot, msg: Message, state: BotState) -> anyhow::Result<
             if let Err(e) = crate::agent::session::save(&session) {
                 tracing::error!("save session {}: {e}", chat.0);
             }
+            // Show the swarm pipeline trace (only set when the trip flow ran).
+            if !result.trace.is_empty() {
+                let _ = bot
+                    .send_message(chat, format!("🧭 Swarm:\n{}", result.trace.join("\n")))
+                    .await;
+            }
             // Never send an empty message (Telegram rejects it -> silent failure).
             let answer = if result.answer.trim().is_empty() {
                 "✅ Готово.".to_string()
@@ -367,33 +373,37 @@ async fn handle_trip(bot: &Bot, chat: ChatId, state: &BotState, args: &str) -> a
             .await?;
         return Ok(());
     };
-    if args.trim().is_empty() {
-        bot.send_message(
-            chat,
-            "Usage: /trip <cities and dates>, e.g. /trip Москва и Сочи на выходные",
-        )
-        .await?;
-        return Ok(());
-    }
+    let kick = if args.trim().is_empty() {
+        "Хочу спланировать поездку"
+    } else {
+        args
+    };
+    // Explicit command just force-starts the same stateful swarm; the normal
+    // text path then continues it across turns (clarify → plan → … → doc).
     let typing = spawn_typing(bot.clone(), chat);
-    let session = crate::agent::session::load(chat.0);
-    let outcome = crate::agent::flow::run(&llm, state, &session, args).await;
+    let mut session = crate::agent::session::load(chat.0);
+    session.trip = Some(crate::agent::flow::TripFlowState::start());
+    let outcome = crate::agent::run_turn(&llm, state, &mut session, kick).await;
     typing.abort();
     match outcome {
-        Ok(report) => {
-            let stages: Vec<String> = report
-                .records
-                .iter()
-                .map(|r| format!("• {:?}: {}", r.stage, r.output))
-                .collect();
-            bot.send_message(chat, format!("🧭 Pipeline:\n{}", stages.join("\n")))
-                .await?;
-            for chunk in split_chunks(&report.answer, 3900) {
+        Ok(result) => {
+            if let Err(e) = crate::agent::session::save(&session) {
+                tracing::error!("save session {}: {e}", chat.0);
+            }
+            if !result.trace.is_empty() {
+                let _ = bot
+                    .send_message(chat, format!("🧭 Swarm:\n{}", result.trace.join("\n")))
+                    .await;
+            }
+            for chunk in split_chunks(&result.answer, 3900) {
+                if chunk.trim().is_empty() {
+                    continue;
+                }
                 bot.send_message(chat, chunk).await?;
             }
         }
         Err(e) => {
-            bot.send_message(chat, format!("❌ trip flow error: {e}"))
+            bot.send_message(chat, format!("❌ trip flow error: {e:#}"))
                 .await?;
         }
     }
