@@ -144,9 +144,16 @@ pub async fn run_turn(
         );
         answer = {
             use anyhow::Context;
-            llm.answer_in_chat(state, &system, user_text, &history, Some(session.chat_id))
-                .await
-                .context("answering failed")?
+            llm.answer_in_chat(
+                state,
+                &system,
+                user_text,
+                &history,
+                Some(session.chat_id),
+                crate::llm::MAX_STEPS,
+            )
+            .await
+            .context("answering failed")?
         };
 
         // Agent self-extraction: pull any ⟦profile:k=v⟧ markers, then strip them
