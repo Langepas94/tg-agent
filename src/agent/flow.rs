@@ -18,7 +18,7 @@
 //! Stages (the orchestrator may move forward, stay, or step back):
 //!   Clarify → Planning → Routing → Camp → Schedule → Doc → Done
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, time::Duration};
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -534,6 +534,10 @@ fn drop_from(records: &mut Vec<StageRecord>, stage: &Stage) {
 /// Maximum orchestrator steps per user turn (auto-advance bound), so one turn
 /// can walk Planning→…→Doc→Done but never loops forever.
 const MAX_ORCH_STEPS: usize = 12;
+/// Hard wall clock limit for one worker stage. External map/weather/Google
+/// tools can be slow or rate-limited; stop the stage instead of leaving the
+/// Telegram user staring at "typing..." for many minutes.
+const STAGE_TIMEOUT: Duration = Duration::from_secs(150);
 
 /// Advance the flow by one user turn. The caller guarantees `session.trip` is
 /// `Some`. The ORCHESTRATOR agent decides every transition; the user can step
@@ -595,7 +599,11 @@ pub async fn advance(
                 .complete(ORCH_PROMPT, &orch_input)
                 .await
                 .unwrap_or_default();
-            parse_decision(&raw, &brief, &records, user_empty)
+            prevent_auto_repeat(
+                parse_decision(&raw, &brief, &records, user_empty),
+                &records,
+                user_empty,
+            )
         };
 
         match decision.next {
@@ -634,6 +642,13 @@ pub async fn advance(
                     })
                     .unwrap_or(0);
                 let enough = parsed.ready || forced || rounds >= MAX_CLARIFY_ROUNDS;
+                if first_contact {
+                    return Ok(FlowTurn {
+                        reply: render_first_contact_reply(&parsed.recap, &parsed.questions, enough),
+                        trace,
+                        done: false,
+                    });
+                }
                 if !enough {
                     return Ok(FlowTurn {
                         reply: render_clarify_reply(&parsed.recap, &parsed.questions),
@@ -686,6 +701,13 @@ pub async fn advance(
                     t.stage = stage.clone();
                     t.records = records.clone();
                 }
+                if is_stage_failure(&output) {
+                    return Ok(FlowTurn {
+                        reply: render_stage_failure(stage, &output),
+                        trace,
+                        done: false,
+                    });
+                }
                 continue;
             }
 
@@ -723,10 +745,16 @@ async fn run_exec_stage(
         stage.name(),
         stage.instruction(),
     );
-    match llm.answer_with_system(state, &system, &query).await {
-        Ok(o) if !o.trim().is_empty() => o,
-        Ok(_) => "(no output)".to_string(),
-        Err(e) => format!("(stage failed: {e})"),
+    match tokio::time::timeout(
+        STAGE_TIMEOUT,
+        llm.answer_with_system(state, &system, &query),
+    )
+    .await
+    {
+        Err(_) => format!("(stage timed out after {STAGE_TIMEOUT:?})"),
+        Ok(Ok(o)) if !o.trim().is_empty() => o,
+        Ok(Ok(_)) => "(no output)".to_string(),
+        Ok(Err(e)) => format!("(stage failed: {e})"),
     }
 }
 
@@ -754,6 +782,54 @@ fn completed_list(records: &[StageRecord]) -> String {
         .join("\n")
 }
 
+/// On auto-advance there is no new user intent, so the orchestrator must not
+/// re-run a stage that already has output. In prod this retried Routing several
+/// times after tool-budget failures, turning one Telegram message into a very
+/// long silent turn.
+fn prevent_auto_repeat(decision: Decision, records: &[StageRecord], user_empty: bool) -> Decision {
+    if !user_empty || !decision.next.is_exec() || record_index(records, &decision.next).is_none() {
+        return decision;
+    }
+    Decision {
+        next: next_exec_after(records),
+        mode: Mode::Run,
+        message: String::new(),
+    }
+}
+
+fn render_first_contact_reply(recap: &str, questions: &[String], enough: bool) -> String {
+    if !enough {
+        return render_clarify_reply(recap, questions);
+    }
+    let recap = recap.trim();
+    let mut out = String::new();
+    if recap.is_empty() {
+        out.push_str("Принял вводные по сплаву.");
+    } else {
+        out.push_str(recap);
+    }
+    out.push_str(
+        "\n\nЗадача большая: погода, маршрут, проверка стоянки, календарь и Google Doc. \
+Чтобы не молчать много минут одним сообщением, я разбил её на шаги. Напишите «поехали» — начну планирование по этим вводным.",
+    );
+    out
+}
+
+fn is_stage_failure(output: &str) -> bool {
+    let text = output.trim();
+    text.starts_with("Stopped after too many tool calls")
+        || text.starts_with("(stage failed:")
+        || text.starts_with("(stage timed out")
+}
+
+fn render_stage_failure(stage: &Stage, output: &str) -> String {
+    format!(
+        "Остановился на этапе {}: {}\n\nНе буду крутиться молча дальше. Можно сузить район/реку или написать «продолжай», и я попробую с уже собранными вводными.",
+        stage.name(),
+        clip(output.trim(), 500)
+    )
+}
+
 const COMPOSE_PROMPT: &str = "You assemble the FINAL trip plan a user will share with friends, \
 from the stage outputs of a planning swarm. Write it in the user's language as a clean, \
 phone-friendly PLAIN-TEXT message (no Markdown tables, no `|`, no `**`). Use short vertical \
@@ -775,7 +851,13 @@ fn stage_system(session: &ChatSession, role: &str) -> String {
         Some(&format!(
             "You are the {role} agent in a multi-stage trip-planning swarm. Do ONLY your stage's \
              task, building on the prior stages' outputs. Use the connected MCP tools when you \
-             need live data or to act."
+             need live data or to act. For Russian geography with OSM tools, pass region=\"RU\" \
+             and include \"Россия\" in free-text place queries. For maps__osm_query_bbox, the \
+             tags argument must be a JSON object/map such as {{\"waterway\":\"river\"}} or \
+             {{\"tourism\":\"camp_site\"}}; never pass an array or a plain string. Avoid raw \
+             name=<Cyrillic> tag selectors; geocode names first or query broad tags and filter the result. If \
+             Overpass returns 400/429/504, do not keep retrying alternatives in a loop: state \
+             what remains unverified and finish your stage."
         )),
         None,
     )
@@ -947,6 +1029,32 @@ mod tests {
         );
         assert_ne!(d.next, Stage::Clarify);
         assert_eq!(d.next, Stage::Planning); // earliest stage without output
+    }
+
+    #[test]
+    fn auto_advance_does_not_repeat_completed_stage() {
+        let mut records = Vec::new();
+        set_record(&mut records, &Stage::Planning, "plan".into());
+        let d = prevent_auto_repeat(
+            Decision {
+                next: Stage::Planning,
+                mode: Mode::Run,
+                message: String::new(),
+            },
+            &records,
+            true,
+        );
+        assert_eq!(d.next, Stage::Routing);
+    }
+
+    #[test]
+    fn detects_stage_failure_outputs() {
+        assert!(is_stage_failure(
+            "Stopped after too many tool calls. Try rephrasing."
+        ));
+        assert!(is_stage_failure("(stage failed: LLM HTTP 500)"));
+        assert!(is_stage_failure("(stage timed out after 150s)"));
+        assert!(!is_stage_failure("Маршрут построен."));
     }
 
     #[test]

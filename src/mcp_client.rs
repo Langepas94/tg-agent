@@ -34,6 +34,14 @@ pub type EventSender = broadcast::Sender<McpEvent>;
 /// Per-tool-call ceiling. A geocode/forecast that stalls past this errors out
 /// (surfaced to the model as a tool error) instead of hanging the chat turn.
 const TOOL_TIMEOUT: Duration = Duration::from_secs(45);
+/// Per-connection ceiling. Self-connect is model-driven and often launches
+/// third-party stdio servers; a bad package install, auth bootstrap, or dead
+/// HTTP endpoint must not hold the Telegram turn forever.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(45);
+/// Listing tools is part of connection setup and also happens on tool-list
+/// notifications. Bound it separately so a live connection cannot wedge the
+/// refresh task or startup path.
+const LIST_TOOLS_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// User-supplied connection parameters for one MCP server.
 ///
@@ -96,14 +104,32 @@ impl McpClient {
 
         // The transport type differs per branch, but `serve()` erases it —
         // both arms yield the same `RunningService<RoleClient, _>`.
-        let svc = if params.is_stdio() {
-            Self::spawn_stdio(&params, &tx).await?
-        } else {
-            Self::connect_http(&params, &tx).await?
-        };
+        let svc = tokio::time::timeout(CONNECT_TIMEOUT, async {
+            if params.is_stdio() {
+                Self::spawn_stdio(&params, &tx).await
+            } else {
+                Self::connect_http(&params, &tx).await
+            }
+        })
+        .await
+        .with_context(|| {
+            format!(
+                "MCP connect '{}' timed out after {CONNECT_TIMEOUT:?} ({})",
+                params.name,
+                params.target()
+            )
+        })??;
         let peer: Peer<RoleClient> = svc.peer().clone();
 
-        let tools = peer.list_all_tools().await.context("list_tools failed")?;
+        let tools = tokio::time::timeout(LIST_TOOLS_TIMEOUT, peer.list_all_tools())
+            .await
+            .with_context(|| {
+                format!(
+                    "MCP '{}' list_tools timed out after {LIST_TOOLS_TIMEOUT:?}",
+                    params.name
+                )
+            })?
+            .context("list_tools failed")?;
         let n = tools.len();
         let tools = Arc::new(Mutex::new(tools));
         info!("MCP '{}' ready, {n} tools", params.name);
@@ -120,12 +146,17 @@ impl McpClient {
                 loop {
                     match rx.recv().await {
                         Ok(McpEvent::ToolsChanged { server: s }) if s == server => {
-                            match peer.list_all_tools().await {
-                                Ok(t) => {
+                            match tokio::time::timeout(LIST_TOOLS_TIMEOUT, peer.list_all_tools())
+                                .await
+                            {
+                                Err(_) => error!(
+                                    "'{server}' refresh timed out after {LIST_TOOLS_TIMEOUT:?}"
+                                ),
+                                Ok(Err(e)) => error!("'{server}' refresh failed: {e}"),
+                                Ok(Ok(t)) => {
                                     info!("'{server}' tools refreshed: {}", t.len());
                                     *tools.lock().await = t;
                                 }
-                                Err(e) => error!("'{server}' refresh failed: {e}"),
                             }
                         }
                         Ok(_) => {}

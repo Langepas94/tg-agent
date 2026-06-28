@@ -197,6 +197,7 @@ impl Llm {
                             match tool_map.get(&name) {
                                 None => format!("error: tool '{name}' is not available"),
                                 Some((server, real_tool)) => {
+                                    normalize_tool_args(server, real_tool, &mut args);
                                     let period = args
                                         .as_ref()
                                         .and_then(|m| m.get("period"))
@@ -665,6 +666,101 @@ fn parse_args(raw: &str) -> Option<rmcp::model::JsonObject> {
     }
 }
 
+fn normalize_tool_args(server: &str, tool: &str, args: &mut Option<rmcp::model::JsonObject>) {
+    let server = server.to_ascii_lowercase();
+    if !(server.contains("map") || server.contains("osm")) {
+        return;
+    }
+    let Some(map) = args.as_mut() else {
+        return;
+    };
+
+    if tool == "geocode_address" && map.values().any(value_contains_cyrillic) {
+        let needs_ru = map
+            .get("region")
+            .and_then(|v| v.as_str())
+            .map(|r| r.eq_ignore_ascii_case("singapore") || r.trim().is_empty())
+            .unwrap_or(true);
+        if needs_ru {
+            map.insert("region".into(), "RU".into());
+        }
+    }
+
+    if tool == "osm_query_bbox" {
+        if let Some(tags) = map.get("tags").cloned().and_then(normalize_osm_tags) {
+            map.insert("tags".into(), Value::Object(tags));
+        }
+    }
+}
+
+fn value_contains_cyrillic(v: &Value) -> bool {
+    match v {
+        Value::String(s) => s.chars().any(|c| ('\u{0400}'..='\u{04ff}').contains(&c)),
+        Value::Array(a) => a.iter().any(value_contains_cyrillic),
+        Value::Object(o) => o.values().any(value_contains_cyrillic),
+        _ => false,
+    }
+}
+
+fn normalize_osm_tags(v: Value) -> Option<serde_json::Map<String, Value>> {
+    match v {
+        Value::Object(o) => Some(
+            o.into_iter()
+                .map(|(k, v)| {
+                    let val = v
+                        .as_str()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| v.to_string());
+                    (k, Value::String(val))
+                })
+                .collect(),
+        ),
+        Value::String(s) => tags_from_selector(&s),
+        Value::Array(items) => {
+            let mut out = serde_json::Map::new();
+            for item in items {
+                if let Some(tags) = normalize_osm_tags(item) {
+                    out.extend(tags);
+                }
+            }
+            if out.is_empty() {
+                None
+            } else {
+                Some(out)
+            }
+        }
+        _ => None,
+    }
+}
+
+fn tags_from_selector(selector: &str) -> Option<serde_json::Map<String, Value>> {
+    let mut out = serde_json::Map::new();
+    for raw in selector.split([',', ';']) {
+        let tag = raw
+            .trim()
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .trim();
+        if tag.is_empty() {
+            continue;
+        }
+        if let Some((k, v)) = tag.split_once('=') {
+            let k = k.trim().trim_matches('"').trim_matches('\'');
+            let v = v.trim().trim_matches('"').trim_matches('\'');
+            if !k.is_empty() {
+                out.insert(k.to_string(), Value::String(v.to_string()));
+            }
+        } else {
+            out.insert(tag.to_string(), Value::String(String::new()));
+        }
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
 fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         return s.to_string();
@@ -762,6 +858,38 @@ mod tests {
         let set = tools_with_session_param(&defs);
         assert!(set.contains("subscribe_summaries"));
         assert!(!set.contains("geocode"));
+    }
+
+    #[test]
+    fn map_geocode_cyrillic_defaults_to_ru() {
+        let mut args = parse_args(r#"{"address":"Волгоград"}"#);
+        normalize_tool_args("maps", "geocode_address", &mut args);
+        let region = args.unwrap().remove("region").unwrap();
+        assert_eq!(region, "RU");
+    }
+
+    #[test]
+    fn map_geocode_overrides_singapore_for_cyrillic() {
+        let mut args = parse_args(r#"{"query":"Ахтуба","region":"Singapore"}"#);
+        normalize_tool_args("osm", "geocode_address", &mut args);
+        let region = args.unwrap().remove("region").unwrap();
+        assert_eq!(region, "RU");
+    }
+
+    #[test]
+    fn osm_tags_string_selector_becomes_object() {
+        let mut args = parse_args(r#"{"tags":"tourism=camp_site"}"#);
+        normalize_tool_args("maps", "osm_query_bbox", &mut args);
+        let args = args.unwrap();
+        assert_eq!(args["tags"], json!({"tourism":"camp_site"}));
+    }
+
+    #[test]
+    fn osm_tags_array_becomes_object() {
+        let mut args = parse_args(r#"{"tags":["waterway",{"boat":"yes"}]}"#);
+        normalize_tool_args("maps", "osm_query_bbox", &mut args);
+        let args = args.unwrap();
+        assert_eq!(args["tags"], json!({"waterway":"","boat":"yes"}));
     }
 
     #[test]
