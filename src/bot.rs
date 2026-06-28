@@ -10,8 +10,8 @@ use crate::{mcp_client::ConnectParams, state::BotState};
 #[derive(BotCommands, Clone)]
 #[command(rename_rule = "lowercase", description = "Commands:")]
 pub enum Command {
-    #[command(description = "start and subscribe to digests")]
-    Start,
+    #[command(description = "unlock the bot: /start <password>")]
+    Start(String),
     #[command(description = "show help")]
     Help,
     #[command(
@@ -42,6 +42,8 @@ pub enum Command {
     Trip(String),
     #[command(description = "reset this chat's memory (keeps long-term)")]
     Reset,
+    #[command(description = "clear short context, keep profile and durable facts")]
+    Compact,
 }
 
 pub fn handler_schema() -> UpdateHandler<anyhow::Error> {
@@ -74,6 +76,9 @@ fn spawn_typing(bot: Bot, chat: ChatId) -> tokio::task::JoinHandle<()> {
 /// if no LLM is configured.
 async fn handle_text(bot: Bot, msg: Message, state: BotState) -> anyhow::Result<()> {
     let chat = msg.chat.id;
+    if !state.is_authorized(chat.0).await {
+        return Ok(());
+    }
     let text = msg.text().unwrap_or("").trim().to_string();
     if text.is_empty() {
         return Ok(());
@@ -145,21 +150,22 @@ async fn handle_command(
     state: BotState,
 ) -> anyhow::Result<()> {
     let chat = msg.chat.id;
+    if !allow_command(&bot, chat, &state, &cmd).await? {
+        return Ok(());
+    }
     match cmd {
-        Command::Start => {
+        Command::Start(_) => {
             state.subscribe(chat.0).await;
-            bot.send_message(
-                chat,
-                "✅ Subscribed to digests.\n\n\
-                 Connect an MCP server:\n\
-                 /connect <url> [name=N] [auth=TOKEN] [Header:Value ...]\n\n\
-                 Then /mcps and /tools (or use the buttons).",
-            )
-            .await?;
+            let role = if state.is_root(chat.0).await {
+                "root"
+            } else {
+                "user"
+            };
+            bot.send_message(chat, format!("✅ Authorized as {role}. Send /help."))
+                .await?;
         }
         Command::Help => {
-            bot.send_message(chat, Command::descriptions().to_string())
-                .await?;
+            send_help(&bot, chat, state.is_root(chat.0).await).await?;
         }
         Command::Connect(args) => {
             do_connect(&bot, chat, &state, &args).await?;
@@ -191,18 +197,28 @@ async fn handle_command(
         Command::Unwatch(arg) => {
             let arg = arg.trim();
             if arg.eq_ignore_ascii_case("all") {
-                let n = state.remove_all_watches().await;
+                let n = if state.is_root(chat.0).await {
+                    state.remove_all_watches().await
+                } else {
+                    state.remove_watches_for_chat(chat.0).await
+                };
                 bot.send_message(chat, format!("✅ stopped {n} watch(es)."))
                     .await?;
             } else {
                 match arg.parse::<u64>() {
-                    Ok(id) if state.remove_watch(id).await => {
-                        bot.send_message(chat, format!("✅ watch #{id} stopped."))
-                            .await?;
-                    }
                     Ok(id) => {
-                        bot.send_message(chat, format!("No watch #{id}. See /watches."))
-                            .await?;
+                        let removed = if state.is_root(chat.0).await {
+                            state.remove_watch(id).await
+                        } else {
+                            state.remove_watch_for_chat(chat.0, id).await
+                        };
+                        if removed {
+                            bot.send_message(chat, format!("✅ watch #{id} stopped."))
+                                .await?;
+                        } else {
+                            bot.send_message(chat, format!("No watch #{id}. See /watches."))
+                                .await?;
+                        }
                     }
                     Err(_) => {
                         bot.send_message(chat, "Usage: /unwatch <id> | /unwatch all")
@@ -212,10 +228,18 @@ async fn handle_command(
             }
         }
         Command::Watches => {
-            let watches = state.list_watches().await;
+            let watches = if state.is_root(chat.0).await {
+                state.list_watches().await
+            } else {
+                state.list_watches_for_chat(chat.0).await
+            };
             if watches.is_empty() {
-                bot.send_message(chat, "No active watches. Use /watch.")
-                    .await?;
+                let msg = if state.is_root(chat.0).await {
+                    "No active watches. Use /watch."
+                } else {
+                    "No active watches."
+                };
+                bot.send_message(chat, msg).await?;
             } else {
                 let mut lines = vec![format!("Active watches ({}):", watches.len())];
                 for w in &watches {
@@ -258,7 +282,89 @@ async fn handle_command(
             bot.send_message(chat, "✅ Chat memory reset (long-term facts kept).")
                 .await?;
         }
+        Command::Compact => {
+            compact_chat_context(&bot, chat).await?;
+        }
     }
+    Ok(())
+}
+
+async fn allow_command(
+    bot: &Bot,
+    chat: ChatId,
+    state: &BotState,
+    cmd: &Command,
+) -> anyhow::Result<bool> {
+    if let Command::Start(args) = cmd {
+        let args = args.trim();
+        if state.is_authorized(chat.0).await {
+            return Ok(true);
+        }
+        if state.authorize(chat.0, args).await {
+            return Ok(true);
+        }
+        if args.is_empty() {
+            bot.send_message(chat, "🔒 Send /start <password> to unlock.")
+                .await?;
+        }
+        return Ok(false);
+    }
+
+    if !state.is_authorized(chat.0).await {
+        return Ok(false);
+    }
+
+    if is_admin_command(cmd) && !state.is_root(chat.0).await {
+        bot.send_message(chat, "⛔ This command is available only to the bot owner.")
+            .await?;
+        return Ok(false);
+    }
+
+    Ok(true)
+}
+
+fn is_admin_command(cmd: &Command) -> bool {
+    matches!(
+        cmd,
+        Command::Connect(_)
+            | Command::Mcps
+            | Command::Tools(_)
+            | Command::Call(_)
+            | Command::Watch(_)
+            | Command::Disconnect(_)
+    )
+}
+
+async fn send_help(bot: &Bot, chat: ChatId, is_root: bool) -> anyhow::Result<()> {
+    let mut lines = vec![
+        "Commands:".to_string(),
+        "/help — show help".to_string(),
+        "/profile [key value | clear] — view/set your profile".to_string(),
+        "/info [label text | clear] — save extra preferences".to_string(),
+        "/facts — show your learned facts".to_string(),
+        "/trip <cities/dates> — travel-weather flow".to_string(),
+        "/watches — list your active watches".to_string(),
+        "/unwatch <id> | all — stop your watches".to_string(),
+        "/compact — clear short context, keep profile and durable facts".to_string(),
+        "/reset — reset chat memory, keep long-term facts".to_string(),
+    ];
+    if is_root {
+        lines.extend(
+            [
+                "",
+                "Owner commands:",
+                "/connect <url> ... | /connect stdio <program> ...",
+                "/mcps — list connected MCP servers",
+                "/tools [server] — list MCP tools",
+                "/call <server> <tool> [json-args] — raw tool call",
+                "/watch <server> <tool> <minutes> [json-args] — admin watch",
+                "/disconnect <name> — disconnect MCP server",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        );
+    }
+    bot.send_message(chat, lines.join("\n")).await?;
     Ok(())
 }
 
@@ -376,6 +482,27 @@ async fn handle_facts(bot: &Bot, chat: ChatId) -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn compact_chat_context(bot: &Bot, chat: ChatId) -> anyhow::Result<()> {
+    let mut session = crate::agent::session::load(chat.0);
+    let before_recent = session.memory.recent.len();
+    let had_summary = !session.memory.summary.trim().is_empty();
+    session.memory.clear_short_context();
+    let _ = crate::agent::session::save(&session);
+    let summary_note = if had_summary {
+        " and compacted summary"
+    } else {
+        ""
+    };
+    bot.send_message(
+        chat,
+        format!(
+            "✅ Cleared short context ({before_recent} recent message(s){summary_note}). Profile and durable facts kept."
+        ),
+    )
+    .await?;
+    Ok(())
+}
+
 /// `/trip` — run the multi-agent travel-weather pipeline.
 async fn handle_trip(bot: &Bot, chat: ChatId, state: &BotState, args: &str) -> anyhow::Result<()> {
     let Some(llm) = state.llm.clone() else {
@@ -435,9 +562,25 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, state: BotState) -> anyhow:
         return Ok(());
     };
     let chat = msg.chat.id;
+    if !state.is_authorized(chat.0).await {
+        return Ok(());
+    }
     if let Some(name) = data.strip_prefix("tools:") {
+        if !state.is_root(chat.0).await {
+            bot.send_message(chat, "⛔ MCP tools are available only to the bot owner.")
+                .await?;
+            return Ok(());
+        }
         send_tools(&bot, chat, &state, name).await?;
     } else if let Some(name) = data.strip_prefix("disc:") {
+        if !state.is_root(chat.0).await {
+            bot.send_message(
+                chat,
+                "⛔ MCP management is available only to the bot owner.",
+            )
+            .await?;
+            return Ok(());
+        }
         if state.disconnect_mcp(name).await {
             bot.send_message(chat, format!("✅ '{name}' disconnected."))
                 .await?;

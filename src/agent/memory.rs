@@ -218,7 +218,14 @@ impl AgentMemory {
     /// Drop everything that does not survive a new session (keep long-term).
     pub fn reset_for_new_session(&mut self) {
         self.facts.retain(|f| f.layer.persists_across_sessions());
+        self.clear_short_context();
+    }
+
+    /// Clear ephemeral conversational context while preserving durable facts.
+    pub fn clear_short_context(&mut self) {
+        self.facts.retain(|f| f.layer.persists_across_sessions());
         self.recent.clear();
+        self.summary.clear();
     }
 
     /// Merge facts extracted from an LLM JSON response of the form
