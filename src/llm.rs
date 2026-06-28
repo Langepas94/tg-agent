@@ -10,10 +10,11 @@ use crate::{config::LlmConfig, state::BotState};
 
 /// Default tool-loop budget for an ordinary chat turn.
 pub const MAX_STEPS: usize = 12;
-/// Larger budget for a trip-swarm worker stage: campsite/route verification can
-/// legitimately need many OSM queries (settlements, water, land features), so 12
-/// was too few and the stage died with "too many tool calls".
-pub const STAGE_MAX_STEPS: usize = 20;
+/// Budget for a trip-swarm worker stage. A stage needs a handful of OSM queries
+/// (geocode + a few small-bbox lookups), then it must COMMIT. A high cap just
+/// let a chatty model fire 20 slow queries and blow the wall-clock, so keep it
+/// tight and pair it with "commit, don't over-verify" stage instructions.
+pub const STAGE_MAX_STEPS: usize = 10;
 /// Per-tool-result char cap before feeding it back to the model. Sized for a
 /// 7-day hourly forecast (~10–15k chars); `fit_to_context` reclaims the window
 /// if many such results accumulate across the loop.
@@ -698,7 +699,47 @@ fn normalize_tool_args(server: &str, tool: &str, args: &mut Option<rmcp::model::
         if let Some(tags) = map.get("tags").cloned().and_then(normalize_osm_tags) {
             map.insert("tags".into(), Value::Object(tags));
         }
+        clamp_osm_bbox(map);
     }
+}
+
+/// Max bbox side, in degrees, allowed through to Overpass. A broad-tag query
+/// over a large box takes tens of seconds and is the main cause of trip stages
+/// grinding for minutes; some models ignore the "small bbox" instruction, so we
+/// hard-clamp here. A route/campsite lookup only ever needs a small box around a
+/// point of interest, so shrinking an over-large box around its centre is safe
+/// and makes every query fast.
+const MAX_BBOX_SPAN_DEG: f64 = 0.30;
+
+fn clamp_osm_bbox(map: &mut rmcp::model::JsonObject) {
+    let Some(bbox) = map.get_mut("bbox").and_then(|v| v.as_object_mut()) else {
+        return;
+    };
+    let get = |b: &rmcp::model::JsonObject, k: &str| b.get(k).and_then(Value::as_f64);
+    let (Some(min_lat), Some(max_lat), Some(min_lon), Some(max_lon)) = (
+        get(bbox, "minLat"),
+        get(bbox, "maxLat"),
+        get(bbox, "minLon"),
+        get(bbox, "maxLon"),
+    ) else {
+        return;
+    };
+    // Shrink a side to MAX_BBOX_SPAN_DEG around its centre when it's too wide.
+    let clamp = |lo: f64, hi: f64| -> (f64, f64) {
+        if hi - lo <= MAX_BBOX_SPAN_DEG {
+            (lo, hi)
+        } else {
+            let c = (lo + hi) / 2.0;
+            let h = MAX_BBOX_SPAN_DEG / 2.0;
+            (c - h, c + h)
+        }
+    };
+    let (nlat0, nlat1) = clamp(min_lat, max_lat);
+    let (nlon0, nlon1) = clamp(min_lon, max_lon);
+    bbox.insert("minLat".into(), json!(nlat0));
+    bbox.insert("maxLat".into(), json!(nlat1));
+    bbox.insert("minLon".into(), json!(nlon0));
+    bbox.insert("maxLon".into(), json!(nlon1));
 }
 
 fn value_contains_cyrillic(v: &Value) -> bool {
@@ -715,10 +756,19 @@ fn normalize_osm_tags(v: Value) -> Option<serde_json::Map<String, Value>> {
         Value::Object(o) => Some(
             o.into_iter()
                 .map(|(k, v)| {
-                    let val = v
-                        .as_str()
-                        .map(str::to_string)
-                        .unwrap_or_else(|| v.to_string());
+                    // A tag VALUE must be a single string. Some models pass an
+                    // array (`{"place":["village","hamlet"]}`) which Overpass
+                    // rejects with 400; collapse it to the first string element
+                    // rather than stringifying the whole array.
+                    let val = match &v {
+                        Value::String(s) => s.clone(),
+                        Value::Array(items) => items
+                            .iter()
+                            .find_map(|i| i.as_str())
+                            .map(str::to_string)
+                            .unwrap_or_default(),
+                        other => other.to_string(),
+                    };
                     (k, Value::String(val))
                 })
                 .collect(),
@@ -934,5 +984,50 @@ mod tests {
             .contains("trimmed to fit context"));
         // ...the freshest tool result (in the protected last-two window) is intact.
         assert_eq!(messages[4]["content"].as_str().unwrap().len(), 90_000);
+    }
+
+    fn obj(v: Value) -> Option<rmcp::model::JsonObject> {
+        v.as_object().cloned()
+    }
+
+    #[test]
+    fn osm_bbox_clamped_when_too_large() {
+        // ~0.8° x 1.0° box (the broad sweep the model produced) → clamped to 0.30.
+        let mut args = obj(json!({
+            "bbox": {"minLat": 48.3, "minLon": 44.0, "maxLat": 49.1, "maxLon": 45.0},
+            "tags": {"tourism": "camp_site"}
+        }));
+        normalize_tool_args("maps", "osm_query_bbox", &mut args);
+        let b = &args.unwrap()["bbox"];
+        let span = |lo: &str, hi: &str| b[hi].as_f64().unwrap() - b[lo].as_f64().unwrap();
+        assert!((span("minLat", "maxLat") - 0.30).abs() < 1e-9);
+        assert!((span("minLon", "maxLon") - 0.30).abs() < 1e-9);
+        // centred on the original box centre (48.7, 44.5)
+        assert!((b["minLat"].as_f64().unwrap() - 48.55).abs() < 1e-9);
+        assert!((b["maxLon"].as_f64().unwrap() - 44.65).abs() < 1e-9);
+    }
+
+    #[test]
+    fn osm_bbox_small_box_untouched() {
+        let mut args = obj(json!({
+            "bbox": {"minLat": 50.20, "minLon": 43.57, "maxLat": 50.24, "maxLon": 43.65},
+            "tags": {"place": "village"}
+        }));
+        normalize_tool_args("maps", "osm_query_bbox", &mut args);
+        let b = &args.unwrap()["bbox"];
+        assert_eq!(b["minLat"].as_f64().unwrap(), 50.20);
+        assert_eq!(b["maxLon"].as_f64().unwrap(), 43.65);
+    }
+
+    #[test]
+    fn osm_tag_array_value_collapses_to_first() {
+        // An array tag value (`place:[village,hamlet]`) → first element, not the
+        // stringified array (which Overpass rejects with 400).
+        let mut args = obj(json!({
+            "bbox": {"minLat": 50.0, "minLon": 43.0, "maxLat": 50.1, "maxLon": 43.1},
+            "tags": {"place": ["village", "hamlet", "town"]}
+        }));
+        normalize_tool_args("maps", "osm_query_bbox", &mut args);
+        assert_eq!(args.unwrap()["tags"]["place"].as_str().unwrap(), "village");
     }
 }
