@@ -45,10 +45,22 @@ Copy `.env.example` to `.env`:
 TELEGRAM_BOT_TOKEN=...
 DEEPSEEK_API_KEY=...        # or LLM_API_KEY (OpenAI-compatible)
 LLM_MODEL=deepseek-v4-flash
+BOT_PASSWORD=202020         # Telegram /start password
+ADMIN_ADDR=127.0.0.1:8080   # web admin bind; put nginx in front on VPS
+ADMIN_USERNAME=admin
+ADMIN_PASSWORD=...          # defaults to BOT_PASSWORD if omitted
 DIGEST_INTERVAL_MINUTES=360
 STATE_FILE=state.json
 SESSIONS_DIR=sessions
 ```
+
+## Web admin
+
+The bot also starts a small root admin UI at `http://ADMIN_ADDR/admin`.
+It is meant to bind to localhost on the VPS and be exposed through nginx or an
+SSH tunnel. The UI lets the owner inspect users, profile fields, notes, sticky
+facts, compacted summary, recent messages, watches, push subscriptions, raw
+session JSON, and manage access/context/profile/notes.
 
 ## Run
 
