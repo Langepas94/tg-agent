@@ -1,15 +1,22 @@
 //! Stateful multi-agent trip-planning flow (the "swarm").
 //!
-//! Unlike the old one-shot weather pipeline, this flow SUSPENDS across user
-//! turns: it interrogates the user first (Clarify), accumulating a `TripBrief`
-//! that is persisted in the chat session. Only when the brief is complete does
-//! it run the execution pipeline — Planning → Routing → Camp → Schedule → Doc —
-//! where **each stage receives the prior stages' outputs** (real subagent
-//! hand-off). The orchestrator (this code) owns transitions; each stage is an
-//! LLM call, the execution stages using the connected MCP tools.
+//! Each stage is its own agent. An **LLM ORCHESTRATOR agent** decides every
+//! transition — it is not a hardcoded sequential FSM: it reads the brief, which
+//! stages already have output, and the user's latest message, and returns the
+//! next stage + whether to run it or ask the user. This lets the user **step
+//! back** at any point ("change the date / river / campsite"): the orchestrator
+//! routes to that earlier stage and its (and all later stages') outputs are
+//! recomputed.
 //!
-//! State machine (only Clarify waits for the user):
-//!   Clarify ⇄ Clarify … → Planning → Routing → Camp → Schedule → Doc → Done
+//! The flow SUSPENDS across user turns: Clarify interrogates first, building a
+//! `TripBrief` persisted in the chat session; each execution stage
+//! (Planning → Routing → Camp → Schedule → Doc) receives the prior stages'
+//! outputs (real subagent hand-off) and uses the connected MCP tools. Code only
+//! executes the chosen stage and guards against loops; the routing decisions are
+//! the orchestrator agent's.
+//!
+//! Stages (the orchestrator may move forward, stay, or step back):
+//!   Clarify → Planning → Routing → Camp → Schedule → Doc → Done
 
 use std::collections::BTreeMap;
 
@@ -56,6 +63,26 @@ impl TripBrief {
                 self.fields.insert(k.trim().to_string(), v.to_string());
             }
         }
+    }
+
+    /// Minimum to start planning: a start area/region and a date window. Used
+    /// only by the orchestrator's deterministic fallback (key-name heuristic).
+    pub fn has_minimum(&self) -> bool {
+        let has = |needles: &[&str]| {
+            self.fields
+                .iter()
+                .any(|(k, v)| !v.trim().is_empty() && needles.iter().any(|n| k.contains(n)))
+        };
+        has(&[
+            "area",
+            "region",
+            "where",
+            "start",
+            "location",
+            "место",
+            "регион",
+            "старт",
+        ]) && has(&["date", "when", "window", "дат", "когда", "срок"])
     }
 
     /// Render as `key: value` lines for downstream stage prompts.
@@ -232,163 +259,435 @@ fn render_clarify_reply(recap: &str, questions: &[String]) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Orchestrator
+// Stage ordering + execution instructions
 // ---------------------------------------------------------------------------
 
+impl Stage {
+    /// Linear position; used to compare "earlier/later" for back-steps.
+    pub fn order(&self) -> u8 {
+        match self {
+            Stage::Clarify => 0,
+            Stage::Planning => 1,
+            Stage::Routing => 2,
+            Stage::Camp => 3,
+            Stage::Schedule => 4,
+            Stage::Doc => 5,
+            Stage::Done => 6,
+        }
+    }
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            Stage::Clarify => "Clarify",
+            Stage::Planning => "Planning",
+            Stage::Routing => "Routing",
+            Stage::Camp => "Camp",
+            Stage::Schedule => "Schedule",
+            Stage::Doc => "Doc",
+            Stage::Done => "Done",
+        }
+    }
+
+    /// Parse a stage name (case-insensitive) from the orchestrator's JSON.
+    pub fn parse(s: &str) -> Option<Stage> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "clarify" => Some(Stage::Clarify),
+            "planning" | "plan" => Some(Stage::Planning),
+            "routing" | "route" => Some(Stage::Routing),
+            "camp" | "campsite" => Some(Stage::Camp),
+            "schedule" | "calendar" => Some(Stage::Schedule),
+            "doc" | "document" => Some(Stage::Doc),
+            "done" | "finish" => Some(Stage::Done),
+            _ => None,
+        }
+    }
+
+    /// Execution stages (have their own worker agent + MCP tools).
+    pub fn is_exec(&self) -> bool {
+        matches!(
+            self,
+            Stage::Planning | Stage::Routing | Stage::Camp | Stage::Schedule | Stage::Doc
+        )
+    }
+
+    /// The worker-agent task for an execution stage (empty for Clarify/Done).
+    fn instruction(&self) -> &'static str {
+        match self {
+            Stage::Planning => {
+                "Pick the single BEST day within the user's date window and the best concrete \
+                 river/area near their start region for this kind of trip. Use the weather tools \
+                 (geocode then forecast) to compare candidate days — favor low rain, light wind, \
+                 comfortable temperature. State the chosen DATE with a one-line weather rationale \
+                 (include numbers) and name the specific waterway/area."
+            }
+            Stage::Routing => {
+                "Design the actual on-water route for the chosen day and place. Give a concrete \
+                 put-in and take-out, 2-4 named stops with rough distances/times, and a relaxed \
+                 pace that matches how prepared the party is and their priorities (e.g. more \
+                 rest/BBQ than paddling). Keep total distance modest for an unprepared group."
+            }
+            Stage::Camp => {
+                "Choose ONE overnight campsite on the route that satisfies the user's constraints \
+                 — notably any minimum distance from turbazy/villages/roads and maximum distance \
+                 to water. If a maps/geo tool is connected, use it to verify; otherwise propose a \
+                 plausible spot and clearly flag the distances must be verified on the map. State \
+                 approximate coordinates or a clear landmark, distance to water, and distance to \
+                 the nearest civilization."
+            }
+            Stage::Schedule => {
+                "Create a calendar event for this trip (start = chosen date, overnight duration). \
+                 If no connected server can create calendar events, connect a calendar MCP \
+                 yourself with `mcp_connect` (ask the user for any credentials in chat first). \
+                 Confirm the event you created (title, date, time)."
+            }
+            Stage::Doc => {
+                "Produce a shareable Google Doc with the full plan (date, route with stops, \
+                 campsite, gear/BBQ notes) so the user can share it with friends. If no connected \
+                 server can create docs, connect a Google Docs MCP yourself with `mcp_connect` \
+                 (ask for credentials in chat first). Return the share link."
+            }
+            Stage::Clarify | Stage::Done => "",
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Orchestrator agent — an LLM decides every stage transition (incl. back-steps)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    /// Execute the chosen stage's worker agent now.
+    Run,
+    /// Stop and send `message` to the user; wait for their reply.
+    Ask,
+}
+
+/// The orchestrator's decision for one step.
+#[derive(Debug, Clone)]
+pub struct Decision {
+    pub next: Stage,
+    pub mode: Mode,
+    pub message: String,
+}
+
+const ORCH_PROMPT: &str = "You are the ORCHESTRATOR of a trip-planning swarm. The stages, in \
+order, are: Clarify, Planning, Routing, Camp, Schedule, Doc, Done. Each stage is run by its own \
+worker agent; YOU decide which stage runs next. \
+You are given: the trip brief, which stages already have output, and the user's latest message \
+(which may be empty when you are auto-advancing within a turn). \
+Decide the SINGLE next step and return ONLY JSON \
+{\"next_stage\":\"<stage>\",\"mode\":\"run|ask\",\"message\":\"<text if ask>\",\"reason\":\"<short>\"}. \
+Rules: \
+- Use Clarify (mode=run) only while the brief lacks at least an area/start and a date window, AND \
+only when the user just sent a message; never pick Clarify when the user's message is empty. \
+- Otherwise advance one stage at a time in order, mode=run, picking the earliest stage that has \
+no output yet. \
+- If the user's latest message asks to CHANGE or REDO an earlier decision (different date, \
+different river/route, move the campsite, change the event), pick that EARLIER stage (a step \
+back), mode=run — its and all later stages' outputs will be recomputed. \
+- Use mode=ask only when you genuinely need the user to decide something you cannot; put a short \
+question in message. \
+- When every stage through Doc has output and the user is not asking for changes, pick \
+next_stage=Done, mode=run.";
+
+#[derive(Debug, Deserialize)]
+struct DecisionJson {
+    #[serde(default)]
+    next_stage: String,
+    #[serde(default)]
+    mode: String,
+    #[serde(default)]
+    message: String,
+}
+
+/// Parse the orchestrator JSON, falling back to a deterministic decision if the
+/// model returns junk (so the flow never stalls).
+fn parse_decision(
+    raw: &str,
+    brief: &TripBrief,
+    records: &[StageRecord],
+    user_empty: bool,
+) -> Decision {
+    let parsed: Option<DecisionJson> = serde_json::from_str(&extract_json(raw)).ok();
+    if let Some(d) = parsed {
+        if let Some(stage) = Stage::parse(&d.next_stage) {
+            let mode = if d.mode.trim().eq_ignore_ascii_case("ask") {
+                Mode::Ask
+            } else {
+                Mode::Run
+            };
+            // Guard: never Clarify on an empty (auto-advance) message.
+            if !(stage == Stage::Clarify && user_empty) {
+                return Decision {
+                    next: stage,
+                    mode,
+                    message: d.message,
+                };
+            }
+        }
+    }
+    fallback_decision(brief, records, user_empty)
+}
+
+/// Deterministic safety net: clarify if the brief is thin and the user spoke,
+/// else run the earliest stage without output, else finish.
+fn fallback_decision(brief: &TripBrief, records: &[StageRecord], user_empty: bool) -> Decision {
+    if !brief.has_minimum() && !user_empty {
+        return Decision {
+            next: Stage::Clarify,
+            mode: Mode::Run,
+            message: String::new(),
+        };
+    }
+    Decision {
+        next: next_exec_after(records),
+        mode: Mode::Run,
+        message: String::new(),
+    }
+}
+
+/// Earliest execution stage that has no record yet; `Done` when all are present.
+fn next_exec_after(records: &[StageRecord]) -> Stage {
+    for stage in [
+        Stage::Planning,
+        Stage::Routing,
+        Stage::Camp,
+        Stage::Schedule,
+        Stage::Doc,
+    ] {
+        if record_index(records, &stage).is_none() {
+            return stage;
+        }
+    }
+    Stage::Done
+}
+
+// ---------------------------------------------------------------------------
+// Record helpers (replace-by-stage + downstream invalidation for back-steps)
+// ---------------------------------------------------------------------------
+
+fn record_index(records: &[StageRecord], stage: &Stage) -> Option<usize> {
+    records.iter().position(|r| r.stage == stage.name())
+}
+
+/// Insert or replace a stage's output, keeping records ordered by stage order.
+fn set_record(records: &mut Vec<StageRecord>, stage: &Stage, output: String) {
+    if let Some(i) = record_index(records, stage) {
+        records[i].output = output;
+    } else {
+        records.push(StageRecord {
+            stage: stage.name().to_string(),
+            output,
+        });
+        records.sort_by_key(|r| Stage::parse(&r.stage).map(|s| s.order()).unwrap_or(255));
+    }
+}
+
+/// Drop the output of `stage` and every later stage — used when the user steps
+/// back so stale downstream artifacts don't leak into the recomputed plan.
+fn drop_from(records: &mut Vec<StageRecord>, stage: &Stage) {
+    records.retain(|r| match Stage::parse(&r.stage) {
+        Some(s) => s.order() < stage.order(),
+        None => false,
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Orchestrated turn
+// ---------------------------------------------------------------------------
+
+/// Maximum orchestrator steps per user turn (auto-advance bound), so one turn
+/// can walk Planning→…→Doc→Done but never loops forever.
+const MAX_ORCH_STEPS: usize = 12;
+
 /// Advance the flow by one user turn. The caller guarantees `session.trip` is
-/// `Some`; this function mutates it and returns what to tell the user.
+/// `Some`. The ORCHESTRATOR agent decides every transition; the user can step
+/// back at any point by asking to change an earlier decision.
 pub async fn advance(
     llm: &Llm,
     state: &BotState,
     session: &mut ChatSession,
     user_text: &str,
 ) -> Result<FlowTurn> {
-    // Clone the parts we need so we can borrow the session immutably for the
-    // execution pipeline (which reads memory/profile/invariants).
-    let stage = session
-        .trip
-        .as_ref()
-        .map(|t| t.stage.clone())
-        .unwrap_or(Stage::Clarify);
-
-    if stage == Stage::Clarify {
-        // ---- Clarify: merge answers, decide whether to plan ----
-        let brief_so_far = session
-            .trip
-            .as_ref()
-            .map(|t| t.brief.render())
-            .unwrap_or_default();
-        let input = format!("Brief so far:\n{brief_so_far}\n\nUser message:\n{user_text}");
-        let raw = llm
-            .complete(CLARIFY_PROMPT, &input)
-            .await
-            .unwrap_or_default();
-        let parsed = parse_clarify(&raw);
-
-        let trip = session.trip.as_mut().expect("caller ensured Some");
-        trip.brief.merge(parsed.brief);
-        trip.clarify_rounds = trip.clarify_rounds.saturating_add(1);
-
-        let forced = user_forces_go(user_text) || trip.clarify_rounds >= MAX_CLARIFY_ROUNDS;
-        if !parsed.ready && !forced {
-            // Stay in Clarify; ask the user for more.
-            return Ok(FlowTurn {
-                reply: render_clarify_reply(&parsed.recap, &parsed.questions),
-                trace: vec![],
-                done: false,
-            });
-        }
-        // Brief is good enough → fall through to the execution pipeline.
-        trip.stage = Stage::Planning;
-    }
-
-    run_pipeline(llm, state, session).await
-}
-
-/// Run Planning → Routing → Camp → Schedule → Doc sequentially, threading each
-/// stage's output into the next, then compose the final user-facing plan.
-async fn run_pipeline(llm: &Llm, state: &BotState, session: &mut ChatSession) -> Result<FlowTurn> {
-    let brief = session
+    let mut brief = session
         .trip
         .as_ref()
         .map(|t| t.brief.clone())
         .unwrap_or_default();
-    let brief_text = brief.render();
-    let mut records: Vec<StageRecord> = Vec::new();
+    let mut records = session
+        .trip
+        .as_ref()
+        .map(|t| t.records.clone())
+        .unwrap_or_default();
+    let mut trace: Vec<String> = Vec::new();
+    let forced = user_forces_go(user_text);
 
-    let stages: &[(Stage, &str, &str)] = &[
-        (
-            Stage::Planning,
-            "PLANNING",
-            "Pick the single BEST day within the user's date window and the best concrete \
-             river/area near their start region for this kind of trip. Use the weather tools \
-             (geocode then forecast) to compare candidate days — favor low rain, light wind, \
-             comfortable temperature. State the chosen DATE with a one-line weather rationale \
-             (include numbers) and name the specific waterway/area.",
-        ),
-        (
-            Stage::Routing,
-            "ROUTING",
-            "Design the actual on-water route for the chosen day and place. Give a concrete \
-             put-in and take-out, 2-4 named stops with rough distances/times, and a relaxed pace \
-             that matches how prepared the party is and their priorities (e.g. more rest/BBQ than \
-             paddling). Keep total distance modest for an unprepared group.",
-        ),
-        (
-            Stage::Camp,
-            "CAMP",
-            "Choose ONE overnight campsite on the route that satisfies the user's constraints — \
-             notably any minimum distance from turbazy/villages/roads and maximum distance to \
-             water. If a maps/geo tool is connected, use it to verify; otherwise propose a \
-             plausible spot and clearly flag that the distances must be verified on the map. \
-             State approximate coordinates or a clear landmark, distance to water, and distance \
-             to the nearest civilization.",
-        ),
-        (
-            Stage::Schedule,
-            "SCHEDULE",
-            "Create a calendar event for this trip (start = chosen date, overnight duration). \
-             If no connected server can create calendar events, connect a calendar MCP yourself \
-             with `mcp_connect` (ask the user for any credentials in chat first). Confirm the \
-             event you created (title, date, time).",
-        ),
-        (
-            Stage::Doc,
-            "DOC",
-            "Produce a shareable Google Doc containing the full plan (date, route with stops, \
-             campsite, gear/BBQ notes) so the user can share it with friends. If no connected \
-             server can create docs, connect a Google Docs MCP yourself with `mcp_connect` \
-             (ask for credentials in chat first). Return the share link.",
-        ),
-    ];
+    for step in 0..MAX_ORCH_STEPS {
+        let user_empty = step > 0; // only the first step carries the user's message
+        let umsg = if user_empty { "" } else { user_text };
 
-    for (stage, name, instruction) in stages {
-        let system = stage_system(session, name);
-        let query = format!(
-            "[trip-brief]\n{brief_text}\n\n[prior-stages]\n{}\n\n[your-task as the {name} agent]\n{instruction}",
-            render_records(&records),
+        // ---- Orchestrator agent picks the next transition ----
+        let orch_input = format!(
+            "[trip-brief]\n{}\n\n[completed-stages]\n{}\n\n[user-message]\n{}{}",
+            brief.render(),
+            completed_list(&records),
+            if umsg.trim().is_empty() {
+                "(none)"
+            } else {
+                umsg
+            },
+            if forced && !user_empty {
+                "\n[hint] The user signaled they want to proceed with what's known."
+            } else {
+                ""
+            },
         );
-        let output = match llm.answer_with_system(state, &system, &query).await {
-            Ok(o) if !o.trim().is_empty() => o,
-            Ok(_) => "(no output)".to_string(),
-            Err(e) => format!("(stage failed: {e})"),
-        };
-        records.push(StageRecord {
-            stage: name.to_string(),
-            output,
-        });
-        // Persist progress after each stage so a crash mid-pipeline isn't lost.
-        if let Some(trip) = session.trip.as_mut() {
-            trip.stage = stage.clone();
-            trip.records = records.clone();
+        let raw = llm
+            .complete(ORCH_PROMPT, &orch_input)
+            .await
+            .unwrap_or_default();
+        let decision = parse_decision(&raw, &brief, &records, user_empty);
+
+        match decision.next {
+            // ---- Clarify: dedicated agent extracts slots / asks questions ----
+            Stage::Clarify => {
+                let input = format!("Brief so far:\n{}\n\nUser message:\n{umsg}", brief.render());
+                let parsed = parse_clarify(
+                    &llm.complete(CLARIFY_PROMPT, &input)
+                        .await
+                        .unwrap_or_default(),
+                );
+                brief.merge(parsed.brief);
+                let rounds = session
+                    .trip
+                    .as_mut()
+                    .map(|t| {
+                        t.clarify_rounds = t.clarify_rounds.saturating_add(1);
+                        t.brief = brief.clone();
+                        t.stage = Stage::Clarify;
+                        t.clarify_rounds
+                    })
+                    .unwrap_or(0);
+                let enough = parsed.ready || forced || rounds >= MAX_CLARIFY_ROUNDS;
+                if !enough {
+                    return Ok(FlowTurn {
+                        reply: render_clarify_reply(&parsed.recap, &parsed.questions),
+                        trace,
+                        done: false,
+                    });
+                }
+                // Brief good enough → let the orchestrator advance next step.
+                continue;
+            }
+
+            // ---- Done: compose the shareable plan and finish ----
+            Stage::Done => {
+                let final_answer = compose_final(llm, &brief, &records).await;
+                if let Some(t) = session.trip.as_mut() {
+                    t.stage = Stage::Done;
+                    t.records = records.clone();
+                }
+                return Ok(FlowTurn {
+                    reply: final_answer,
+                    trace,
+                    done: true,
+                });
+            }
+
+            // ---- Execution stage ----
+            ref stage if stage.is_exec() => {
+                if decision.mode == Mode::Ask {
+                    if let Some(t) = session.trip.as_mut() {
+                        t.stage = stage.clone();
+                        t.brief = brief.clone();
+                        t.records = records.clone();
+                    }
+                    return Ok(FlowTurn {
+                        reply: if decision.message.trim().is_empty() {
+                            "Уточните, пожалуйста?".into()
+                        } else {
+                            decision.message
+                        },
+                        trace,
+                        done: false,
+                    });
+                }
+                // Back-step: redoing a stage invalidates it and everything after.
+                drop_from(&mut records, stage);
+                let output = run_exec_stage(llm, state, session, &brief, &records, stage).await;
+                set_record(&mut records, stage, output.clone());
+                trace.push(format!("• {}: {}", stage.name(), clip(&output, 90)));
+                if let Some(t) = session.trip.as_mut() {
+                    t.stage = stage.clone();
+                    t.records = records.clone();
+                }
+                continue;
+            }
+
+            _ => continue,
         }
     }
 
-    // ---- Compose the final user-facing plan from all stage artifacts ----
-    let compose_input = format!(
-        "[trip-brief]\n{brief_text}\n\n[stage-outputs]\n{}",
-        render_records(&records),
-    );
-    let final_answer = llm
-        .complete(COMPOSE_PROMPT, &compose_input)
-        .await
-        .unwrap_or_else(|_| fallback_compose(&records));
-
-    let trace: Vec<String> = records
-        .iter()
-        .map(|r| format!("• {}: {}", r.stage, clip(&r.output, 90)))
-        .collect();
-
-    // Flow complete — caller clears session.trip.
-    if let Some(trip) = session.trip.as_mut() {
-        trip.stage = Stage::Done;
+    // Safety: hit the step cap — compose whatever we have.
+    let final_answer = compose_final(llm, &brief, &records).await;
+    if let Some(t) = session.trip.as_mut() {
+        t.stage = Stage::Done;
+        t.records = records.clone();
     }
-
     Ok(FlowTurn {
         reply: final_answer,
         trace,
         done: true,
     })
+}
+
+/// Run one execution stage's worker agent (uses the connected MCP tools).
+async fn run_exec_stage(
+    llm: &Llm,
+    state: &BotState,
+    session: &ChatSession,
+    brief: &TripBrief,
+    records: &[StageRecord],
+    stage: &Stage,
+) -> String {
+    let system = stage_system(session, stage.name());
+    let query = format!(
+        "[trip-brief]\n{}\n\n[prior-stages]\n{}\n\n[your-task as the {} agent]\n{}",
+        brief.render(),
+        render_records(records),
+        stage.name(),
+        stage.instruction(),
+    );
+    match llm.answer_with_system(state, &system, &query).await {
+        Ok(o) if !o.trim().is_empty() => o,
+        Ok(_) => "(no output)".to_string(),
+        Err(e) => format!("(stage failed: {e})"),
+    }
+}
+
+/// Compose the final user-facing plan from all stage artifacts.
+async fn compose_final(llm: &Llm, brief: &TripBrief, records: &[StageRecord]) -> String {
+    let compose_input = format!(
+        "[trip-brief]\n{}\n\n[stage-outputs]\n{}",
+        brief.render(),
+        render_records(records),
+    );
+    llm.complete(COMPOSE_PROMPT, &compose_input)
+        .await
+        .unwrap_or_else(|_| fallback_compose(records))
+}
+
+/// One-line-per-completed-stage listing for the orchestrator prompt.
+fn completed_list(records: &[StageRecord]) -> String {
+    if records.is_empty() {
+        return "(none)".to_string();
+    }
+    records
+        .iter()
+        .map(|r| format!("- {}: {}", r.stage, clip(&r.output, 120)))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 const COMPOSE_PROMPT: &str = "You assemble the FINAL trip plan a user will share with friends, \
@@ -509,5 +808,149 @@ mod tests {
         let s = "Карелия";
         let c = clip(s, 5);
         assert!(c.ends_with('…'));
+    }
+
+    // ---- Stage ordering + parsing ----
+
+    #[test]
+    fn stage_order_is_linear_and_parse_roundtrips() {
+        let seq = [
+            Stage::Clarify,
+            Stage::Planning,
+            Stage::Routing,
+            Stage::Camp,
+            Stage::Schedule,
+            Stage::Doc,
+            Stage::Done,
+        ];
+        for w in seq.windows(2) {
+            assert!(w[0].order() < w[1].order(), "{:?} !< {:?}", w[0], w[1]);
+        }
+        for s in seq {
+            assert_eq!(Stage::parse(s.name()), Some(s.clone()));
+        }
+        // aliases + case-insensitivity
+        assert_eq!(Stage::parse("ROUTE"), Some(Stage::Routing));
+        assert_eq!(Stage::parse("calendar"), Some(Stage::Schedule));
+        assert_eq!(Stage::parse("garbage"), None);
+    }
+
+    // ---- brief.has_minimum heuristic ----
+
+    #[test]
+    fn has_minimum_needs_area_and_date() {
+        let mut b = TripBrief::default();
+        assert!(!b.has_minimum());
+        b.fields.insert("area".into(), "Москва".into());
+        assert!(!b.has_minimum(), "area alone is not enough");
+        b.fields.insert("date_window".into(), "2 недели".into());
+        assert!(b.has_minimum());
+        // blank value doesn't count
+        let mut b2 = TripBrief::default();
+        b2.fields.insert("start_location".into(), "Питер".into());
+        b2.fields.insert("when".into(), "   ".into());
+        assert!(!b2.has_minimum());
+    }
+
+    // ---- orchestrator decision parsing + fallback ----
+
+    #[test]
+    fn parse_decision_reads_stage_and_mode() {
+        let d = parse_decision(
+            r#"{"next_stage":"Routing","mode":"ask","message":"какой реки?","reason":"x"}"#,
+            &TripBrief::default(),
+            &[],
+            false,
+        );
+        assert_eq!(d.next, Stage::Routing);
+        assert_eq!(d.mode, Mode::Ask);
+        assert_eq!(d.message, "какой реки?");
+    }
+
+    #[test]
+    fn parse_decision_never_clarifies_on_empty_user_message() {
+        // Even if the model says Clarify, an auto-advance (empty msg) must not.
+        let mut brief = TripBrief::default();
+        brief.fields.insert("area".into(), "Москва".into());
+        brief.fields.insert("date".into(), "июль".into());
+        let d = parse_decision(
+            r#"{"next_stage":"Clarify","mode":"run"}"#,
+            &brief,
+            &[],
+            true, // user_empty
+        );
+        assert_ne!(d.next, Stage::Clarify);
+        assert_eq!(d.next, Stage::Planning); // earliest stage without output
+    }
+
+    #[test]
+    fn fallback_picks_earliest_stage_without_output() {
+        let mut brief = TripBrief::default();
+        brief.fields.insert("area".into(), "Москва".into());
+        brief.fields.insert("date".into(), "июль".into());
+        let mut records = Vec::new();
+        set_record(&mut records, &Stage::Planning, "day chosen".into());
+        let d = parse_decision("not json", &brief, &records, true);
+        assert_eq!(d.next, Stage::Routing);
+    }
+
+    #[test]
+    fn fallback_clarifies_when_brief_thin_and_user_spoke() {
+        let d = parse_decision("junk", &TripBrief::default(), &[], false);
+        assert_eq!(d.next, Stage::Clarify);
+        assert_eq!(d.mode, Mode::Run);
+    }
+
+    #[test]
+    fn next_exec_after_returns_done_when_all_present() {
+        let mut r = Vec::new();
+        for s in [
+            Stage::Planning,
+            Stage::Routing,
+            Stage::Camp,
+            Stage::Schedule,
+            Stage::Doc,
+        ] {
+            set_record(&mut r, &s, "x".into());
+        }
+        assert_eq!(next_exec_after(&r), Stage::Done);
+    }
+
+    // ---- record helpers: replace + back-step invalidation ----
+
+    #[test]
+    fn set_record_replaces_and_keeps_order() {
+        let mut r = Vec::new();
+        set_record(&mut r, &Stage::Camp, "camp v1".into());
+        set_record(&mut r, &Stage::Planning, "plan".into());
+        set_record(&mut r, &Stage::Routing, "route".into());
+        // ordered by stage order, not insertion order
+        let names: Vec<&str> = r.iter().map(|x| x.stage.as_str()).collect();
+        assert_eq!(names, vec!["Planning", "Routing", "Camp"]);
+        // replace in place, no duplicate
+        set_record(&mut r, &Stage::Camp, "camp v2".into());
+        assert_eq!(r.iter().filter(|x| x.stage == "Camp").count(), 1);
+        assert_eq!(
+            record_index(&r, &Stage::Camp).map(|i| &r[i].output[..]),
+            Some("camp v2")
+        );
+    }
+
+    #[test]
+    fn drop_from_invalidates_stage_and_downstream() {
+        let mut r = Vec::new();
+        for s in [
+            Stage::Planning,
+            Stage::Routing,
+            Stage::Camp,
+            Stage::Schedule,
+            Stage::Doc,
+        ] {
+            set_record(&mut r, &s, "x".into());
+        }
+        // user steps back to Routing → Routing..Doc dropped, Planning kept
+        drop_from(&mut r, &Stage::Routing);
+        let names: Vec<&str> = r.iter().map(|x| x.stage.as_str()).collect();
+        assert_eq!(names, vec!["Planning"]);
     }
 }
