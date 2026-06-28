@@ -262,6 +262,19 @@ impl Stage {
         }
     }
 
+    /// Short user-facing "what I'm doing now" line, shown before a (possibly
+    /// multi-minute) stage runs so the chat is never silent. RU — primary user.
+    fn progress_label(&self) -> &'static str {
+        match self {
+            Stage::Planning => "🛶 Подбираю день и место по погоде…",
+            Stage::Routing => "🗺 Прорабатываю маршрут по карте (заезд, остановки, выход)… это может занять пару минут",
+            Stage::Camp => "🏕 Ищу и проверяю стоянку у воды… пару минут",
+            Stage::Schedule => "📅 Создаю событие в календаре…",
+            Stage::Doc => "📄 Собираю Google-документ с планом…",
+            Stage::Clarify | Stage::Done => "",
+        }
+    }
+
     /// Parse a stage name (case-insensitive) from the orchestrator's JSON.
     pub fn parse(s: &str) -> Option<Stage> {
         match s.trim().to_ascii_lowercase().as_str() {
@@ -548,6 +561,7 @@ pub async fn advance(
     state: &BotState,
     session: &mut ChatSession,
     user_text: &str,
+    progress: Option<&super::ProgressSender>,
 ) -> Result<FlowTurn> {
     let mut brief = session
         .trip
@@ -732,6 +746,14 @@ pub async fn advance(
                     });
                 }
                 let is_final = finalizing(stage);
+                // Tell the user which step is starting BEFORE the (possibly
+                // multi-minute) stage runs, so the chat is never silent.
+                if let Some(p) = progress {
+                    let label = stage.progress_label();
+                    if !label.is_empty() {
+                        let _ = p.send(label.to_string());
+                    }
+                }
                 // Back-step / re-run invalidates this stage and everything after.
                 drop_from(&mut records, stage);
                 // Pass the user's choice only when finalizing a checkpoint, so the
@@ -988,12 +1010,24 @@ fn stage_system(session: &ChatSession, role: &str) -> String {
             "You are the {role} agent in a multi-stage trip-planning swarm. Do ONLY your stage's \
              task, building on the prior stages' outputs. Use the connected MCP tools when you \
              need live data or to act. For Russian geography with OSM tools, pass region=\"RU\" \
-             and include \"Россия\" in free-text place queries. For maps__osm_query_bbox, the \
-             tags argument must be a JSON object/map such as {{\"waterway\":\"river\"}} or \
-             {{\"tourism\":\"camp_site\"}}; never pass an array or a plain string. Avoid raw \
-             name=<Cyrillic> tag selectors; geocode names first or query broad tags and filter the result. If \
-             Overpass returns 400/429/504, do not keep retrying alternatives in a loop: state \
-             what remains unverified and finish your stage."
+             and include \"Россия\" in free-text place queries.\n\
+             OSM QUERY RULES (follow EXACTLY — violating them causes Overpass HTTP 400 and wastes \
+             minutes):\n\
+             1. To locate a NAMED feature (a river, town), call geocode_address FIRST to get \
+             coordinates. NEVER put a name in osm_query_bbox tags — `{{\"name\":\"Медведица\"}}` \
+             produces an unquoted-Cyrillic selector that Overpass rejects with 400. After \
+             geocoding, query a SMALL bbox around those coordinates with a generic tag like \
+             {{\"waterway\":\"river\"}}, no name filter.\n\
+             2. osm_query_bbox `tags` must be a JSON object whose VALUES are single strings: \
+             {{\"waterway\":\"river\"}} or {{\"tourism\":\"camp_site\"}}. NEVER an array value \
+             (`{{\"place\":[\"village\",\"hamlet\"]}}` is INVALID → 400) and never a plain string \
+             or array at top level. Need several values? Run separate small queries or query just \
+             the key.\n\
+             3. Keep every bbox small (tenths of a degree). Big bboxes time out (504).\n\
+             4. HARD STOP: if the SAME goal fails twice on Overpass (400/429/504), do NOT keep \
+             trying new variations — stop and finish your stage (emit STAGE_INCOMPLETE if you have \
+             no real coordinates). Looping on a failing query is the main cause of multi-minute \
+             silent stalls and is forbidden."
         )),
         None,
     )
