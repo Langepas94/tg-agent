@@ -8,7 +8,12 @@ use std::time::Duration;
 
 use crate::{config::LlmConfig, state::BotState};
 
-const MAX_STEPS: usize = 12;
+/// Default tool-loop budget for an ordinary chat turn.
+pub const MAX_STEPS: usize = 12;
+/// Larger budget for a trip-swarm worker stage: campsite/route verification can
+/// legitimately need many OSM queries (settlements, water, land features), so 12
+/// was too few and the stage died with "too many tool calls".
+pub const STAGE_MAX_STEPS: usize = 20;
 /// Per-tool-result char cap before feeding it back to the model. Sized for a
 /// 7-day hourly forecast (~10–15k chars); `fit_to_context` reclaims the window
 /// if many such results accumulate across the loop.
@@ -110,7 +115,8 @@ impl Llm {
             Resolve place names to coordinates with a geocode tool before \
             weather tools if required. Answer concisely in the user's language. \
             Never show raw JSON — summarize results in human-readable prose.";
-        self.answer_with_system(state, system, user_text).await
+        self.answer_with_system(state, system, user_text, MAX_STEPS)
+            .await
     }
 
     /// Agentic loop with a caller-supplied system prompt and no chat context
@@ -120,8 +126,9 @@ impl Llm {
         state: &BotState,
         system: &str,
         user_text: &str,
+        max_steps: usize,
     ) -> Result<String> {
-        self.answer_in_chat(state, system, user_text, &[], None)
+        self.answer_in_chat(state, system, user_text, &[], None, max_steps)
             .await
     }
 
@@ -135,6 +142,7 @@ impl Llm {
         user_text: &str,
         history: &[(&str, &str)],
         chat_id: Option<i64>,
+        max_steps: usize,
     ) -> Result<String> {
         let (mut tool_defs, mut tool_map) = collect_tools(state).await;
         // Tools that accept a `session_id` param — the bot forces it to the
@@ -154,7 +162,7 @@ impl Llm {
         }
         messages.push(json!({ "role": "user", "content": user_text }));
 
-        for _ in 0..MAX_STEPS {
+        for _ in 0..max_steps {
             // Keep the growing tool transcript under the model's window. MCP
             // results (multi-city forecasts) can overflow it mid-loop; clip the
             // oldest results BEFORE the call so the provider never 400s.

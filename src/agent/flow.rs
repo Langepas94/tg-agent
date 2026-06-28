@@ -347,26 +347,30 @@ impl Stage {
             }
             Stage::Camp => {
                 "You are a CHECKPOINT stage: you propose the overnight site and let the user \
-                 confirm, you do NOT silently decide. Honour the CONSTRAINTS THE USER ACTUALLY \
-                 STATED in the brief — only those. Common ones: a minimum distance from \
-                 civilization (settlements/turbazy/roads), and, IF the user asked for it or it is a \
-                 water trip, a maximum distance to water. Do NOT invent a water requirement for a \
-                 cycling/hiking trip that never mentioned it. You MUST use the maps/OSM tools to \
-                 VERIFY each stated constraint with real data. NEVER guess coordinates — derive \
-                 them from tool results.\n\
-                 CRITICAL — the campsite MUST be on DRY, PITCHABLE LAND. Do NOT output the centroid \
-                 of a lake/river/water polygon (an `out center` of a natural=water / waterway \
-                 feature is the MIDDLE OF THE WATER — you cannot pitch a tent there). If a \
-                 near-water constraint applies, the site is dry BANK ground whose distance to the \
-                 water EDGE meets the limit, not a point inside the water. Prefer real on-land \
-                 features — a clearing/meadow (landuse=meadow, natural=grassland), a beach \
-                 (natural=beach), or an existing camp_site. Sanity-check every coordinate is on \
-                 land before proposing it.\n\
-                 - If [user-choice] below is empty (first run): propose 1-2 candidate sites on the \
-                 route, each a dry-land spot with real coordinates and the measured distances for \
-                 EACH stated constraint (distance to the nearest village/turbaza/road; distance to \
-                 the water edge only if a water constraint applies). End by asking the user to \
-                 confirm one (or ask for another). Do NOT finalize yet.\n\
+                 confirm. Honour ONLY the CONSTRAINTS THE USER ACTUALLY STATED in the brief \
+                 (e.g. a minimum distance from civilization; a maximum distance to water IF they \
+                 asked or it is a water trip — never invent a water requirement for a bike/hike).\n\
+                 BE ECONOMICAL — you have a limited tool budget; running too many queries makes the \
+                 stage fail. Work like this:\n\
+                 1. REUSE the coordinates already found by the Routing stage (see [prior-stages]). \
+                 Do NOT re-discover the river/route — it is already known. Pick ONE candidate point \
+                 on the route, on the bank, as your starting guess.\n\
+                 2. A campsite does NOT need to be a tagged OSM feature — any suitable dry bank spot \
+                 works. Do NOT enumerate beach/camp_site/meadow/picnic_site/wilderness_hut tags one \
+                 by one.\n\
+                 3. Verify the stated constraints with the FEWEST queries possible: ONE small-bbox \
+                 query for settlements near the point (e.g. {{\"place\":\"village\"}} in a ~2 km \
+                 box) to confirm the min-distance-from-civilization; the water distance you can take \
+                 from the already-known waterway. Aim for 2-3 queries total, small bboxes only — \
+                 NEVER broad single-key tags like [tourism]/[leisure]/[highway] over a big box \
+                 (they are slow and waste the budget).\n\
+                 CRITICAL — the site MUST be on DRY, PITCHABLE LAND, never a water-polygon centroid \
+                 (an `out center` of a water feature is the MIDDLE OF THE WATER). If a near-water \
+                 constraint applies, it is dry BANK ground whose distance to the water EDGE meets \
+                 the limit.\n\
+                 - If [user-choice] below is empty (first run): propose 1-2 candidate sites with \
+                 real coordinates and the measured distances for EACH stated constraint. End by \
+                 asking the user to confirm one. Do NOT finalize yet.\n\
                  - If [user-choice] below confirms a site (or asks to move it): COMMIT to that one \
                  site and output its final verified coordinates and distances.\n\
                  HONESTY GATE: if the map service keeps failing and you CANNOT produce a real site \
@@ -881,9 +885,16 @@ async fn run_exec_stage(
     last
 }
 
-/// One bounded attempt at a stage's worker agent.
+/// One bounded attempt at a stage's worker agent. Uses a larger tool-loop budget
+/// than a normal chat turn — OSM verification (settlements, water, land) needs
+/// several queries, and 12 steps died with "too many tool calls".
 async fn run_stage_once(llm: &Llm, state: &BotState, system: &str, query: &str) -> String {
-    match tokio::time::timeout(STAGE_TIMEOUT, llm.answer_with_system(state, system, query)).await {
+    match tokio::time::timeout(
+        STAGE_TIMEOUT,
+        llm.answer_with_system(state, system, query, crate::llm::STAGE_MAX_STEPS),
+    )
+    .await
+    {
         Err(_) => "(stage timed out)".to_string(),
         Ok(Ok(o)) if !o.trim().is_empty() => o,
         Ok(Ok(_)) => "(no output)".to_string(),
@@ -1034,7 +1045,12 @@ fn stage_system(session: &ChatSession, role: &str) -> String {
              4. HARD STOP: if the SAME goal fails twice on Overpass (400/429/504), do NOT keep \
              trying new variations — stop and finish your stage (emit STAGE_INCOMPLETE if you have \
              no real coordinates). Looping on a failing query is the main cause of multi-minute \
-             silent stalls and is forbidden."
+             silent stalls and is forbidden.\n\
+             5. BE ECONOMICAL — your tool budget is limited; too many calls kill the stage. REUSE \
+             coordinates already produced by earlier stages (see [prior-stages]) instead of \
+             re-querying them. Pick a specific tag + SMALL bbox; NEVER sweep a broad single-key tag \
+             ([tourism], [leisure], [highway], [place]) over a large bbox — those are slow and \
+             waste the whole budget. Target the minimum number of queries that answers your task."
         )),
         None,
     )
