@@ -253,7 +253,31 @@ impl Llm {
                 }
             }
         }
-        Ok("Stopped after too many tool calls. Try rephrasing.".into())
+        // Budget exhausted. Instead of throwing away everything the model
+        // gathered (the old behaviour returned a canned "too many tool calls"
+        // string and the whole stage failed), force ONE final answer with NO
+        // tools available: the model must commit using the data already in the
+        // transcript. This is what makes a query-heavy stage (campsite search)
+        // produce a real result instead of dying at the step cap.
+        messages.push(json!({
+            "role": "user",
+            "content": "Stop using tools now — you have reached the tool limit. \
+                Answer the task using ONLY the data you have already gathered above. \
+                Commit to concrete results (with the coordinates/values you found); \
+                do not ask for more tools.",
+        }));
+        fit_to_context(&mut messages, &self.cfg.model);
+        let final_msg = self.chat(&messages, &[]).await?;
+        let answer = final_msg["content"]
+            .as_str()
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if answer.is_empty() {
+            Ok("Stopped after too many tool calls. Try rephrasing.".into())
+        } else {
+            Ok(answer)
+        }
     }
 }
 
