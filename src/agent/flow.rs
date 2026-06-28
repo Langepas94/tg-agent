@@ -296,17 +296,22 @@ impl Stage {
     fn instruction(&self) -> &'static str {
         match self {
             Stage::Planning => {
-                "You are a CHECKPOINT stage: you offer the user a choice, you do NOT decide alone. \
-                 Use the weather tools (geocode then forecast) to evaluate candidate days within \
-                 the user's date window for concrete rivers/areas near their start region.\n\
-                 - If [user-choice] below is empty (first run): PROPOSE 2-3 distinct CANDIDATE \
-                 options, each = a specific day + a specific waterway/area + a one-line weather \
-                 rationale WITH NUMBERS (rain, wind, temperature). Make them genuinely different \
-                 (different days and/or places) so the choice is meaningful. End by asking the \
-                 user to pick one (or ask to see other options). Do NOT commit yet.\n\
+                "You are a CHECKPOINT stage: you offer the user a CHOICE with explicit trade-offs, \
+                 you do NOT decide alone. Use the weather tools (geocode then forecast) AND geocode \
+                 the user's start region so you can give the APPROXIMATE travel distance/time from \
+                 their start to each candidate area.\n\
+                 - If [user-choice] below is empty (first run): PROPOSE 2-3 genuinely DIFFERENT \
+                 candidate options that SPREAD ACROSS THE TRADE-OFF, not just the single best \
+                 weather. Deliberately include at least one CLOSER/nearer area even if its weather \
+                 is slightly worse, and one with the best weather even if farther. Each option = a \
+                 specific day + a specific waterway/area + weather numbers (rain, wind, temp) + the \
+                 approx distance/drive time from the user's start. Make the trade-off explicit \
+                 (e.g. 'на 1-2°C прохладнее, зато в 2 раза ближе'). NEVER collapse to one option or \
+                 silently pick the farthest 'best weather' spot. End by asking the user to pick. Do \
+                 NOT commit yet.\n\
                  - If [user-choice] below names the option the user picked (or asks to adjust): \
-                 COMMIT to a single final choice — the chosen DATE and the specific waterway/area \
-                 — with the confirming weather numbers. Output just that final pick."
+                 COMMIT to a single final choice — the chosen DATE and the specific waterway/area — \
+                 with the confirming weather numbers and the distance. Output just that final pick."
             }
             Stage::Routing => {
                 "Design the actual on-water route. You MUST call the maps/OSM tools to get REAL \
