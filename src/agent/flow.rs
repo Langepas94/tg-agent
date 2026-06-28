@@ -336,15 +336,18 @@ impl Stage {
             }
             Stage::Schedule => {
                 "Create a calendar event for this trip (start = chosen date, overnight duration). \
-                 If no connected server can create calendar events, connect a calendar MCP \
-                 yourself with `mcp_connect` (ask the user for any credentials in chat first). \
-                 Confirm the event you created (title, date, time)."
+                 If a connected tool can create calendar events, use it and confirm the event \
+                 (title, date, time). If NONE can: do NOT loop or keep retrying — make at most ONE \
+                 `mcp_connect` attempt for a calendar MCP, and if that is not possible right now, \
+                 output a single short line that a calendar MCP must be connected to create the \
+                 event, then STOP."
             }
             Stage::Doc => {
-                "Produce a shareable Google Doc with the full plan (date, route with stops, \
-                 campsite, gear/BBQ notes) so the user can share it with friends. If no connected \
-                 server can create docs, connect a Google Docs MCP yourself with `mcp_connect` \
-                 (ask for credentials in chat first). Return the share link."
+                "Produce the shareable plan as a Google Doc. If a connected tool can create docs, \
+                 use it and return the share link. If NONE can: do NOT loop or keep retrying — make \
+                 at most ONE `mcp_connect` attempt for a docs MCP, and if that is not possible right \
+                 now, output the full plan as plain text the user can copy, plus one short line that \
+                 a docs MCP must be connected for an auto-shared link, then STOP."
             }
             Stage::Clarify | Stage::Done => "",
         }
@@ -522,32 +525,47 @@ pub async fn advance(
         .unwrap_or_default();
     let mut trace: Vec<String> = Vec::new();
     let forced = user_forces_go(user_text);
+    // First contact with a fresh flow: ALWAYS clarify first (never let the
+    // orchestrator dive into the 5-stage pipeline on a raw multi-part request).
+    // Guarantees a fast first reply that asks questions, and avoids the old
+    // single-shot "burn 12 tool calls then give up" failure on a megaprompt.
+    let first_contact =
+        records.is_empty() && session.trip.as_ref().map(|t| t.clarify_rounds).unwrap_or(0) == 0;
 
     for step in 0..MAX_ORCH_STEPS {
         let user_empty = step > 0; // only the first step carries the user's message
         let umsg = if user_empty { "" } else { user_text };
 
         // ---- Orchestrator agent picks the next transition ----
-        let orch_input = format!(
-            "[trip-brief]\n{}\n\n[completed-stages]\n{}\n\n[user-message]\n{}{}",
-            brief.render(),
-            completed_list(&records),
-            if umsg.trim().is_empty() {
-                "(none)"
-            } else {
-                umsg
-            },
-            if forced && !user_empty {
-                "\n[hint] The user signaled they want to proceed with what's known."
-            } else {
-                ""
-            },
-        );
-        let raw = llm
-            .complete(ORCH_PROMPT, &orch_input)
-            .await
-            .unwrap_or_default();
-        let decision = parse_decision(&raw, &brief, &records, user_empty);
+        let decision = if step == 0 && first_contact {
+            // Skip the orchestrator call entirely on turn 1: clarify is mandatory.
+            Decision {
+                next: Stage::Clarify,
+                mode: Mode::Run,
+                message: String::new(),
+            }
+        } else {
+            let orch_input = format!(
+                "[trip-brief]\n{}\n\n[completed-stages]\n{}\n\n[user-message]\n{}{}",
+                brief.render(),
+                completed_list(&records),
+                if umsg.trim().is_empty() {
+                    "(none)"
+                } else {
+                    umsg
+                },
+                if forced && !user_empty {
+                    "\n[hint] The user signaled they want to proceed with what's known."
+                } else {
+                    ""
+                },
+            );
+            let raw = llm
+                .complete(ORCH_PROMPT, &orch_input)
+                .await
+                .unwrap_or_default();
+            parse_decision(&raw, &brief, &records, user_empty)
+        };
 
         match decision.next {
             // ---- Clarify: dedicated agent extracts slots / asks questions ----
