@@ -155,21 +155,22 @@ pub struct FlowTurn {
 // Clarify agent
 // ---------------------------------------------------------------------------
 
-const CLARIFY_PROMPT: &str = "You are the CLARIFY agent of an outdoor-trip planner \
-(hikes, kayak/canoe trips, camping, weekend getaways). You receive the user's known profile, \
-the brief gathered so far, and the user's newest message. MERGE any new facts into the brief. \
+const CLARIFY_PROMPT: &str = "You are the CLARIFY agent of a general outdoor-trip / recreation \
+planner (any activity the user names — hikes, paddling, cycling, camping, weekend getaways, etc.; \
+make NO assumption about the activity or terrain). You receive the user's known profile, the \
+brief gathered so far, and the user's newest message. MERGE any new facts into the brief. \
 \
-CORE PRINCIPLE: the planning agents decide WHERE to go (which river/route), WHICH day, and the \
-campsite — that is the whole point of the assistant. NEVER ask the user to choose the river, the \
-exact route, the specific day, or the campsite; do NOT ask for things already stated in the \
-message or present in the profile/brief. \
+CORE PRINCIPLE: the planning agents decide WHERE to go (the place/route), WHICH day, and the \
+overnight spot — that is the whole point of the assistant. NEVER ask the user to choose the \
+place, the exact route, the specific day, or the overnight spot; do NOT ask for things already \
+stated in the message or present in the profile/brief. \
 \
 The ONLY facts to clarify are ones that only the user can know AND are still missing: \
 1) their home city / start region — but if the profile has a home city, use it as `area` and do \
 NOT ask; 2) the date window, if the message gives none; 3) group size / experience level, if not \
-implied; 4) any hard must-haves the user cares about (e.g. campsite far from civilization, water \
-nearby). If the message already conveys these (e.g. 'команда неподготовленная, хочет шашлык', \
-'одна ночёвка', 'в ближайшие 2 недели', 'вода в 30 м'), mark them filled — do NOT re-ask. \
+implied; 4) any hard must-haves the user cares about (whatever constraints they state). If the \
+message already conveys these (e.g. 'команда неподготовленная, хочет шашлык', 'одна ночёвка', \
+'в ближайшие 2 недели', 'вода в 30 м'), mark them filled — do NOT re-ask. \
 \
 Set `ready=true` as soon as you have a start region (from profile or message) and a rough date \
 window; everything else the planners infer. Also set `ready=true` if the user signals they want \
@@ -313,70 +314,73 @@ impl Stage {
                  you do NOT decide alone. Use the weather tools (geocode then forecast) AND geocode \
                  the user's start region so you can give the APPROXIMATE travel distance/time from \
                  their start to each candidate area.\n\
-                 - If [user-choice] below is empty (first run): PROPOSE 2-3 genuinely DIFFERENT \
-                 candidate options that SPREAD ACROSS THE TRADE-OFF, not just the single best \
-                 weather. Deliberately include at least one CLOSER/nearer area even if its weather \
-                 is slightly worse, and one with the best weather even if farther. Each option = a \
-                 specific day + a specific area/route suited to THE USER'S ACTIVITY (read it from \
-                 the brief — kayak/raft → a river/lake; cycling → a road/trail loop; hiking → a \
-                 trail area; etc. — do NOT assume water) + weather numbers (rain, wind, temp) + the \
-                 approx distance/travel time from the user's start. Make the trade-off explicit \
-                 (e.g. 'на 1-2°C прохладнее, зато в 2 раза ближе'). NEVER collapse to one option or \
-                 silently pick the farthest 'best weather' spot. End by asking the user to pick. Do \
-                 NOT commit yet.\n\
-                 - If [user-choice] below names the option the user picked (or asks to adjust): \
-                 COMMIT to a single final choice — the chosen DATE and the specific area/route — \
-                 with the confirming weather numbers and the distance. Output just that final pick."
+                 - If [user-choice] below is empty (first run): PROPOSE the genuinely distinct, \
+                 worthwhile candidate options that actually exist for this trip — as many as truly \
+                 make sense, no fixed number. Do not pad to a count, and do not drop a clearly good \
+                 option to hit one; if only one area realistically fits, present just that and say \
+                 why. SPREAD them across the trade-off (don't offer only the single best weather): \
+                 where it applies, include a nearer area even if slightly worse weather and a \
+                 best-weather one even if farther. Each option = a specific day + a specific \
+                 place/area that fits THE ACTIVITY DESCRIBED IN THE BRIEF (infer what kind of place \
+                 that activity needs; make no assumptions about terrain or whether water is \
+                 involved) + weather numbers (rain, wind, temp) + the approx distance/travel time \
+                 from the user's start. Make the trade-off explicit (e.g. 'на 1-2°C прохладнее, \
+                 зато в 2 раза ближе'). End by asking the user to pick. Do NOT commit yet.\n\
+                 - If [user-choice] below names the option the user picked: your earlier options \
+                 are in [prior-stages]; just COMMIT to the chosen one — its DATE, place/area, \
+                 weather numbers and distance — no new tool calls needed. Output just that pick."
             }
             Stage::Routing => {
-                "Design the actual route FOR THE USER'S ACTIVITY (read it from the brief; do NOT \
-                 assume a water trip): a kayak/raft trip follows a waterway with a put-in and \
-                 take-out; a cycling/hiking trip follows roads/trails with a start and end point. \
-                 You MUST call the maps/OSM tools to get REAL geographic data — geocode the area, \
-                 find the relevant way (waterway / road / trail), and resolve concrete start and \
-                 end points. NEVER invent or approximate coordinates: every coordinate you state \
-                 must come from a tool result. Give the start and end with real coordinates, 2-4 \
-                 named intermediate stops (real places from the map) with distances/times, and a \
-                 pace matching the party's stated level and priorities from the brief. Keep total \
+                "Design the actual route for the trip. INFER from the brief what kind of route the \
+                 stated activity needs and which map features matter — do not assume any particular \
+                 mode or terrain. You MUST call the maps/OSM tools to get REAL geographic data: \
+                 geocode the area, find the features the route follows, and resolve concrete start \
+                 and end points. NEVER invent or approximate coordinates — every coordinate you \
+                 state must come from a tool result. Give the start and end with real coordinates, \
+                 2-4 named intermediate stops (real places from the map) with distances/times, and \
+                 a pace matching the party's stated level and priorities from the brief. Keep total \
                  distance sensible for that level.\n\
-                 HONESTY GATE: if the map service keeps failing (Overpass 429/504) and you CANNOT \
-                 resolve real start/end coordinates and at least one real intermediate stop, do \
-                 NOT write vague prose like 'маршрут уточняется' or 'точки не определены'. Instead \
-                 end your reply with a line exactly: 'STAGE_INCOMPLETE: <short reason>'. Never \
-                 present a route as ready without real coordinates."
+                 TIGHT BUDGET: you have only a few map queries. Geocode once, run a SMALL number of \
+                 lookups, then COMMIT — output the route with the concrete coordinates you have. Do \
+                 NOT keep re-querying to perfect it. Better a good route committed in 4 queries \
+                 than an endless refinement that times out.\n\
+                 Only if you got NO usable coordinates at all end your reply with exactly: \
+                 'STAGE_INCOMPLETE: <short reason>'. Never write vague prose like 'маршрут \
+                 уточняется' instead of committing."
             }
             Stage::Camp => {
-                "You are a CHECKPOINT stage: you propose the overnight site and let the user \
-                 confirm. Honour ONLY the CONSTRAINTS THE USER ACTUALLY STATED in the brief \
-                 (e.g. a minimum distance from civilization; a maximum distance to water IF they \
-                 asked or it is a water trip — never invent a water requirement for a bike/hike).\n\
-                 BE ECONOMICAL — you have a limited tool budget; running too many queries makes the \
-                 stage fail. Work like this:\n\
-                 1. REUSE the coordinates already found by the Routing stage (see [prior-stages]). \
-                 Do NOT re-discover the river/route — it is already known. Pick ONE candidate point \
-                 on the route, on the bank, as your starting guess.\n\
-                 2. A campsite does NOT need to be a tagged OSM feature — any suitable dry bank spot \
-                 works. Do NOT enumerate beach/camp_site/meadow/picnic_site/wilderness_hut tags one \
-                 by one.\n\
-                 3. Verify the stated constraints with the FEWEST queries possible: ONE small-bbox \
-                 query for settlements near the point (e.g. {{\"place\":\"village\"}} in a ~2 km \
-                 box) to confirm the min-distance-from-civilization; the water distance you can take \
-                 from the already-known waterway. Aim for 2-3 queries total, small bboxes only — \
-                 NEVER broad single-key tags like [tourism]/[leisure]/[highway] over a big box \
-                 (they are slow and waste the budget).\n\
-                 CRITICAL — the site MUST be on DRY, PITCHABLE LAND, never a water-polygon centroid \
-                 (an `out center` of a water feature is the MIDDLE OF THE WATER). If a near-water \
-                 constraint applies, it is dry BANK ground whose distance to the water EDGE meets \
-                 the limit.\n\
-                 - If [user-choice] below is empty (first run): propose 1-2 candidate sites with \
-                 real coordinates and the measured distances for EACH stated constraint. End by \
-                 asking the user to confirm one. Do NOT finalize yet.\n\
-                 - If [user-choice] below confirms a site (or asks to move it): COMMIT to that one \
-                 site and output its final verified coordinates and distances.\n\
-                 HONESTY GATE: if the map service keeps failing and you CANNOT produce a real site \
-                 with verified coordinates and the measured distances for the stated constraints, \
-                 do NOT write 'место уточняется' or fabricate numbers. Instead end your reply with \
-                 a line exactly: 'STAGE_INCOMPLETE: <short reason>'."
+                "You are a CHECKPOINT stage: you propose the overnight spot and let the user \
+                 confirm. Honour ONLY the CONSTRAINTS THE USER ACTUALLY STATED in the brief — do \
+                 not invent requirements they never mentioned. Read each stated constraint from the \
+                 brief and verify it.\n\
+                 BE ECONOMICAL — you have a limited tool budget; too many queries fail the stage:\n\
+                 1. REUSE the coordinates the Routing stage already produced (see [prior-stages]). \
+                 Do NOT re-discover the route — it is already known. Pick ONE candidate point along \
+                 it as your starting guess.\n\
+                 2. The spot does NOT need to be a tagged OSM feature — any suitable real location \
+                 works. Do NOT enumerate many feature tags one by one.\n\
+                 3. Verify the stated constraints with the FEWEST queries possible (aim 2-3), small \
+                 bboxes only — NEVER sweep broad single-key tags over a big box (slow, wastes the \
+                 budget). For a 'far from civilization' constraint, one small-bbox settlements query \
+                 (e.g. {{\"place\":\"village\"}}) near the point is enough.\n\
+                 CRITICAL — the spot must be on solid ground you can ACTUALLY use for an overnight \
+                 stay: never return the centroid (`out center`) of a body of water or any other \
+                 polygon you cannot stand on. If the user stated a proximity constraint to some \
+                 feature, the spot is the nearby usable ground whose measured distance to that \
+                 feature's EDGE meets the limit, not a point inside the feature.\n\
+                 COMMIT within ~5 queries: after your few lookups, output a concrete spot with the \
+                 real coordinates you have. If you could not check every constraint in the budget, \
+                 still commit and note the unchecked one in ONE short line — do NOT keep querying.\n\
+                 - If [user-choice] below is empty (first run): propose the candidate spot(s) that \
+                 genuinely fit — present what actually works, not a fixed count (often one or two) \
+                 — each with real coordinates and the measured distances for each constraint you \
+                 COULD check. End by asking the user to confirm one. Do NOT finalize yet.\n\
+                 - If [user-choice] below confirms a site: your earlier candidates are already in \
+                 [prior-stages]; just pick the one the user chose and restate its coordinates and \
+                 distances. Do NOT run new map queries (only re-query if they asked to MOVE it).\n\
+                 Only if you got NO usable coordinates at all, end with exactly: \
+                 'STAGE_INCOMPLETE: <short reason>'. Never write 'место уточняется' or fabricate \
+                 numbers instead of committing real coordinates."
             }
             Stage::Schedule => {
                 "Create a real calendar event for this trip via the connected Google/calendar \
@@ -550,6 +554,16 @@ fn drop_from(records: &mut Vec<StageRecord>, stage: &Stage) {
     });
 }
 
+/// Drop only the stages strictly AFTER `stage`, keeping `stage`'s own record —
+/// used when finalizing a checkpoint so the worker can see the candidates it
+/// already proposed and just commit to the user's pick instead of re-querying.
+fn drop_after(records: &mut Vec<StageRecord>, stage: &Stage) {
+    records.retain(|r| match Stage::parse(&r.stage) {
+        Some(s) => s.order() <= stage.order(),
+        None => false,
+    });
+}
+
 // ---------------------------------------------------------------------------
 // Orchestrated turn
 // ---------------------------------------------------------------------------
@@ -562,7 +576,7 @@ const MAX_ORCH_STEPS: usize = 12;
 /// well under this; we also retry once and never dead-end on a hit, so a high
 /// value just prevents a hang — it does not make the user wait this long in the
 /// common case.
-const STAGE_TIMEOUT: Duration = Duration::from_secs(300);
+const STAGE_TIMEOUT: Duration = Duration::from_secs(200);
 
 /// Advance the flow by one user turn. The caller guarantees `session.trip` is
 /// `Some`. The ORCHESTRATOR agent decides every transition; the user can step
@@ -765,8 +779,15 @@ pub async fn advance(
                         let _ = p.send(label.to_string());
                     }
                 }
-                // Back-step / re-run invalidates this stage and everything after.
-                drop_from(&mut records, stage);
+                // On a checkpoint FINALIZE, keep this stage's own prior output
+                // (the candidates the user is choosing among) as context, and
+                // drop only the now-stale LATER stages. Otherwise (fresh run or
+                // back-step) invalidate this stage and everything after.
+                if is_final {
+                    drop_after(&mut records, stage);
+                } else {
+                    drop_from(&mut records, stage);
+                }
                 // Pass the user's choice only when finalizing a checkpoint, so the
                 // stage commits to the option they picked; otherwise it proposes.
                 let choice = if is_final { user_text } else { "" };
@@ -874,12 +895,11 @@ async fn run_exec_stage(
         stage.name(),
         stage.instruction(),
     );
-    // One automatic retry: external map/weather tools (Overpass especially)
-    // return transient 429/504s, so a single retry usually succeeds where the
-    // first attempt timed out or errored. Failures are NOT surfaced to the user
-    // as a dead-end here — the caller carries a best-effort result forward.
+    // One automatic retry ONLY for a transient LLM/HTTP error. Do NOT retry a
+    // timeout or a "too many tool calls" — those just repeat the slow grind and
+    // double the user's wait; the caller handles them as best-effort/incomplete.
     let mut last = run_stage_once(llm, state, &system, &query).await;
-    if is_stage_failure(&last) {
+    if last.starts_with("(stage failed:") {
         last = run_stage_once(llm, state, &system, &query).await;
     }
     last
@@ -1012,9 +1032,9 @@ keep that URL VERBATIM in the final message as a clickable link with a one-line 
 access' instruction — never drop it and never turn it into a vague 'нужен токен/доступ'. \
 If a stage output shows it stalled or failed (e.g. '(stage timed out)', '(stage failed: …)'), \
 do NOT fabricate that section's data: present the rest of the plan normally and add one short \
-honest line that that specific part (e.g. the campsite distances) is approximate / still to be \
-verified — without scolding the user and without asking them to choose a river or narrow the \
-area. Keep it tight.";
+honest line that that specific part (e.g. the overnight-spot distances) is approximate / still to \
+be verified — without scolding the user and without asking them to choose a specific place or \
+narrow the area. Keep it tight.";
 
 /// Build a stage's system prompt: the layered base prompt + a stage role line.
 fn stage_system(session: &ChatSession, role: &str) -> String {
@@ -1031,13 +1051,13 @@ fn stage_system(session: &ChatSession, role: &str) -> String {
              and include \"Россия\" in free-text place queries.\n\
              OSM QUERY RULES (follow EXACTLY — violating them causes Overpass HTTP 400 and wastes \
              minutes):\n\
-             1. To locate a NAMED feature (a river, town), call geocode_address FIRST to get \
-             coordinates. NEVER put a name in osm_query_bbox tags — `{{\"name\":\"Медведица\"}}` \
-             produces an unquoted-Cyrillic selector that Overpass rejects with 400. After \
-             geocoding, query a SMALL bbox around those coordinates with a generic tag like \
-             {{\"waterway\":\"river\"}}, no name filter.\n\
+             1. To locate a NAMED feature (a place, road, or natural feature), call \
+             geocode_address FIRST to get coordinates. NEVER put a name in osm_query_bbox tags — \
+             `{{\"name\":\"Медведица\"}}` produces an unquoted-Cyrillic selector that Overpass \
+             rejects with 400. After geocoding, query a SMALL bbox around those coordinates with a \
+             generic tag (e.g. {{\"tourism\":\"camp_site\"}}), no name filter.\n\
              2. osm_query_bbox `tags` must be a JSON object whose VALUES are single strings: \
-             {{\"waterway\":\"river\"}} or {{\"tourism\":\"camp_site\"}}. NEVER an array value \
+             {{\"tourism\":\"camp_site\"}} or {{\"place\":\"village\"}}. NEVER an array value \
              (`{{\"place\":[\"village\",\"hamlet\"]}}` is INVALID → 400) and never a plain string \
              or array at top level. Need several values? Run separate small queries or query just \
              the key.\n\
@@ -1383,5 +1403,23 @@ mod tests {
         drop_from(&mut r, &Stage::Routing);
         let names: Vec<&str> = r.iter().map(|x| x.stage.as_str()).collect();
         assert_eq!(names, vec!["Planning"]);
+    }
+
+    #[test]
+    fn drop_after_keeps_finalizing_stage_drops_only_later() {
+        let mut r = Vec::new();
+        for s in [
+            Stage::Planning,
+            Stage::Routing,
+            Stage::Camp,
+            Stage::Schedule,
+            Stage::Doc,
+        ] {
+            set_record(&mut r, &s, "x".into());
+        }
+        // finalizing Camp keeps its own candidates, drops only Schedule/Doc
+        drop_after(&mut r, &Stage::Camp);
+        let names: Vec<&str> = r.iter().map(|x| x.stage.as_str()).collect();
+        assert_eq!(names, vec!["Planning", "Routing", "Camp"]);
     }
 }
