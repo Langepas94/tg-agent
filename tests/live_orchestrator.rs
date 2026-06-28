@@ -185,7 +185,10 @@ async fn trip_swarm_clarifies_then_plans() {
     .expect("turn1");
     println!("\n=== CLARIFY ===\n{}\n", r1.answer);
     assert!(session.trip.is_some(), "flow did not start");
-    assert!(r1.trace.is_empty(), "should still be clarifying, no pipeline yet");
+    assert!(
+        r1.trace.is_empty(),
+        "should still be clarifying, no pipeline yet"
+    );
 
     // 2. Provide the missing facts and force planning; the swarm runs and
     //    produces a trace plus a final plan.
@@ -201,4 +204,46 @@ async fn trip_swarm_clarifies_then_plans() {
     println!("\n=== FINAL ===\n{}\n", r2.answer);
     assert!(!r2.trace.is_empty(), "pipeline did not run");
     assert!(session.trip.is_none(), "flow should be cleared when done");
+}
+
+#[tokio::test]
+#[ignore]
+async fn trip_swarm_supports_step_back() {
+    // The orchestrator agent must route a "change an earlier decision" message
+    // back to that stage and recompute downstream — not just append.
+    let (llm, state) = setup().await;
+    let mut session = ChatSession::new(303);
+
+    // Seed an already-planned trip mid-flow (Planning..Doc all have output),
+    // suspended at Doc, so the next message exercises a real back-step.
+    let mut trip = agent::flow::TripFlowState::start();
+    trip.brief.fields.insert("area".into(), "Москва".into());
+    trip.brief
+        .fields
+        .insert("date_window".into(), "ближайшие 2 недели".into());
+    for stage in ["Planning", "Routing", "Camp", "Schedule", "Doc"] {
+        trip.records.push(agent::flow::StageRecord {
+            stage: stage.into(),
+            output: format!("{stage} v1 (initial)"),
+        });
+    }
+    trip.stage = agent::flow::Stage::Doc;
+    session.trip = Some(trip);
+
+    // User steps back: change the date. Orchestrator should return to Planning,
+    // drop Routing..Doc, and recompute the whole downstream.
+    let r = agent::run_turn(
+        &llm,
+        &state,
+        &mut session,
+        "Давай перенесём на другой день, поищи день потеплее.",
+    )
+    .await
+    .expect("turn");
+    println!("\n=== STEP-BACK TRACE ===\n{}", r.trace.join("\n"));
+    println!("\n=== FINAL ===\n{}\n", r.answer);
+    assert!(
+        r.trace.iter().any(|l| l.contains("Planning")),
+        "step-back did not re-run Planning"
+    );
 }
