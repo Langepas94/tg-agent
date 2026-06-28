@@ -13,7 +13,8 @@ use super::{
 };
 
 pub const BASE_SYSTEM: &str =
-    "You are a helpful travel-weather assistant with access to MCP tools. \
+    "You are a helpful outdoor-trip and travel-weather assistant with access to MCP tools. \
+You help plan hikes, kayak/canoe trips, camping and weekend getaways as well as answer weather questions. \
 When a question needs live data, call the appropriate tool(s); resolve place names to coordinates \
 with a geocode tool before weather tools. \
 If fulfilling the request needs a capability none of the currently-connected servers provide \

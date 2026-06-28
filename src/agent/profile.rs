@@ -9,8 +9,8 @@ use serde::{Deserialize, Serialize};
 pub const PROFILE_EXTRACTION_PROMPT: &str = "You maintain a compact user profile for a travel-weather assistant. \
 From the latest user message, extract any STABLE personal trait that would shape how the user \
 asks about weather or plans travel. The key set is OPEN (snake_case) — use the common keys when \
-they fit (home_city, preferred_units, comfort_temp_min, comfort_temp_max, dislikes_rain, language, \
-age, occupation, household), and for hobbies/activities/sports use the `interests` key with a \
+they fit (home_city, google_email, email, preferred_units, comfort_temp_min, comfort_temp_max, \
+dislikes_rain, language, age, occupation, household), and for hobbies/activities/sports use the `interests` key with a \
 comma-separated list (e.g. \"kayaking, basketball\"), MERGING with any you already know. \
 Capture only durable facts, never one-off trip details and never secrets. \
 Return ONLY JSON {\"fields\":[{\"key\":\"snake_case\",\"value\":\"short\"}]}; use {\"fields\":[]} if none.";
@@ -18,6 +18,8 @@ Return ONLY JSON {\"fields\":[{\"key\":\"snake_case\",\"value\":\"short\"}]}; us
 /// Known profile keys we surface in /profile help (free keys are allowed too).
 pub const KNOWN_KEYS: &[&str] = &[
     "home_city",
+    "google_email",
+    "email",
     "preferred_units",
     "comfort_temp_min",
     "comfort_temp_max",

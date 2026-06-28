@@ -169,23 +169,81 @@ async fn agent_cancels_subscription_on_request() {
 
 #[tokio::test]
 #[ignore]
-async fn travel_flow_pipeline_runs() {
+async fn trip_swarm_clarifies_then_plans() {
     let (llm, state) = setup().await;
-    let session = ChatSession::new(202);
+    let mut session = ChatSession::new(202);
 
-    let report = agent::flow::run(&llm, &state, &session, "Москва и Сочи на эти выходные")
-        .await
-        .expect("flow");
-
-    println!("\n=== PLAN === {:?}", report.plan);
-    for r in &report.records {
-        println!("[{:?}] {}", r.stage, r.output);
-    }
-    println!("\n=== FINAL ===\n{}\n", report.answer);
-
-    assert!(!report.plan.cities.is_empty(), "planner found no cities");
+    // 1. A trip request auto-starts the flow and should CLARIFY first (ask
+    //    questions), not dump a finished plan.
+    let r1 = agent::run_turn(
+        &llm,
+        &state,
+        &mut session,
+        "Хочу в поход на байдарках с одной ночёвкой",
+    )
+    .await
+    .expect("turn1");
+    println!("\n=== CLARIFY ===\n{}\n", r1.answer);
+    assert!(session.trip.is_some(), "flow did not start");
     assert!(
-        report.answer.chars().any(|c| c.is_ascii_digit()),
-        "no weather numbers"
+        r1.trace.is_empty(),
+        "should still be clarifying, no pipeline yet"
+    );
+
+    // 2. Provide the missing facts and force planning; the swarm runs and
+    //    produces a trace plus a final plan.
+    let r2 = agent::run_turn(
+        &llm,
+        &state,
+        &mut session,
+        "Старт из Москвы, в ближайшие 2 недели. Команда ленивая, любит шашлык. Поехали, планируй.",
+    )
+    .await
+    .expect("turn2");
+    println!("\n=== TRACE ===\n{}", r2.trace.join("\n"));
+    println!("\n=== FINAL ===\n{}\n", r2.answer);
+    assert!(!r2.trace.is_empty(), "pipeline did not run");
+    assert!(session.trip.is_none(), "flow should be cleared when done");
+}
+
+#[tokio::test]
+#[ignore]
+async fn trip_swarm_supports_step_back() {
+    // The orchestrator agent must route a "change an earlier decision" message
+    // back to that stage and recompute downstream — not just append.
+    let (llm, state) = setup().await;
+    let mut session = ChatSession::new(303);
+
+    // Seed an already-planned trip mid-flow (Planning..Doc all have output),
+    // suspended at Doc, so the next message exercises a real back-step.
+    let mut trip = agent::flow::TripFlowState::start();
+    trip.brief.fields.insert("area".into(), "Москва".into());
+    trip.brief
+        .fields
+        .insert("date_window".into(), "ближайшие 2 недели".into());
+    for stage in ["Planning", "Routing", "Camp", "Schedule", "Doc"] {
+        trip.records.push(agent::flow::StageRecord {
+            stage: stage.into(),
+            output: format!("{stage} v1 (initial)"),
+        });
+    }
+    trip.stage = agent::flow::Stage::Doc;
+    session.trip = Some(trip);
+
+    // User steps back: change the date. Orchestrator should return to Planning,
+    // drop Routing..Doc, and recompute the whole downstream.
+    let r = agent::run_turn(
+        &llm,
+        &state,
+        &mut session,
+        "Давай перенесём на другой день, поищи день потеплее.",
+    )
+    .await
+    .expect("turn");
+    println!("\n=== STEP-BACK TRACE ===\n{}", r.trace.join("\n"));
+    println!("\n=== FINAL ===\n{}\n", r.answer);
+    assert!(
+        r.trace.iter().any(|l| l.contains("Planning")),
+        "step-back did not re-run Planning"
     );
 }
