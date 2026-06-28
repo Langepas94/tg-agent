@@ -266,11 +266,11 @@ impl Stage {
     /// multi-minute) stage runs so the chat is never silent. RU — primary user.
     fn progress_label(&self) -> &'static str {
         match self {
-            Stage::Planning => "🛶 Подбираю день и место по погоде…",
-            Stage::Routing => "🗺 Прорабатываю маршрут по карте (заезд, остановки, выход)… это может занять пару минут",
-            Stage::Camp => "🏕 Ищу и проверяю стоянку у воды… пару минут",
+            Stage::Planning => "📅 Подбираю даты и место по погоде…",
+            Stage::Routing => "🗺 Прорабатываю маршрут по карте… это может занять пару минут",
+            Stage::Camp => "🏕 Подбираю место для ночёвки… пару минут",
             Stage::Schedule => "📅 Создаю событие в календаре…",
-            Stage::Doc => "📄 Собираю Google-документ с планом…",
+            Stage::Doc => "📄 Готовлю документ с планом…",
             Stage::Clarify | Stage::Done => "",
         }
     }
@@ -317,56 +317,62 @@ impl Stage {
                  candidate options that SPREAD ACROSS THE TRADE-OFF, not just the single best \
                  weather. Deliberately include at least one CLOSER/nearer area even if its weather \
                  is slightly worse, and one with the best weather even if farther. Each option = a \
-                 specific day + a specific waterway/area + weather numbers (rain, wind, temp) + the \
-                 approx distance/drive time from the user's start. Make the trade-off explicit \
+                 specific day + a specific area/route suited to THE USER'S ACTIVITY (read it from \
+                 the brief — kayak/raft → a river/lake; cycling → a road/trail loop; hiking → a \
+                 trail area; etc. — do NOT assume water) + weather numbers (rain, wind, temp) + the \
+                 approx distance/travel time from the user's start. Make the trade-off explicit \
                  (e.g. 'на 1-2°C прохладнее, зато в 2 раза ближе'). NEVER collapse to one option or \
                  silently pick the farthest 'best weather' spot. End by asking the user to pick. Do \
                  NOT commit yet.\n\
                  - If [user-choice] below names the option the user picked (or asks to adjust): \
-                 COMMIT to a single final choice — the chosen DATE and the specific waterway/area — \
+                 COMMIT to a single final choice — the chosen DATE and the specific area/route — \
                  with the confirming weather numbers and the distance. Output just that final pick."
             }
             Stage::Routing => {
-                "Design the actual on-water route. You MUST call the maps/OSM tools to get REAL \
-                 geographic data — geocode the area, find the waterway, and resolve concrete \
-                 put-in and take-out points. NEVER invent or approximate coordinates: every \
-                 coordinate you state must come from a tool result. Give the put-in and take-out \
-                 with real coordinates, 2-4 named intermediate stops (real places from the map) \
-                 with distances/times, and a relaxed pace matching an unprepared, BBQ-focused \
-                 party. Keep total distance modest.\n\
+                "Design the actual route FOR THE USER'S ACTIVITY (read it from the brief; do NOT \
+                 assume a water trip): a kayak/raft trip follows a waterway with a put-in and \
+                 take-out; a cycling/hiking trip follows roads/trails with a start and end point. \
+                 You MUST call the maps/OSM tools to get REAL geographic data — geocode the area, \
+                 find the relevant way (waterway / road / trail), and resolve concrete start and \
+                 end points. NEVER invent or approximate coordinates: every coordinate you state \
+                 must come from a tool result. Give the start and end with real coordinates, 2-4 \
+                 named intermediate stops (real places from the map) with distances/times, and a \
+                 pace matching the party's stated level and priorities from the brief. Keep total \
+                 distance sensible for that level.\n\
                  HONESTY GATE: if the map service keeps failing (Overpass 429/504) and you CANNOT \
-                 resolve real put-in/take-out coordinates and at least one real intermediate stop, \
-                 do NOT write vague prose like 'маршрут уточняется' or 'точки не определены'. \
-                 Instead end your reply with a line exactly: 'STAGE_INCOMPLETE: <short reason>'. \
-                 Never present a route as ready without real coordinates."
+                 resolve real start/end coordinates and at least one real intermediate stop, do \
+                 NOT write vague prose like 'маршрут уточняется' or 'точки не определены'. Instead \
+                 end your reply with a line exactly: 'STAGE_INCOMPLETE: <short reason>'. Never \
+                 present a route as ready without real coordinates."
             }
             Stage::Camp => {
                 "You are a CHECKPOINT stage: you propose the overnight site and let the user \
-                 confirm, you do NOT silently decide. You MUST use the maps/OSM tools to VERIFY \
-                 constraints with real data: query nearby settlements/turbazy/roads to confirm the \
-                 minimum distance from civilization, and confirm the site is within the required \
-                 distance to water. NEVER guess coordinates — derive them from tool results.\n\
-                 CRITICAL — the campsite MUST be on DRY LAND on the SHORE, never on the water. Do \
-                 NOT output the centroid of a lake/river/water polygon (an `out center` of a \
-                 natural=water / waterway feature is the MIDDLE OF THE WATER — you cannot pitch a \
-                 tent there). A point near water means dry BANK ground whose distance to the water \
-                 EDGE is within the limit, not a point sitting inside the water. Prefer real \
-                 on-land features for the pitch — a beach (natural=beach), a clearing/meadow \
-                 (landuse=meadow, natural=grassland), or an existing camp_site — adjacent to the \
-                 shoreline; if you only have the water feature, place the camp on its bank (offset \
-                 onto land) and say so. Sanity-check every campsite coordinate is on land before \
-                 proposing it.\n\
-                 - If [user-choice] below is empty (first run): propose 1-2 candidate campsites on \
-                 the route, each a DRY-LAND shoreline spot with real coordinates, the measured \
-                 distance to the water edge, and the measured distance to the nearest \
-                 village/turbaza/road. End by asking the user to confirm one (or ask for another). \
-                 Do NOT finalize yet.\n\
+                 confirm, you do NOT silently decide. Honour the CONSTRAINTS THE USER ACTUALLY \
+                 STATED in the brief — only those. Common ones: a minimum distance from \
+                 civilization (settlements/turbazy/roads), and, IF the user asked for it or it is a \
+                 water trip, a maximum distance to water. Do NOT invent a water requirement for a \
+                 cycling/hiking trip that never mentioned it. You MUST use the maps/OSM tools to \
+                 VERIFY each stated constraint with real data. NEVER guess coordinates — derive \
+                 them from tool results.\n\
+                 CRITICAL — the campsite MUST be on DRY, PITCHABLE LAND. Do NOT output the centroid \
+                 of a lake/river/water polygon (an `out center` of a natural=water / waterway \
+                 feature is the MIDDLE OF THE WATER — you cannot pitch a tent there). If a \
+                 near-water constraint applies, the site is dry BANK ground whose distance to the \
+                 water EDGE meets the limit, not a point inside the water. Prefer real on-land \
+                 features — a clearing/meadow (landuse=meadow, natural=grassland), a beach \
+                 (natural=beach), or an existing camp_site. Sanity-check every coordinate is on \
+                 land before proposing it.\n\
+                 - If [user-choice] below is empty (first run): propose 1-2 candidate sites on the \
+                 route, each a dry-land spot with real coordinates and the measured distances for \
+                 EACH stated constraint (distance to the nearest village/turbaza/road; distance to \
+                 the water edge only if a water constraint applies). End by asking the user to \
+                 confirm one (or ask for another). Do NOT finalize yet.\n\
                  - If [user-choice] below confirms a site (or asks to move it): COMMIT to that one \
                  site and output its final verified coordinates and distances.\n\
-                 HONESTY GATE: if the map service keeps failing and you CANNOT produce a real \
-                 campsite with verified coordinates and the measured distances (to water and to the \
-                 nearest village/turbaza), do NOT write 'место уточняется' or fabricate numbers. \
-                 Instead end your reply with a line exactly: 'STAGE_INCOMPLETE: <short reason>'."
+                 HONESTY GATE: if the map service keeps failing and you CANNOT produce a real site \
+                 with verified coordinates and the measured distances for the stated constraints, \
+                 do NOT write 'место уточняется' or fabricate numbers. Instead end your reply with \
+                 a line exactly: 'STAGE_INCOMPLETE: <short reason>'."
             }
             Stage::Schedule => {
                 "Create a real calendar event for this trip via the connected Google/calendar \
@@ -380,7 +386,8 @@ impl Stage {
             }
             Stage::Doc => {
                 "Create a real shareable Google Doc with the full plan (date, route with real \
-                 coordinates/stops, campsite with verified distances, gear/BBQ notes) via the \
+                 coordinates/stops, overnight site with verified distances, gear notes suited to \
+                 the activity from the brief) via the \
                  connected Google/docs tools, then return the actual share link from the tool \
                  result. NEVER ask the user for a token. If a tool reports the user is NOT \
                  authenticated or returns an authorization URL (start_google_auth / auth flow), \
@@ -987,7 +994,7 @@ const COMPOSE_PROMPT: &str = "You assemble the FINAL trip plan a user will share
 from the stage outputs of a planning swarm. Write it in the user's language as a clean, \
 phone-friendly PLAIN-TEXT message (no Markdown tables, no `|`, no `**`). Use short vertical \
 blocks with emoji headings: chosen day + weather, the route with concrete stops, the overnight \
-campsite (with distances), gear/BBQ notes, and — if created — the calendar event and the \
+site (with distances), gear notes suited to the activity, and — if created — the calendar event and the \
 shareable doc link. Be concrete; do not invent a doc link or coordinates that the stages did \
 not produce. If a stage returned an AUTHORIZATION URL (Google sign-in / start_google_auth), \
 keep that URL VERBATIM in the final message as a clickable link with a one-line 'open and approve \
