@@ -78,10 +78,12 @@ fn reset_keeps_longterm_only() {
     m.upsert_fact("home_city", "Volgograd", MemoryLayer::LongTerm);
     m.upsert_fact("goal", "trip", MemoryLayer::Working);
     m.push_message("user", "hi");
+    m.append_summary("old short context");
     m.reset_for_new_session();
     assert_eq!(m.facts.len(), 1);
     assert_eq!(m.facts[0].key, "home_city");
     assert!(m.recent.is_empty());
+    assert!(m.summary.is_empty());
 }
 
 #[test]

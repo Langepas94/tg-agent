@@ -146,12 +146,25 @@ impl Llm {
         max_steps: usize,
     ) -> Result<String> {
         let (mut tool_defs, mut tool_map) = collect_tools(state).await;
+        let can_manage_mcp = match chat_id {
+            Some(cid) => state.is_root(cid).await,
+            None => false,
+        };
         // Tools that accept a `session_id` param — the bot forces it to the
         // chat id so jobs are chat-isolated AND server pushes route back here.
         let mut session_tools = tools_with_session_param(&tool_defs);
-        append_meta_defs(&mut tool_defs, chat_id);
+        append_meta_defs(&mut tool_defs, chat_id, can_manage_mcp);
 
         let mut messages = vec![json!({ "role": "system", "content": system })];
+        if chat_id.is_some() && !can_manage_mcp {
+            messages.push(json!({
+                "role": "system",
+                "content": "Access policy: this chat is a regular user, not the bot owner. \
+                    Do not connect, disconnect, configure, inspect, or expose MCP servers/tools. \
+                    You may use already-available tools to answer normal user requests, but if \
+                    a request requires changing MCP configuration, say that only the bot owner can do it."
+            }));
+        }
         // Prior turns (short-term window) give multi-turn continuity.
         for (role, text) in history {
             let role = if *role == "assistant" {
@@ -191,11 +204,19 @@ impl Llm {
                         }
 
                         let content = if name == "mcp_connect" {
-                            let out = handle_mcp_connect(state, args_raw).await;
+                            let out = if can_manage_mcp {
+                                handle_mcp_connect(state, args_raw).await
+                            } else {
+                                "error: only the bot owner can connect MCP servers".into()
+                            };
                             tools_dirty |= !out.starts_with("error");
                             out
                         } else if name == "mcp_disconnect" {
-                            let out = handle_mcp_disconnect(state, args_raw).await;
+                            let out = if can_manage_mcp {
+                                handle_mcp_disconnect(state, args_raw).await
+                            } else {
+                                "error: only the bot owner can disconnect MCP servers".into()
+                            };
                             tools_dirty |= !out.starts_with("error");
                             out
                         } else if name == "schedule_summary" {
@@ -241,7 +262,7 @@ impl Llm {
                         tool_defs = d;
                         tool_map = m;
                         session_tools = tools_with_session_param(&tool_defs);
-                        append_meta_defs(&mut tool_defs, chat_id);
+                        append_meta_defs(&mut tool_defs, chat_id, can_manage_mcp);
                     }
                 }
                 _ => {
@@ -453,9 +474,11 @@ fn cancel_summary_def() -> Value {
 
 /// Append the always-available meta-tools (connect/disconnect MCP servers) and,
 /// when running inside a chat, the recurring-summary meta-tools.
-fn append_meta_defs(tool_defs: &mut Vec<Value>, chat_id: Option<i64>) {
-    tool_defs.push(mcp_connect_def());
-    tool_defs.push(mcp_disconnect_def());
+fn append_meta_defs(tool_defs: &mut Vec<Value>, chat_id: Option<i64>, can_manage_mcp: bool) {
+    if can_manage_mcp {
+        tool_defs.push(mcp_connect_def());
+        tool_defs.push(mcp_disconnect_def());
+    }
     if chat_id.is_some() {
         tool_defs.push(schedule_summary_def());
         tool_defs.push(cancel_summary_def());
@@ -882,24 +905,33 @@ mod tests {
     }
 
     #[test]
-    fn meta_defs_always_include_connect_disconnect() {
+    fn meta_defs_without_chat_have_no_meta_tools() {
         let mut defs = Vec::new();
-        append_meta_defs(&mut defs, None);
+        append_meta_defs(&mut defs, None, false);
         let names = tool_names(&defs);
-        assert!(names.contains(&"mcp_connect".to_string()));
-        assert!(names.contains(&"mcp_disconnect".to_string()));
-        // outside a chat, no recurring-summary meta-tools
+        assert!(!names.contains(&"mcp_connect".to_string()));
+        assert!(!names.contains(&"mcp_disconnect".to_string()));
         assert!(!names.contains(&"schedule_summary".to_string()));
     }
 
     #[test]
-    fn meta_defs_add_summary_tools_in_chat() {
+    fn meta_defs_regular_chat_gets_summary_only() {
         let mut defs = Vec::new();
-        append_meta_defs(&mut defs, Some(42));
+        append_meta_defs(&mut defs, Some(42), false);
         let names = tool_names(&defs);
-        assert!(names.contains(&"mcp_connect".to_string()));
+        assert!(!names.contains(&"mcp_connect".to_string()));
         assert!(names.contains(&"schedule_summary".to_string()));
         assert!(names.contains(&"cancel_summary".to_string()));
+    }
+
+    #[test]
+    fn meta_defs_root_chat_gets_mcp_management() {
+        let mut defs = Vec::new();
+        append_meta_defs(&mut defs, Some(42), true);
+        let names = tool_names(&defs);
+        assert!(names.contains(&"mcp_connect".to_string()));
+        assert!(names.contains(&"mcp_disconnect".to_string()));
+        assert!(names.contains(&"schedule_summary".to_string()));
     }
 
     #[test]

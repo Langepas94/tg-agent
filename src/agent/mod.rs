@@ -243,12 +243,17 @@ async fn maybe_compact(llm: &Llm, session: &mut ChatSession) {
     //    history we send each turn stays small (token cost) without data loss.
     compact_overflow(llm, session, memory::RECENT_WINDOW).await;
 
-    // 2. Budget-driven shrink — matters for small/overridden context windows.
-    let threshold = context_budget::compact_threshold(llm.model());
+    // 2. Budget-driven shrink. Only kicks in at the 80% trigger, but then
+    //    compacts all the way down to the lower TARGET (~55%), so we don't
+    //    re-summarize on every following turn while hovering near the limit.
+    //    Only chat history (`recent`) is summarized here — profile and sticky
+    //    facts live outside this budget and are never touched.
+    if estimate_session_tokens(session) <= context_budget::compact_threshold(llm.model()) {
+        return;
+    }
+    let target = context_budget::compact_target(llm.model());
     let mut guard = 0;
-    while estimate_session_tokens(session) > threshold
-        && session.memory.recent.len() > 2
-        && guard < 8
+    while estimate_session_tokens(session) > target && session.memory.recent.len() > 2 && guard < 8
     {
         let keep = (session.memory.recent.len() / 2).max(2);
         compact_overflow(llm, session, keep).await;

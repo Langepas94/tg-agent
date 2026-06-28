@@ -8,6 +8,13 @@
 /// Fraction of the window at which we begin summarizing older history.
 pub const COMPACT_AT: f32 = 0.80;
 
+/// Once compaction starts (at [`COMPACT_AT`]), shrink the session well below the
+/// trigger — down to this fraction — so we don't re-summarize on every following
+/// turn while hovering at the limit. Profile and sticky facts are never part of
+/// this budget (they live outside chat history), so compacting to here never
+/// touches them.
+pub const COMPACT_TARGET: f32 = 0.55;
+
 /// Conservative chars-per-token. English ≈ 4, Cyrillic ≈ 2–3 (multi-byte,
 /// fewer chars per token); 3.0 keeps the estimate from *under*-counting.
 const CHARS_PER_TOKEN: f32 = 3.0;
@@ -68,6 +75,11 @@ pub fn context_window(model: &str) -> usize {
 /// The token budget at which compaction should kick in for a model.
 pub fn compact_threshold(model: &str) -> usize {
     (context_window(model) as f32 * COMPACT_AT) as usize
+}
+
+/// The lower token budget compaction shrinks down to once it has been triggered.
+pub fn compact_target(model: &str) -> usize {
+    (context_window(model) as f32 * COMPACT_TARGET) as usize
 }
 
 #[cfg(test)]

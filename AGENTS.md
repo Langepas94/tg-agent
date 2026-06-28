@@ -1,8 +1,8 @@
-# tg-agent — Claude context
+# tg-agent — Codex context
 
 Telegram-бот = **MCP-клиент + LLM-агент**. Юзер общается ТОЛЬКО через телеграм-чат.
 MCP-серверы подключаются **в чате** (команды или self-connect агентом), НЕ через
-внешние конфиги (Claude Desktop / VS Code `.mcp.json` — НЕ относятся к этому проекту).
+внешние конфиги (Codex Desktop / VS Code `.mcp.json` — НЕ относятся к этому проекту).
 
 ## Что это
 

@@ -10,7 +10,7 @@ use tokio::{sync::Mutex, task::JoinHandle};
 use crate::{
     llm::Llm,
     mcp_client::{ConnectParams, EventSender, McpClient},
-    persist::{self, Persisted, WatchSpec},
+    persist::{self, AccessState, Persisted, WatchSpec},
 };
 
 #[derive(Clone)]
@@ -33,6 +33,12 @@ pub struct BotState {
     pub bot: Arc<Mutex<Option<teloxide::Bot>>>,
     /// durable server-push subscriptions (re-applied on MCP reconnect)
     pub push_subs: Arc<Mutex<Vec<crate::persist::PushSub>>>,
+    /// Chats that passed the password gate.
+    pub authorized_chat_ids: Arc<Mutex<HashSet<i64>>>,
+    /// Owner/root chat id. The first successful authorization claims it.
+    pub root_chat_id: Arc<Mutex<Option<i64>>>,
+    /// Password used by /start <password>.
+    bot_password: Arc<String>,
 }
 
 impl BotState {
@@ -41,6 +47,14 @@ impl BotState {
     }
 
     pub fn with_llm(events: EventSender, llm: Option<Arc<Llm>>) -> Self {
+        Self::with_llm_and_password(events, llm, "202020".to_string())
+    }
+
+    pub fn with_llm_and_password(
+        events: EventSender,
+        llm: Option<Arc<Llm>>,
+        bot_password: String,
+    ) -> Self {
         Self {
             mcps: Arc::new(Mutex::new(HashMap::new())),
             subscribers: Arc::new(Mutex::new(HashSet::new())),
@@ -51,11 +65,93 @@ impl BotState {
             llm,
             bot: Arc::new(Mutex::new(None)),
             push_subs: Arc::new(Mutex::new(Vec::new())),
+            authorized_chat_ids: Arc::new(Mutex::new(HashSet::new())),
+            root_chat_id: Arc::new(Mutex::new(None)),
+            bot_password: Arc::new(bot_password),
         }
     }
 
     pub async fn set_bot(&self, bot: teloxide::Bot) {
         *self.bot.lock().await = Some(bot);
+    }
+
+    pub async fn restore_access(&self, access: AccessState) {
+        *self.root_chat_id.lock().await = access.root_chat_id;
+        let mut authorized = self.authorized_chat_ids.lock().await;
+        authorized.clear();
+        authorized.extend(access.authorized_chat_ids);
+    }
+
+    pub async fn access_snapshot(&self) -> AccessState {
+        let mut authorized_chat_ids: Vec<i64> = self
+            .authorized_chat_ids
+            .lock()
+            .await
+            .iter()
+            .copied()
+            .collect();
+        authorized_chat_ids.sort();
+        AccessState {
+            root_chat_id: *self.root_chat_id.lock().await,
+            authorized_chat_ids,
+        }
+    }
+
+    pub async fn is_authorized(&self, chat_id: i64) -> bool {
+        self.authorized_chat_ids.lock().await.contains(&chat_id)
+    }
+
+    pub async fn is_root(&self, chat_id: i64) -> bool {
+        *self.root_chat_id.lock().await == Some(chat_id)
+    }
+
+    pub async fn grant_access(&self, chat_id: i64) {
+        let changed = self.authorized_chat_ids.lock().await.insert(chat_id);
+        if changed {
+            self.persist().await;
+        }
+    }
+
+    pub async fn revoke_access(&self, chat_id: i64) -> bool {
+        if self.is_root(chat_id).await {
+            return false;
+        }
+        let changed = self.authorized_chat_ids.lock().await.remove(&chat_id);
+        if changed {
+            self.persist().await;
+        }
+        changed
+    }
+
+    pub async fn set_root(&self, chat_id: i64) {
+        {
+            let mut root = self.root_chat_id.lock().await;
+            *root = Some(chat_id);
+        }
+        self.authorized_chat_ids.lock().await.insert(chat_id);
+        self.persist().await;
+    }
+
+    /// Try to unlock this chat. First successful chat becomes root/owner.
+    pub async fn authorize(&self, chat_id: i64, password: &str) -> bool {
+        if password.trim() != self.bot_password.as_str() {
+            return false;
+        }
+        let mut changed = {
+            let mut authorized = self.authorized_chat_ids.lock().await;
+            authorized.insert(chat_id)
+        };
+        {
+            let mut root = self.root_chat_id.lock().await;
+            if root.is_none() {
+                *root = Some(chat_id);
+                changed = true;
+            }
+        }
+        if changed {
+            self.persist().await;
+        }
+        true
     }
 
     /// Spawn the periodic task for a watch and register its handle.
@@ -359,6 +455,29 @@ impl BotState {
         n
     }
 
+    pub async fn remove_watch_for_chat(&self, chat_id: i64, id: u64) -> bool {
+        let belongs_to_chat = self
+            .watches
+            .lock()
+            .await
+            .iter()
+            .any(|w| w.id == id && w.chat_id == chat_id);
+        if !belongs_to_chat {
+            return false;
+        }
+        self.remove_watch(id).await
+    }
+
+    pub async fn list_watches_for_chat(&self, chat_id: i64) -> Vec<WatchSpec> {
+        self.watches
+            .lock()
+            .await
+            .iter()
+            .filter(|w| w.chat_id == chat_id)
+            .cloned()
+            .collect()
+    }
+
     /// Remove a watch and tear down its linked MCP-side resource (e.g. cancel
     /// the collection cron job) so nothing is orphaned.
     pub async fn remove_watch(&self, id: u64) -> bool {
@@ -411,6 +530,7 @@ impl BotState {
             watches,
             next_watch_id: self.next_watch_id.load(Ordering::SeqCst),
             push_subs,
+            access: self.access_snapshot().await,
         }
     }
 
@@ -545,6 +665,22 @@ mod tests {
         assert_eq!(s.remove_push_subs(6, Some("other")).await, 0);
         assert_eq!(s.remove_push_subs(6, Some("weather")).await, 1);
         assert!(s.push_subs.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn authorization_first_user_becomes_root() {
+        let s = state();
+        assert!(!s.is_authorized(1).await);
+        assert!(!s.authorize(1, "wrong").await);
+        assert!(!s.is_authorized(1).await);
+
+        assert!(s.authorize(1, "202020").await);
+        assert!(s.is_authorized(1).await);
+        assert!(s.is_root(1).await);
+
+        assert!(s.authorize(2, "202020").await);
+        assert!(s.is_authorized(2).await);
+        assert!(!s.is_root(2).await);
     }
 
     #[tokio::test]

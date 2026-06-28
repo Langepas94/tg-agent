@@ -3,6 +3,12 @@ use anyhow::{Context, Result};
 #[derive(Debug, Clone)]
 pub struct Config {
     pub telegram_token: String,
+    /// Password required to unlock the bot for a Telegram chat/user.
+    pub bot_password: String,
+    /// Web admin UI bind address, e.g. 127.0.0.1:8080 behind nginx.
+    pub admin_addr: Option<String>,
+    pub admin_username: String,
+    pub admin_password: String,
     /// How often to send digest, in minutes
     pub digest_interval_minutes: u64,
     /// LLM config; None means the agent answers only via explicit commands.
@@ -25,6 +31,16 @@ impl Config {
             .unwrap_or_else(|_| "360".into()) // 6 hours default
             .parse::<u64>()
             .unwrap_or(360);
+        let bot_password = std::env::var("BOT_PASSWORD").unwrap_or_else(|_| "202020".into());
+        let admin_addr = std::env::var("ADMIN_ADDR")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| Some("127.0.0.1:8080".into()));
+        let admin_username = std::env::var("ADMIN_USERNAME").unwrap_or_else(|_| "admin".into());
+        let admin_password = std::env::var("ADMIN_PASSWORD")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| bot_password.clone());
 
         // Accept DEEPSEEK_API_KEY or generic LLM_API_KEY.
         let api_key = std::env::var("LLM_API_KEY")
@@ -41,6 +57,10 @@ impl Config {
 
         Ok(Config {
             telegram_token,
+            bot_password,
+            admin_addr,
+            admin_username,
+            admin_password,
             digest_interval_minutes,
             llm,
         })

@@ -50,6 +50,16 @@ fn default_period() -> String {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AccessState {
+    /// First successfully-authorized chat becomes the bot owner/root.
+    #[serde(default)]
+    pub root_chat_id: Option<i64>,
+    /// Chats that passed the bot password gate.
+    #[serde(default)]
+    pub authorized_chat_ids: Vec<i64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Persisted {
     #[serde(default)]
     pub servers: Vec<ConnectParams>,
@@ -61,6 +71,8 @@ pub struct Persisted {
     pub next_watch_id: u64,
     #[serde(default)]
     pub push_subs: Vec<PushSub>,
+    #[serde(default)]
+    pub access: AccessState,
 }
 
 /// State file location: `$STATE_FILE` or `./state.json`.
