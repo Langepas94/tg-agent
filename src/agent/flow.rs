@@ -342,33 +342,41 @@ impl Stage {
                  (include numbers) and name the specific waterway/area."
             }
             Stage::Routing => {
-                "Design the actual on-water route for the chosen day and place. Give a concrete \
-                 put-in and take-out, 2-4 named stops with rough distances/times, and a relaxed \
-                 pace that matches how prepared the party is and their priorities (e.g. more \
-                 rest/BBQ than paddling). Keep total distance modest for an unprepared group."
+                "Design the actual on-water route. You MUST call the maps/OSM tools to get REAL \
+                 geographic data — geocode the area, find the waterway, and resolve concrete \
+                 put-in and take-out points. NEVER invent or approximate coordinates: every \
+                 coordinate you state must come from a tool result. Give the put-in and take-out \
+                 with real coordinates, 2-4 named intermediate stops (real places from the map) \
+                 with distances/times, and a relaxed pace matching an unprepared, BBQ-focused \
+                 party. Keep total distance modest."
             }
             Stage::Camp => {
-                "Choose ONE overnight campsite on the route that satisfies the user's constraints \
-                 — notably any minimum distance from turbazy/villages/roads and maximum distance \
-                 to water. If a maps/geo tool is connected, use it to verify; otherwise propose a \
-                 plausible spot and clearly flag the distances must be verified on the map. State \
-                 approximate coordinates or a clear landmark, distance to water, and distance to \
-                 the nearest civilization."
+                "Choose ONE overnight campsite on the route. You MUST use the maps/OSM tools to \
+                 VERIFY the constraints with real data: query nearby settlements/turbazy/roads to \
+                 confirm the minimum distance from civilization, and confirm the campsite is within \
+                 the required distance to water. NEVER guess coordinates — derive them from tool \
+                 results. Output the campsite's real coordinates, the measured distance to water, \
+                 and the measured distance to the nearest village/turbaza/road. If a query fails, \
+                 say which one and what is still unverified — do not fabricate a passing number."
             }
             Stage::Schedule => {
-                "Create a calendar event for this trip (start = chosen date, overnight duration). \
-                 If a connected tool can create calendar events, use it and confirm the event \
-                 (title, date, time). If NONE can: do NOT loop or keep retrying — make at most ONE \
-                 `mcp_connect` attempt for a calendar MCP, and if that is not possible right now, \
-                 output a single short line that a calendar MCP must be connected to create the \
-                 event, then STOP."
+                "Create a real calendar event for this trip via the connected Google/calendar \
+                 tools (start = chosen date + time, end = next day; title, location, description \
+                 with the plan). Use the user's email from their profile as the organizer/attendee \
+                 — do NOT ask the user for a token or credentials; the Google MCP is already \
+                 connected. Actually CALL the create-event tool, then confirm the event (title, \
+                 date, time) from the tool result. Only if the tool returns an authorization error \
+                 you cannot resolve, report that exact error in one short line and STOP — never \
+                 invent a success."
             }
             Stage::Doc => {
-                "Produce the shareable plan as a Google Doc. If a connected tool can create docs, \
-                 use it and return the share link. If NONE can: do NOT loop or keep retrying — make \
-                 at most ONE `mcp_connect` attempt for a docs MCP, and if that is not possible right \
-                 now, output the full plan as plain text the user can copy, plus one short line that \
-                 a docs MCP must be connected for an auto-shared link, then STOP."
+                "Create a real shareable Google Doc with the full plan (date, route with real \
+                 coordinates/stops, campsite with verified distances, gear/BBQ notes) via the \
+                 connected Google/docs tools, then return the actual share link from the tool \
+                 result. Do NOT ask the user for a token — the Google MCP is already connected. \
+                 Only if the tool returns an authorization error you cannot resolve, report that \
+                 exact error in one short line plus the plan as plain text, then STOP — never \
+                 fabricate a link."
             }
             Stage::Clarify | Stage::Done => "",
         }
