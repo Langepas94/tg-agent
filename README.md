@@ -48,7 +48,7 @@ LLM_MODEL=deepseek-v4-flash
 BOT_PASSWORD=202020         # Telegram /start password
 ADMIN_ADDR=127.0.0.1:8080   # web admin bind; put nginx in front on VPS
 ADMIN_USERNAME=admin
-ADMIN_PASSWORD=...          # defaults to BOT_PASSWORD if omitted
+ADMIN_PASSWORD=...          # required for web admin; must differ from BOT_PASSWORD
 DIGEST_INTERVAL_MINUTES=360
 STATE_FILE=state.json
 SESSIONS_DIR=sessions
@@ -63,6 +63,9 @@ nginx as `http://5.129.234.9/admin`.
 The UI lets the owner inspect users, profile fields, notes, sticky facts,
 compacted summary, recent messages, watches, push subscriptions, raw session
 JSON, and manage access/context/profile/notes.
+
+`/admin` is disabled unless `ADMIN_PASSWORD` is set, and the admin password must
+be different from `BOT_PASSWORD`.
 
 ## Run
 
@@ -80,4 +83,4 @@ cargo test -- --ignored --nocapture          # live tests (need MCP + LLM key)
 ## Commands
 
 `/start` `/help` `/connect` `/mcps` `/tools` `/call` `/watch` `/unwatch`
-`/watches` `/disconnect` `/profile` `/info` `/facts` `/trip` `/reset`
+`/watches` `/disconnect` `/profile` `/info` `/facts` `/trip` `/compact` `/reset`

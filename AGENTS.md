@@ -36,14 +36,14 @@ MCP-серверы подключаются **в чате** (команды ил
 - `BOT_PASSWORD` — пароль для `/start`, default `202020`.
 - `ADMIN_ADDR` — web-админка, default `127.0.0.1:8080` (`/admin`).
 - `ADMIN_USERNAME` — логин web-админки, default `admin`.
-- `ADMIN_PASSWORD` — пароль web-админки, default = `BOT_PASSWORD`.
+- `ADMIN_PASSWORD` — пароль web-админки; без него `/admin` отключён. Должен отличаться от `BOT_PASSWORD`.
 - `DIGEST_INTERVAL_MINUTES` — default 360.
 - `STATE_FILE` (default `state.json`), `SESSIONS_DIR` (default `sessions`).
 
 ## Команды (`src/bot.rs` enum `Command`)
 
 `/start` `/help` `/connect` `/mcps` `/tools` `/call` `/watch` `/unwatch`
-`/watches` `/disconnect` `/profile` `/info` `/facts` `/trip` `/reset`
+`/watches` `/disconnect` `/profile` `/info` `/facts` `/trip` `/compact` `/reset`
 
 ## Подключение MCP — ТОЧНЫЙ синтаксис (`parse_connect`)
 

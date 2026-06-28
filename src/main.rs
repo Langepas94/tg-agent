@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use teloxide::{prelude::*, types::BotCommand};
+use teloxide::prelude::*;
 use tg_agent::{admin, bot, config, llm::Llm, persist, scheduler, state};
 use tracing::{info, warn};
 
@@ -33,26 +33,30 @@ async fn main() -> Result<()> {
     let state = state::BotState::with_llm_and_password(tx, llm, cfg.bot_password.clone());
 
     let bot = Bot::new(&cfg.telegram_token);
-    bot.set_my_commands(vec![BotCommand::new("start", "unlock the bot")])
-        .await?;
-    info!("Public bot command registered");
+    bot::set_public_commands(&bot).await?;
+    info!("Public bot commands registered");
 
     // Store the bot handle so watches/agent meta-tools can post to chats.
     state.set_bot(bot.clone()).await;
 
     // Restore persisted state: reconnect MCP servers, subscribers, watches.
     restore_state(&state).await;
+    if let Err(e) = bot::sync_authorized_command_menus(&bot, &state).await {
+        warn!("Failed to sync chat command menus: {e:#}");
+    }
 
     scheduler::spawn(bot.clone(), state.clone());
-    if let Some(addr) = cfg.admin_addr.clone() {
+    if let (Some(addr), Some(password)) = (cfg.admin_addr.clone(), cfg.admin_password.clone()) {
         admin::spawn(
             state.clone(),
             admin::AdminConfig {
                 addr,
                 username: cfg.admin_username.clone(),
-                password: cfg.admin_password.clone(),
+                password,
             },
         );
+    } else if cfg.admin_addr.is_some() {
+        warn!("Admin web disabled: set ADMIN_PASSWORD to enable /admin");
     }
 
     info!("Dispatcher starting");
