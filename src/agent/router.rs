@@ -27,8 +27,8 @@ pub enum Route {
 const ROUTER_PROMPT: &str = "You are the intent router of a weather + travel/outdoor-trip \
 planning assistant. Read the user's message and decide ONE route. Return ONLY JSON \
 {\"route\":\"trip|chat|offtopic\",\"reason\":\"<short>\"}.\n\
-- trip: the user wants to PLAN an outdoor or overnight trip — a hike, kayak/canoe/rafting trip, \
-camping, a weekend getaway with an overnight stay, a multi-stop route, a campsite/BBQ outing, \
+- trip: the user wants to PLAN an outdoor/nature recreation activity, overnight stay, \
+weekend getaway, multi-stop route, campsite/BBQ outing, field visit, or similar outdoor plan, \
 or asks to plan/organize such a trip. Choose this even if the request is long and detailed.\n\
 - chat: any other on-topic message — a weather question or forecast, a city/country/travel \
 question, a place name, a short follow-up ('а завтра?', 'да', 'Москва'), or a greeting.\n\

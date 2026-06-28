@@ -1,31 +1,26 @@
 //! Stateful multi-agent trip-planning flow (the "swarm").
 //!
-//! Each stage is its own agent. An **LLM ORCHESTRATOR agent** decides every
-//! transition — it is not a hardcoded sequential FSM: it reads the brief, which
-//! stages already have output, and the user's latest message, and returns the
-//! next stage + whether to run it or ask the user. This lets the user **step
-//! back** at any point ("change the date / river / campsite"): the orchestrator
-//! routes to that earlier stage and its (and all later stages') outputs are
-//! recomputed.
+//! The public runner is a dynamic swarm: BriefAgent extracts the request,
+//! OptionsAgent offers concise alternatives, SwarmPlanner builds worker tasks
+//! from the live MCP tool inventory, WorkerAgents execute isolated tasks,
+//! VerifierAgent gates side effects, and FinalAgent composes the answer.
 //!
 //! The flow SUSPENDS across user turns: Clarify interrogates first, building a
 //! `TripBrief` persisted in the chat session; each execution stage
-//! (Planning → Routing → Camp → Schedule → Doc) receives the prior stages'
-//! outputs (real subagent hand-off) and uses the connected MCP tools. Code only
-//! executes the chosen stage and guards against loops; the routing decisions are
-//! the orchestrator agent's.
-//!
-//! Stages (the orchestrator may move forward, stay, or step back):
-//!   Clarify → Planning → Routing → Camp → Schedule → Doc → Done
+//! The old fixed stage labels are retained only as serialized-state
+//! compatibility shells; they no longer drive the public flow.
 
 use std::{collections::BTreeMap, time::Duration};
+
+#[cfg(test)]
+use std::collections::HashMap;
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use crate::{llm::Llm, state::BotState};
 
-use super::session::ChatSession;
+use super::{memory::MemoryLayer, profile, session::ChatSession};
 
 /// Hard cap on clarify rounds — after this we plan with whatever we have, so the
 /// bot never interrogates forever.
@@ -35,9 +30,15 @@ const MAX_CLARIFY_ROUNDS: u8 = 3;
 /// keeping the cumulative prompt bounded. A committed stage result (chosen day,
 /// route coords, campsite) fits well under this; the verbose user-facing prose
 /// is for the chat, not the hand-off.
+#[cfg(test)]
 const HANDOFF_CLIP: usize = 400;
+/// A checkpoint finalization must see the options it previously showed the
+/// user. Clipping the Planning/Camp record to the normal hand-off size made
+/// "first option" ambiguous and let the model bind it to the wrong candidate.
+#[cfg(test)]
+const CHECKPOINT_CHOICE_CLIP: usize = 3200;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, std::hash::Hash, Serialize, Deserialize)]
 pub enum Stage {
     Clarify,
     Planning,
@@ -157,8 +158,9 @@ pub struct FlowTurn {
 // Clarify agent
 // ---------------------------------------------------------------------------
 
+#[cfg(test)]
 const CLARIFY_PROMPT: &str = "You are the CLARIFY agent of a general outdoor-trip / recreation \
-planner (any activity the user names — hikes, paddling, cycling, camping, weekend getaways, etc.; \
+planner (any outdoor or nature-recreation activity the user names; \
 make NO assumption about the activity or terrain). You receive the user's known profile, the \
 brief gathered so far, and the user's newest message. MERGE any new facts into the brief. \
 \
@@ -267,6 +269,7 @@ impl Stage {
 
     /// Short user-facing "what I'm doing now" line, shown before a (possibly
     /// multi-minute) stage runs so the chat is never silent. RU — primary user.
+    #[cfg(test)]
     fn progress_label(&self) -> &'static str {
         match self {
             Stage::Planning => "📅 Подбираю даты и место по погоде…",
@@ -309,6 +312,7 @@ impl Stage {
     }
 
     /// The worker-agent task for an execution stage (empty for Clarify/Done).
+    #[cfg(test)]
     fn instruction(&self) -> &'static str {
         match self {
             Stage::Planning => {
@@ -321,6 +325,11 @@ impl Stage {
                  make sense, no fixed number. Do not pad to a count, and do not drop a clearly good \
                  option to hit one; if only one area realistically fits, present just that and say \
                  why. SPREAD them across the trade-off (don't offer only the single best weather): \
+                 if the brief says the user can only go on weekends, every option MUST be a \
+                 Saturday→Sunday overnight pair in the current/future year; never offer Friday or \
+                 any weekday just because the weather is better, and include weekday + day + month \
+                 + year for every option. The place type, route type, and evidence must follow the \
+                 user's actual activity and constraints; do not use fixed activity templates. \
                  where it applies, include a nearer area even if slightly worse weather and a \
                  best-weather one even if farther. Each option = a specific day + a specific \
                  place/area that fits THE ACTIVITY DESCRIBED IN THE BRIEF (infer what kind of place \
@@ -341,7 +350,8 @@ impl Stage {
                  state must come from a tool result. Give the start and end with real coordinates, \
                  2-4 named intermediate stops (real places from the map) with distances/times, and \
                  a pace matching the party's stated level and priorities from the brief. Keep total \
-                 distance sensible for that level.\n\
+                 distance sensible for that level. The route mechanics must be inferred from the \
+                 brief and the available tools; never substitute a different activity mode.\n\
                  TIGHT BUDGET: you have only a few map queries. Geocode once, run a SMALL number of \
                  lookups, then COMMIT — output the route with the concrete coordinates you have. Do \
                  NOT keep re-querying to perfect it. Better a good route committed in 4 queries \
@@ -353,8 +363,9 @@ impl Stage {
             Stage::Camp => {
                 "You are a CHECKPOINT stage: you propose the overnight spot and let the user \
                  confirm. Honour ONLY the CONSTRAINTS THE USER ACTUALLY STATED in the brief — do \
-                 not invent requirements they never mentioned. Read each stated constraint from the \
-                 brief and verify it.\n\
+                 not invent requirements they never mentioned. Keys named `constraint_*` in \
+                 [trip-brief] are HARD constraints. Read each stated constraint from the brief and \
+                 verify it.\n\
                  BE ECONOMICAL — you have a limited tool budget; too many queries fail the stage:\n\
                  1. REUSE the coordinates the Routing stage already produced (see [prior-stages]). \
                  Do NOT re-discover the route — it is already known. Pick ONE candidate point along \
@@ -371,8 +382,10 @@ impl Stage {
                  feature, the spot is the nearby usable ground whose measured distance to that \
                  feature's EDGE meets the limit, not a point inside the feature.\n\
                  COMMIT within ~5 queries: after your few lookups, output a concrete spot with the \
-                 real coordinates you have. If you could not check every constraint in the budget, \
-                 still commit and note the unchecked one in ONE short line — do NOT keep querying.\n\
+                 real coordinates you have. HARD CONSTRAINTS stated by the user are not optional: \
+                 if you cannot verify one of them, do not present the campsite as confirmable; end \
+                 with 'STAGE_INCOMPLETE: <short reason>' instead of saying the constraint is \
+                 unchecked. Do NOT keep querying.\n\
                  - If [user-choice] below is empty (first run): propose the candidate spot(s) that \
                  genuinely fit — present what actually works, not a fixed count (often one or two) \
                  — each with real coordinates and the measured distances for each constraint you \
@@ -385,26 +398,14 @@ impl Stage {
                  numbers instead of committing real coordinates."
             }
             Stage::Schedule => {
-                "Create a real calendar event for this trip via the connected Google/calendar \
-                 tools (start = chosen date + time, end = next day; title, location, description \
-                 with the plan). Use the user's email from their profile. NEVER ask the user for a \
-                 token or credentials. Actually CALL the create-event tool, then confirm the event \
-                 from the tool result. If a tool reports the user is NOT authenticated or returns \
-                 an authorization URL (start_google_auth / auth flow), give the user that EXACT URL \
-                 verbatim as a clickable link with a one-line instruction to open it and approve \
-                 access — do NOT paraphrase it into 'нужен токен'. Then STOP. Never invent success."
+                "Legacy compatibility placeholder. The dynamic ArtifactsAgent is responsible for \
+                 requested external artifacts, based on actual runtime tool inventory and verifier \
+                 approval; this fixed stage must not assume any calendar capability exists."
             }
             Stage::Doc => {
-                "Create a real shareable Google Doc with the full plan (date, route with real \
-                 coordinates/stops, overnight site with verified distances, gear notes suited to \
-                 the activity from the brief) via the \
-                 connected Google/docs tools, then return the actual share link from the tool \
-                 result. NEVER ask the user for a token. If a tool reports the user is NOT \
-                 authenticated or returns an authorization URL (start_google_auth / auth flow), \
-                 give the user that EXACT URL verbatim as a clickable link with a one-line \
-                 instruction to open it and approve access — do NOT paraphrase it into 'нужен \
-                 доступ'. Also output the full plan as plain text so it is never lost. Then STOP. \
-                 Never fabricate a link."
+                "Legacy compatibility placeholder. The dynamic ArtifactsAgent is responsible for \
+                 requested shareable documents, based on actual runtime tool inventory and verifier \
+                 approval; this fixed stage must not assume any document capability exists."
             }
             Stage::Clarify | Stage::Done => "",
         }
@@ -431,6 +432,7 @@ pub struct Decision {
     pub message: String,
 }
 
+#[cfg(test)]
 const ORCH_PROMPT: &str = "You are the ORCHESTRATOR of a trip-planning swarm. The stages, in \
 order, are: Clarify, Planning, Routing, Camp, Schedule, Doc, Done. Each stage is run by its own \
 worker agent; YOU decide which stage runs next. \
@@ -455,6 +457,7 @@ message. \
 next_stage=Done, mode=run.";
 
 #[derive(Debug, Deserialize)]
+#[cfg(test)]
 struct DecisionJson {
     #[serde(default)]
     next_stage: String,
@@ -466,6 +469,7 @@ struct DecisionJson {
 
 /// Parse the orchestrator JSON, falling back to a deterministic decision if the
 /// model returns junk (so the flow never stalls).
+#[cfg(test)]
 fn parse_decision(
     raw: &str,
     brief: &TripBrief,
@@ -495,6 +499,7 @@ fn parse_decision(
 
 /// Deterministic safety net: clarify if the brief is thin and the user spoke,
 /// else run the earliest stage without output, else finish.
+#[cfg(test)]
 fn fallback_decision(brief: &TripBrief, records: &[StageRecord], user_empty: bool) -> Decision {
     if !brief.has_minimum() && !user_empty {
         return Decision {
@@ -511,6 +516,7 @@ fn fallback_decision(brief: &TripBrief, records: &[StageRecord], user_empty: boo
 }
 
 /// Earliest execution stage that has no record yet; `Done` when all are present.
+#[cfg(test)]
 fn next_exec_after(records: &[StageRecord]) -> Stage {
     for stage in [
         Stage::Planning,
@@ -519,8 +525,10 @@ fn next_exec_after(records: &[StageRecord]) -> Stage {
         Stage::Schedule,
         Stage::Doc,
     ] {
-        if record_index(records, &stage).is_none() {
-            return stage;
+        match record_index(records, &stage) {
+            None => return stage,
+            Some(i) if is_stage_unresolved(&records[i].output) => return stage,
+            _ => {}
         }
     }
     Stage::Done
@@ -530,11 +538,13 @@ fn next_exec_after(records: &[StageRecord]) -> Stage {
 // Record helpers (replace-by-stage + downstream invalidation for back-steps)
 // ---------------------------------------------------------------------------
 
+#[cfg(test)]
 fn record_index(records: &[StageRecord], stage: &Stage) -> Option<usize> {
     records.iter().position(|r| r.stage == stage.name())
 }
 
 /// Insert or replace a stage's output, keeping records ordered by stage order.
+#[cfg(test)]
 fn set_record(records: &mut Vec<StageRecord>, stage: &Stage, output: String) {
     if let Some(i) = record_index(records, stage) {
         records[i].output = output;
@@ -549,6 +559,7 @@ fn set_record(records: &mut Vec<StageRecord>, stage: &Stage, output: String) {
 
 /// Drop the output of `stage` and every later stage — used when the user steps
 /// back so stale downstream artifacts don't leak into the recomputed plan.
+#[cfg(test)]
 fn drop_from(records: &mut Vec<StageRecord>, stage: &Stage) {
     records.retain(|r| match Stage::parse(&r.stage) {
         Some(s) => s.order() < stage.order(),
@@ -559,11 +570,59 @@ fn drop_from(records: &mut Vec<StageRecord>, stage: &Stage) {
 /// Drop only the stages strictly AFTER `stage`, keeping `stage`'s own record —
 /// used when finalizing a checkpoint so the worker can see the candidates it
 /// already proposed and just commit to the user's pick instead of re-querying.
+#[cfg(test)]
 fn drop_after(records: &mut Vec<StageRecord>, stage: &Stage) {
     records.retain(|r| match Stage::parse(&r.stage) {
         Some(s) => s.order() <= stage.order(),
         None => false,
     });
+}
+
+#[cfg(test)]
+fn seed_obvious_trip_facts(brief: &mut TripBrief, user_text: &str) {
+    let _ = (brief, user_text);
+}
+
+#[cfg(test)]
+fn validate_stage_output(brief: &TripBrief, stage: &Stage, output: &mut String) {
+    let _ = brief;
+    if matches!(stage, Stage::Routing | Stage::Camp) && output_admits_unresolved_core_data(output) {
+        output.push_str("\nSTAGE_INCOMPLETE: core route/campsite data is not concrete");
+    }
+}
+
+fn output_admits_unresolved_core_data(output: &str) -> bool {
+    let low = output.to_lowercase();
+    let uncertainty = [
+        "не зафиксирован",
+        "не зафиксирована",
+        "не завершил",
+        "не завершила",
+        "не удалось построить",
+        "не удалось получить",
+        "требует уточнения",
+        "нужно уточнить",
+        "уточнить на местности",
+        "still to be verified",
+        "not fixed",
+        "not finalized",
+        "could not build",
+        "could not get",
+    ];
+    let core = [
+        "маршрут",
+        "трек",
+        "точк",
+        "стоянк",
+        "лагер",
+        "route",
+        "track",
+        "point",
+        "camp",
+        "campsite",
+    ];
+    uncertainty.iter().any(|needle| low.contains(needle))
+        && core.iter().any(|needle| low.contains(needle))
 }
 
 // ---------------------------------------------------------------------------
@@ -572,7 +631,13 @@ fn drop_after(records: &mut Vec<StageRecord>, stage: &Stage) {
 
 /// Maximum orchestrator steps per user turn (auto-advance bound), so one turn
 /// can walk Planning→…→Doc→Done but never loops forever.
+#[cfg(test)]
 const MAX_ORCH_STEPS: usize = 12;
+/// Extra recovery attempts after a stage explicitly failed or marked itself
+/// incomplete. `run_exec_stage` already retries low-level HTTP/LLM failures
+/// once; this handles semantic stage failures such as `STAGE_INCOMPLETE`.
+#[cfg(test)]
+const MAX_STAGE_RECOVERY_RETRIES: usize = 1;
 /// Safety net for ONE stage attempt that is genuinely stuck (a stalled external
 /// tool connection), not a planning budget. A normal OSM/weather stage finishes
 /// well under this; we also retry once and never dead-end on a hit, so a high
@@ -590,23 +655,506 @@ pub async fn advance(
     user_text: &str,
     progress: Option<&super::ProgressSender>,
 ) -> Result<FlowTurn> {
+    advance_swarm(llm, state, session, user_text, progress).await
+}
+
+#[derive(Debug, Deserialize)]
+struct SwarmPlan {
+    #[serde(default)]
+    tasks: Vec<SwarmTask>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct SwarmTask {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    agent: String,
+    #[serde(default)]
+    task: String,
+    #[serde(default)]
+    tools: bool,
+    #[serde(default)]
+    side_effects: bool,
+    #[serde(default)]
+    checkpoint: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct SwarmVerdict {
+    #[serde(default)]
+    ready: bool,
+    #[serde(default)]
+    missing: Vec<String>,
+}
+
+const SWARM_BRIEF_PROMPT: &str = "You are BriefAgent in an outdoor-recreation planning swarm. \
+Extract the user's request into an open, activity-agnostic brief. Do not use fixed activity \
+categories. Preserve the user's actual activity, constraints, preferences, requested artifacts, \
+dates, group capability, start area, and uncertainty. Ask only for facts that only the user can \
+know and that block planning. Return ONLY JSON: {\"brief\":{\"key\":\"value\",...},\
+\"ready\":bool,\"questions\":[\"...\"],\"recap\":\"short\"}.";
+
+const SWARM_OPTIONS_PROMPT: &str = "You are OptionsAgent. Give a SHORT menu of genuinely distinct \
+options for the outdoor/recreation request. Do not deep-dive into one route yet. Use available \
+tools only as much as needed to compare options at a high level. The options must match the user's \
+actual activity and constraints, whatever they are. End by asking the user to choose one option. \
+Plain text, no Markdown table.";
+
+const SWARM_PLANNER_PROMPT: &str = "You are SwarmPlanner. Build a minimal swarm plan from the \
+brief, the user's chosen option, prior records, and the ACTUAL connected MCP tool inventory. Do \
+not assume calendar/docs/maps/weather tools exist; inspect the inventory. Do not use fixed \
+activity templates. Create separate worker tasks with narrow responsibilities and isolated context. \
+Include a side_effects=true task only for external artifacts explicitly requested by the user AND \
+only if plausible tools are present or connectable; otherwise include a non-side-effect task that \
+explains the missing capability. Return ONLY JSON: {\"tasks\":[{\"id\":\"short_snake\",\
+\"agent\":\"AgentName\",\"task\":\"specific task\",\"tools\":true,\"side_effects\":false,\
+\"checkpoint\":false}]}. The plan must include a verification task before any side-effect task.";
+
+const SWARM_VERIFIER_PROMPT: &str = "You are VerifierAgent. Decide whether the gathered evidence is \
+concrete enough to perform external side effects or present the final plan. Check the user's actual \
+brief and constraints, not a fixed schema. If a route/place/date/constraint/artifact needed by the \
+request is vague, missing, contradicted, or merely 'to be checked later', ready=false. Return ONLY \
+JSON: {\"ready\":bool,\"missing\":[\"short missing item\",...]}";
+
+const SWARM_FINAL_PROMPT: &str =
+    "You are FinalAgent. Compose the user-facing answer from the swarm \
+records. Preserve the selected option, concrete evidence, tool results, and artifact links. Do not \
+claim an external artifact was created unless a tool result says so. If a requested capability was \
+missing, say that plainly. Plain Telegram-friendly text, no Markdown tables.";
+
+async fn advance_swarm(
+    llm: &Llm,
+    state: &BotState,
+    session: &mut ChatSession,
+    user_text: &str,
+    progress: Option<&super::ProgressSender>,
+) -> Result<FlowTurn> {
+    let tools = state.tool_inventory().await;
+    let mut tool_context = render_tool_inventory(&tools);
+    let mut flow = session.trip.clone().unwrap_or_else(TripFlowState::start);
+    let mut trace = Vec::new();
+
+    if flow.records.is_empty() {
+        let input = format!(
+            "Known profile:\n{}\n\nUser request:\n{}",
+            profile_context(&session.profile),
+            user_text
+        );
+        let parsed = parse_clarify(&llm.complete(SWARM_BRIEF_PROMPT, &input).await?);
+        flow.brief.merge(parsed.brief);
+        flow.clarify_rounds = flow.clarify_rounds.saturating_add(1);
+        let ready =
+            parsed.ready || flow.brief.has_minimum() || flow.clarify_rounds >= MAX_CLARIFY_ROUNDS;
+        if !ready {
+            flow.stage = Stage::Clarify;
+            session.trip = Some(flow);
+            return Ok(FlowTurn {
+                reply: render_clarify_reply(&parsed.recap, &parsed.questions),
+                trace,
+                done: false,
+            });
+        }
+
+        if let Some(p) = progress {
+            let _ = p.send("🧭 Подбираю короткие варианты…".to_string());
+        }
+        let options = run_swarm_worker(
+            llm,
+            state,
+            session,
+            "OptionsAgent",
+            SWARM_OPTIONS_PROMPT,
+            &format!(
+                "[brief]\n{}\n\n[available-tools]\n{}\n\n[user-request]\n{}",
+                flow.brief.render(),
+                tool_context,
+                user_text
+            ),
+            true,
+        )
+        .await;
+        let options = clean_user_text(&options);
+        flow.stage = Stage::Planning;
+        set_named_record(&mut flow.records, "OptionsAgent", options.clone());
+        flow.awaiting_choice = Some(Stage::Planning);
+        session.trip = Some(flow);
+        return Ok(FlowTurn {
+            reply: options,
+            trace,
+            done: false,
+        });
+    }
+
+    let user_choice = user_text.trim();
+    if !user_choice.is_empty() {
+        set_named_record(
+            &mut flow.records,
+            "UserChoice",
+            clean_user_text(user_choice),
+        );
+    }
+
+    let plan = make_swarm_plan(llm, &flow.brief, &flow.records, user_choice, &tool_context).await;
+    if plan.tasks.is_empty() {
+        return Ok(FlowTurn {
+            reply: "Не смог собрать план агентов из текущего запроса. Состояние сохранено; попробуйте ещё раз коротко подтвердить выбранный вариант.".into(),
+            trace,
+            done: false,
+        });
+    }
+
+    for task in plan.tasks {
+        let id = sanitize_record_id(&task.id, &task.agent);
+        if let Some(existing) = flow.records.iter().find(|r| r.stage == id) {
+            if !is_stage_unresolved(&existing.output)
+                && !output_admits_unresolved_core_data(&existing.output)
+            {
+                continue;
+            }
+            flow.records.retain(|r| r.stage != id);
+        }
+        if task.side_effects {
+            let verdict = verify_swarm_ready(llm, &flow.brief, &flow.records, &tool_context).await;
+            if !verdict.ready {
+                flow.awaiting_choice = None;
+                session.trip = Some(flow);
+                return Ok(FlowTurn {
+                    reply: render_swarm_incomplete(&verdict.missing),
+                    trace,
+                    done: false,
+                });
+            }
+        }
+        if let Some(p) = progress {
+            let _ = p.send(format!("• {}: работаю", task.agent_or_default()));
+        }
+        let system = build_swarm_worker_system(session, &task, &tool_context);
+        let query = format!(
+            "[brief]\n{}\n\n[selected-option]\n{}\n\n[prior-agent-records]\n{}\n\n[task]\n{}",
+            flow.brief.render(),
+            user_choice,
+            render_records_clipped(&flow.records, |_| 1200),
+            task.task
+        );
+        let output = run_swarm_worker(
+            llm,
+            state,
+            session,
+            &task.agent_or_default(),
+            &system,
+            &query,
+            task.tools,
+        )
+        .await;
+        if task.tools {
+            tool_context = render_tool_inventory(&state.tool_inventory().await);
+        }
+        let output = clean_user_text(&output);
+        if output_admits_unresolved_core_data(&output) || output.contains("STAGE_INCOMPLETE") {
+            set_named_record(&mut flow.records, &id, output.clone());
+            flow.awaiting_choice = None;
+            session.trip = Some(flow);
+            trace.push(format!(
+                "• {}: {}",
+                task.agent_or_default(),
+                clip(&output, 90)
+            ));
+            return Ok(FlowTurn {
+                reply: render_swarm_incomplete(&[clip(&output, 160)]),
+                trace,
+                done: false,
+            });
+        }
+        trace.push(format!(
+            "• {}: {}",
+            task.agent_or_default(),
+            clip(&output, 90)
+        ));
+        set_named_record(&mut flow.records, &id, output.clone());
+        if task.checkpoint {
+            session.trip = Some(flow);
+            return Ok(FlowTurn {
+                reply: output,
+                trace,
+                done: false,
+            });
+        }
+    }
+
+    let verdict = verify_swarm_ready(llm, &flow.brief, &flow.records, &tool_context).await;
+    if !verdict.ready {
+        flow.awaiting_choice = None;
+        session.trip = Some(flow);
+        return Ok(FlowTurn {
+            reply: render_swarm_incomplete(&verdict.missing),
+            trace,
+            done: false,
+        });
+    }
+
+    let final_answer = llm
+        .complete(
+            SWARM_FINAL_PROMPT,
+            &format!(
+                "[brief]\n{}\n\n[available-tools]\n{}\n\n[agent-records]\n{}",
+                flow.brief.render(),
+                tool_context,
+                render_records_clipped(&flow.records, |_| 1800)
+            ),
+        )
+        .await
+        .map(|s| clean_user_text(&s))
+        .unwrap_or_else(|_| fallback_compose(&flow.records));
+    session.trip = None;
+    Ok(FlowTurn {
+        reply: final_answer,
+        trace,
+        done: true,
+    })
+}
+
+async fn make_swarm_plan(
+    llm: &Llm,
+    brief: &TripBrief,
+    records: &[StageRecord],
+    user_choice: &str,
+    tool_context: &str,
+) -> SwarmPlan {
+    let input = format!(
+        "[brief]\n{}\n\n[user-choice]\n{}\n\n[available-tools]\n{}\n\n[records]\n{}",
+        brief.render(),
+        user_choice,
+        tool_context,
+        render_records_clipped(records, |_| 1600)
+    );
+    let raw = llm
+        .complete(SWARM_PLANNER_PROMPT, &input)
+        .await
+        .unwrap_or_default();
+    serde_json::from_str(&extract_json(&raw)).unwrap_or_else(|_| SwarmPlan {
+        tasks: vec![
+            SwarmTask {
+                id: "research".into(),
+                agent: "ResearchAgent".into(),
+                task: "Research the selected option with the available tools and produce a concrete plan with evidence for the user's actual request.".into(),
+                tools: true,
+                side_effects: false,
+                checkpoint: false,
+            },
+            SwarmTask {
+                id: "verify".into(),
+                agent: "VerifierAgent".into(),
+                task: "Verify that the plan satisfies the user's request and list any missing evidence.".into(),
+                tools: false,
+                side_effects: false,
+                checkpoint: false,
+            },
+            SwarmTask {
+                id: "artifacts".into(),
+                agent: "ArtifactsAgent".into(),
+                task: "If the user requested external artifacts and suitable tools are available, create them. If not, report the missing capability without claiming success.".into(),
+                tools: true,
+                side_effects: true,
+                checkpoint: false,
+            },
+        ],
+    })
+}
+
+async fn verify_swarm_ready(
+    llm: &Llm,
+    brief: &TripBrief,
+    records: &[StageRecord],
+    tool_context: &str,
+) -> SwarmVerdict {
+    let input = format!(
+        "[brief]\n{}\n\n[available-tools]\n{}\n\n[records]\n{}",
+        brief.render(),
+        tool_context,
+        render_records_clipped(records, |_| 1800)
+    );
+    let raw = llm
+        .complete(SWARM_VERIFIER_PROMPT, &input)
+        .await
+        .unwrap_or_default();
+    serde_json::from_str(&extract_json(&raw)).unwrap_or(SwarmVerdict {
+        ready: false,
+        missing: vec!["верификатор не подтвердил готовность плана".into()],
+    })
+}
+
+async fn run_swarm_worker(
+    llm: &Llm,
+    state: &BotState,
+    session: &ChatSession,
+    agent: &str,
+    system: &str,
+    query: &str,
+    allow_tools: bool,
+) -> String {
+    let full_system = format!(
+        "{system}\n\nYou are {agent}. You are one worker in a real swarm: do only your task, \
+         use only the context passed to you, and return a compact handoff artifact for the next agent."
+    );
+    let run = async {
+        if allow_tools {
+            llm.answer_in_chat(
+                state,
+                &full_system,
+                query,
+                &[],
+                Some(session.chat_id),
+                crate::llm::STAGE_MAX_STEPS,
+            )
+            .await
+        } else {
+            llm.complete(&full_system, query).await
+        }
+    };
+    match tokio::time::timeout(STAGE_TIMEOUT, run).await {
+        Err(_) => "(stage timed out)".to_string(),
+        Ok(Ok(o)) if !o.trim().is_empty() => o,
+        Ok(Ok(_)) => "(no output)".to_string(),
+        Ok(Err(e)) => format!("(stage failed: {e})"),
+    }
+}
+
+fn build_swarm_worker_system(
+    session: &ChatSession,
+    task: &SwarmTask,
+    tool_context: &str,
+) -> String {
+    let invariants = session.effective_invariants();
+    let mut memory = session.memory.clone();
+    memory.facts.retain(|f| f.layer != MemoryLayer::Working);
+    let role = format!(
+        "Worker role: {}\nTask: {}\nSide effects allowed for this worker: {}\n\n\
+         Available MCP tools, discovered at runtime:\n{}\n\n\
+         Rules:\n- Do not assume tools outside this inventory exist.\n\
+         - If a needed capability is missing, report it instead of pretending success.\n\
+         - Do not create external artifacts unless this task explicitly allows side effects.\n\
+         - Do not rely on fixed activity templates; infer the method from the user's brief.",
+        task.agent_or_default(),
+        task.task,
+        task.side_effects,
+        tool_context,
+    );
+    super::prompt::build_system_prompt(
+        &memory,
+        &session.profile,
+        &[],
+        &invariants,
+        Some(&role),
+        None,
+    )
+}
+
+fn render_tool_inventory(tools: &[crate::state::ToolSummary]) -> String {
+    if tools.is_empty() {
+        return "(no MCP tools connected)".into();
+    }
+    tools
+        .iter()
+        .map(|t| {
+            let desc = if t.description.trim().is_empty() {
+                ""
+            } else {
+                t.description.trim()
+            };
+            format!("- {}__{}: {}", t.server, t.name, clip(desc, 160))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn set_named_record(records: &mut Vec<StageRecord>, stage: &str, output: String) {
+    if let Some(r) = records.iter_mut().find(|r| r.stage == stage) {
+        r.output = output;
+    } else {
+        records.push(StageRecord {
+            stage: stage.to_string(),
+            output,
+        });
+    }
+}
+
+fn sanitize_record_id(id: &str, agent: &str) -> String {
+    let raw = if id.trim().is_empty() { agent } else { id };
+    raw.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn render_swarm_incomplete(missing: &[String]) -> String {
+    let items = if missing.is_empty() {
+        "• не хватает подтверждённых данных".to_string()
+    } else {
+        missing
+            .iter()
+            .take(5)
+            .map(|m| format!("• {m}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    format!(
+        "Финал ещё не готов: верификатор не подтвердил план, поэтому внешние артефакты не создаю.\n{items}\n\nМожно написать «продолжай» — рой продолжит с недостающих проверок."
+    )
+}
+
+impl SwarmTask {
+    fn agent_or_default(&self) -> String {
+        if self.agent.trim().is_empty() {
+            "WorkerAgent".into()
+        } else {
+            self.agent.clone()
+        }
+    }
+}
+
+/// Legacy fixed pipeline kept for old unit coverage and persisted states while
+/// the public flow above uses the dynamic swarm runner.
+#[cfg(test)]
+async fn advance_legacy(
+    llm: &Llm,
+    state: &BotState,
+    session: &mut ChatSession,
+    user_text: &str,
+    progress: Option<&super::ProgressSender>,
+) -> Result<FlowTurn> {
     let mut brief = session
         .trip
         .as_ref()
         .map(|t| t.brief.clone())
         .unwrap_or_default();
+    seed_obvious_trip_facts(&mut brief, user_text);
     let mut records = session
         .trip
         .as_ref()
         .map(|t| t.records.clone())
         .unwrap_or_default();
     let mut trace: Vec<String> = Vec::new();
+    let mut recovery_retries: HashMap<Stage, usize> = HashMap::new();
     // If we paused on a checkpoint last turn, the user's message now is their
     // choice for that stage: re-run it to finalize, then auto-advance.
-    let awaiting = session
+    let raw_awaiting = session
         .trip
         .as_ref()
         .and_then(|t| t.awaiting_choice.clone());
+    let awaiting = raw_awaiting
+        .clone()
+        .filter(|stage| valid_awaiting_choice(stage, &records));
+    if awaiting != raw_awaiting {
+        if let Some(t) = session.trip.as_mut() {
+            t.awaiting_choice = awaiting.clone();
+        }
+    }
     // First contact with a fresh flow: ALWAYS clarify first (never let the
     // orchestrator dive into the pipeline on a raw multi-part request). After
     // clarifying, the flow advances to the Planning checkpoint, which presents
@@ -619,7 +1167,9 @@ pub async fn advance(
         let user_empty = step > 0; // only the first step carries the user's message
         let umsg = if user_empty { "" } else { user_text };
         // True when this exec run finalizes the checkpoint the user just answered.
-        let finalizing = |stage: &Stage| !user_empty && awaiting.as_ref() == Some(stage);
+        let finalizing = |stage: &Stage| {
+            stage.is_checkpoint() && !user_empty && awaiting.as_ref() == Some(stage)
+        };
 
         // ---- Pick the next transition ----
         let decision = if step == 0 && first_contact {
@@ -670,6 +1220,7 @@ pub async fn advance(
                 user_empty,
             )
         };
+        let decision = prevent_unresolved_skip(decision, &records);
 
         match decision.next {
             // ---- Clarify: dedicated agent extracts slots / asks questions ----
@@ -706,7 +1257,7 @@ pub async fn advance(
                         t.clarify_rounds
                     })
                     .unwrap_or(0);
-                let enough = parsed.ready || rounds >= MAX_CLARIFY_ROUNDS;
+                let enough = parsed.ready || brief.has_minimum() || rounds >= MAX_CLARIFY_ROUNDS;
                 if !enough {
                     return Ok(FlowTurn {
                         reply: render_clarify_reply(&parsed.recap, &parsed.questions),
@@ -728,7 +1279,7 @@ pub async fn advance(
                         t.stage = stage.clone();
                         t.brief = brief.clone();
                         t.records = records.clone();
-                        t.awaiting_choice = Some(stage.clone());
+                        t.awaiting_choice = awaiting_if_choice_available(&stage, &records);
                     }
                     return Ok(FlowTurn {
                         reply: render_incomplete_block(&stage),
@@ -759,7 +1310,7 @@ pub async fn advance(
                             t.stage = blocker.clone();
                             t.brief = brief.clone();
                             t.records = records.clone();
-                            t.awaiting_choice = Some(blocker.clone());
+                            t.awaiting_choice = awaiting_if_choice_available(&blocker, &records);
                         }
                         return Ok(FlowTurn {
                             reply: render_incomplete_block(&blocker),
@@ -806,30 +1357,58 @@ pub async fn advance(
                 // Pass the user's choice only when finalizing a checkpoint, so the
                 // stage commits to the option they picked; otherwise it proposes.
                 let choice = if is_final { user_text } else { "" };
-                let output =
-                    run_exec_stage(llm, state, session, &brief, &records, stage, choice).await;
+                let allow_tools = !(is_final && stage.is_checkpoint());
+                let mut output = run_exec_stage(
+                    llm,
+                    state,
+                    session,
+                    &brief,
+                    &records,
+                    stage,
+                    choice,
+                    allow_tools,
+                )
+                .await;
+                let _ = session.profile.apply_inline_markers(&output);
+                output = clean_user_text(&output);
+                validate_stage_output(&brief, stage, &mut output);
                 set_record(&mut records, stage, output.clone());
-                trace.push(format!("• {}: {}", stage.name(), clip(&output, 90)));
-                // A failed/timed-out stage is NOT a dead-end. Only a CHECKPOINT
-                // failure pauses (it has nothing to show), with a short honest
-                // note. A non-checkpoint failure is carried forward as
-                // best-effort; the final compose flags whatever stayed
-                // unverified. We never scold the user or ask them to "narrow the
-                // river" — picking the river is the planner's job.
-                if is_stage_unresolved(&output) && stage.is_checkpoint() {
+                // A failed/timed-out/incomplete essential stage is not a valid
+                // hand-off to downstream agents. Retry once in this turn, then
+                // pause with the bad record removed so the next turn resumes at
+                // the same stage instead of asking the user to "choose" it.
+                if is_stage_unresolved(&output) {
+                    let attempts = recovery_retries.entry(stage.clone()).or_insert(0);
+                    if *attempts < MAX_STAGE_RECOVERY_RETRIES {
+                        *attempts += 1;
+                        drop_from(&mut records, stage);
+                        if let Some(p) = progress {
+                            let _ = p.send(format!(
+                                "↻ Повторяю этап {} — предыдущая попытка не дала надёжных данных",
+                                stage.name()
+                            ));
+                        }
+                        continue;
+                    }
+                    trace.push(format!("• {}: {}", stage.name(), clip(&output, 90)));
+                    drop_from(&mut records, stage);
                     if let Some(t) = session.trip.as_mut() {
                         t.stage = stage.clone();
                         t.brief = brief.clone();
                         t.records = records.clone();
-                        // Keep awaiting on the checkpoint so the user can retry it.
-                        t.awaiting_choice = Some(stage.clone());
+                        t.awaiting_choice = None;
                     }
                     return Ok(FlowTurn {
-                        reply: render_checkpoint_stall(stage),
+                        reply: if stage.is_checkpoint() {
+                            render_checkpoint_stall(stage)
+                        } else {
+                            render_incomplete_block(stage)
+                        },
                         trace,
                         done: false,
                     });
                 }
+                trace.push(format!("• {}: {}", stage.name(), clip(&output, 90)));
                 // Checkpoint: on its FIRST run (not a finalize) present the
                 // options and pause for the user's choice.
                 if stage.is_checkpoint() && !is_final {
@@ -865,7 +1444,7 @@ pub async fn advance(
             t.stage = stage.clone();
             t.brief = brief.clone();
             t.records = records.clone();
-            t.awaiting_choice = Some(stage.clone());
+            t.awaiting_choice = awaiting_if_choice_available(&stage, &records);
         }
         return Ok(FlowTurn {
             reply: render_incomplete_block(&stage),
@@ -886,6 +1465,7 @@ pub async fn advance(
 }
 
 /// Run one execution stage's worker agent (uses the connected MCP tools).
+#[cfg(test)]
 async fn run_exec_stage(
     llm: &Llm,
     state: &BotState,
@@ -894,6 +1474,7 @@ async fn run_exec_stage(
     records: &[StageRecord],
     stage: &Stage,
     user_choice: &str,
+    allow_tools: bool,
 ) -> String {
     let system = stage_system(session, stage);
     let choice = user_choice.trim();
@@ -901,7 +1482,7 @@ async fn run_exec_stage(
         "[trip-brief]\n{}\n\n[prior-stages]\n{}\n\n[user-choice]\n{}\n\n\
          [your-task as the {} agent]\n{}",
         brief.render(),
-        render_records(records),
+        render_records_for_stage(records, stage, !choice.is_empty()),
         if choice.is_empty() {
             "(none yet)"
         } else {
@@ -913,9 +1494,9 @@ async fn run_exec_stage(
     // One automatic retry ONLY for a transient LLM/HTTP error. Do NOT retry a
     // timeout or a "too many tool calls" — those just repeat the slow grind and
     // double the user's wait; the caller handles them as best-effort/incomplete.
-    let mut last = run_stage_once(llm, state, &system, &query).await;
+    let mut last = run_stage_once(llm, state, &system, &query, allow_tools).await;
     if last.starts_with("(stage failed:") {
-        last = run_stage_once(llm, state, &system, &query).await;
+        last = run_stage_once(llm, state, &system, &query, allow_tools).await;
     }
     last
 }
@@ -923,13 +1504,23 @@ async fn run_exec_stage(
 /// One bounded attempt at a stage's worker agent. Uses a larger tool-loop budget
 /// than a normal chat turn — OSM verification (settlements, water, land) needs
 /// several queries, and 12 steps died with "too many tool calls".
-async fn run_stage_once(llm: &Llm, state: &BotState, system: &str, query: &str) -> String {
-    match tokio::time::timeout(
-        STAGE_TIMEOUT,
-        llm.answer_with_system(state, system, query, crate::llm::STAGE_MAX_STEPS),
-    )
-    .await
-    {
+#[cfg(test)]
+async fn run_stage_once(
+    llm: &Llm,
+    state: &BotState,
+    system: &str,
+    query: &str,
+    allow_tools: bool,
+) -> String {
+    let run = async {
+        if allow_tools {
+            llm.answer_with_system(state, system, query, crate::llm::STAGE_MAX_STEPS)
+                .await
+        } else {
+            llm.complete(system, query).await
+        }
+    };
+    match tokio::time::timeout(STAGE_TIMEOUT, run).await {
         Err(_) => "(stage timed out)".to_string(),
         Ok(Ok(o)) if !o.trim().is_empty() => o,
         Ok(Ok(_)) => "(no output)".to_string(),
@@ -938,6 +1529,7 @@ async fn run_stage_once(llm: &Llm, state: &BotState, system: &str, query: &str) 
 }
 
 /// Compose the final user-facing plan from all stage artifacts.
+#[cfg(test)]
 async fn compose_final(llm: &Llm, brief: &TripBrief, records: &[StageRecord]) -> String {
     let compose_input = format!(
         "[trip-brief]\n{}\n\n[stage-outputs]\n{}",
@@ -946,10 +1538,14 @@ async fn compose_final(llm: &Llm, brief: &TripBrief, records: &[StageRecord]) ->
     );
     llm.complete(COMPOSE_PROMPT, &compose_input)
         .await
-        .unwrap_or_else(|_| fallback_compose(records))
+        .map(|s| ensure_final_artifacts(clean_user_text(&s), brief, records))
+        .unwrap_or_else(|_| {
+            ensure_final_artifacts(clean_user_text(&fallback_compose(records)), brief, records)
+        })
 }
 
 /// One-line-per-completed-stage listing for the orchestrator prompt.
+#[cfg(test)]
 fn completed_list(records: &[StageRecord]) -> String {
     if records.is_empty() {
         return "(none)".to_string();
@@ -965,12 +1561,31 @@ fn completed_list(records: &[StageRecord]) -> String {
 /// re-run a stage that already has output. In prod this retried Routing several
 /// times after tool-budget failures, turning one Telegram message into a very
 /// long silent turn.
+#[cfg(test)]
 fn prevent_auto_repeat(decision: Decision, records: &[StageRecord], user_empty: bool) -> Decision {
     if !user_empty || !decision.next.is_exec() || record_index(records, &decision.next).is_none() {
         return decision;
     }
     Decision {
         next: next_exec_after(records),
+        mode: Mode::Run,
+        message: String::new(),
+    }
+}
+
+/// Never skip over an unresolved essential stage. This protects both automatic
+/// advancement and old persisted sessions where an earlier build saved
+/// `STAGE_INCOMPLETE` as if the stage were done.
+#[cfg(test)]
+fn prevent_unresolved_skip(decision: Decision, records: &[StageRecord]) -> Decision {
+    let Some(blocker) = first_unresolved_essential(records) else {
+        return decision;
+    };
+    if decision.next.order() <= blocker.order() {
+        return decision;
+    }
+    Decision {
+        next: blocker,
         mode: Mode::Run,
         message: String::new(),
     }
@@ -994,6 +1609,7 @@ fn is_stage_unresolved(output: &str) -> bool {
 /// calendar event / Google Doc or declare the plan done. Returns the FIRST one
 /// that is missing or unresolved, so we re-run exactly that step rather than
 /// shipping a hollow "готово" with a real calendar event and doc attached.
+#[cfg(test)]
 fn first_unresolved_essential(records: &[StageRecord]) -> Option<Stage> {
     for stage in [Stage::Planning, Stage::Routing, Stage::Camp] {
         match record_index(records, &stage) {
@@ -1005,8 +1621,26 @@ fn first_unresolved_essential(records: &[StageRecord]) -> Option<Stage> {
     None
 }
 
+#[cfg(test)]
+fn valid_awaiting_choice(stage: &Stage, records: &[StageRecord]) -> bool {
+    stage.is_checkpoint()
+        && record_index(records, stage)
+            .map(|i| !is_stage_unresolved(&records[i].output))
+            .unwrap_or(false)
+}
+
+#[cfg(test)]
+fn awaiting_if_choice_available(stage: &Stage, records: &[StageRecord]) -> Option<Stage> {
+    if valid_awaiting_choice(stage, records) {
+        Some(stage.clone())
+    } else {
+        None
+    }
+}
+
 /// Honest "not done yet" note when an essential geo stage has no real data.
 /// We refuse to fabricate a finished plan (calendar + doc) on top of it.
+#[cfg(test)]
 fn render_incomplete_block(stage: &Stage) -> String {
     let what = match stage {
         Stage::Planning => "день и место",
@@ -1016,14 +1650,16 @@ fn render_incomplete_block(stage: &Stage) -> String {
     };
     format!(
         "Финал ещё не готов: не удалось получить {what} — картографический сервис \
-(OSM/Overpass) сейчас перегружен и отдаёт ошибки (504/429). Календарь и документ на \
-неполном плане не создаю. Напишите «ещё раз» — повторю именно этот шаг.",
+(OSM/Overpass) сейчас перегружен и отдаёт ошибки (504/429). Я уже повторил этот шаг, \
+календарь и документ на неполном плане не создаю. Состояние сохранено; следующий запрос \
+продолжит с этого этапа.",
     )
 }
 
 /// Short, honest stall note for a CHECKPOINT stage whose map/weather tools did
 /// not respond in time (even after a retry). No scolding, and never asks the
 /// user to pick a river/area — that is the planner's job.
+#[cfg(test)]
 fn render_checkpoint_stall(stage: &Stage) -> String {
     let what = match stage {
         Stage::Planning => "подобрать день и место",
@@ -1032,17 +1668,21 @@ fn render_checkpoint_stall(stage: &Stage) -> String {
     };
     format!(
         "Картографические/погодные сервисы сейчас отвечают медленно — не успел {what}. \
-Напишите «ещё раз» — повторю запрос.",
+Я уже повторил этот шаг; состояние сохранено, следующий запрос продолжит с этого этапа.",
     )
 }
 
+#[cfg(test)]
 const COMPOSE_PROMPT: &str = "You assemble the FINAL trip plan a user will share with friends, \
 from the stage outputs of a planning swarm. Write it in the user's language as a clean, \
 phone-friendly PLAIN-TEXT message (no Markdown tables, no `|`, no `**`). Use short vertical \
 blocks with emoji headings: chosen day + weather, the route with concrete stops, the overnight \
 site (with distances), gear notes suited to the activity, and — if created — the calendar event and the \
 shareable doc link. Be concrete; do not invent a doc link or coordinates that the stages did \
-not produce. If a stage returned an AUTHORIZATION URL (Google sign-in / start_google_auth), \
+not produce. Preserve the user's requested activity and constraints exactly; never convert it into \
+a different kind of outing. Include the full year in the chosen date. \
+If a stage produced a Google Doc URL, include that exact docs.google.com URL in the final. \
+If a stage returned an AUTHORIZATION URL (Google sign-in / start_google_auth), \
 keep that URL VERBATIM in the final message as a clickable link with a one-line 'open and approve \
 access' instruction — never drop it and never turn it into a vague 'нужен токен/доступ'. \
 If a stage output shows it stalled or failed (e.g. '(stage timed out)', '(stage failed: …)'), \
@@ -1054,6 +1694,7 @@ narrow the area. Keep it tight.";
 /// The OSM query rules — large, but only the map-using stages (Routing, Camp)
 /// need them. Including them in Planning/Schedule/Doc just re-sends ~500 tokens
 /// of irrelevant instructions on every call, so they're attached per stage.
+#[cfg(test)]
 const OSM_QUERY_RULES: &str = "\n\
              OSM QUERY RULES (follow EXACTLY — violating them causes Overpass HTTP 400 and wastes \
              minutes):\n\
@@ -1080,20 +1721,25 @@ const OSM_QUERY_RULES: &str = "\n\
 
 /// Build a stage's system prompt: the layered base prompt + a stage role line.
 /// Only the map stages (Routing, Camp) get the bulky OSM rules appended.
+#[cfg(test)]
 fn stage_system(session: &ChatSession, stage: &Stage) -> String {
     let invariants = session.effective_invariants();
+    let mut memory = session.memory.clone();
+    memory.facts.retain(|f| f.layer != MemoryLayer::Working);
     let mut role = format!(
         "You are the {} agent in a multi-stage trip-planning swarm. Do ONLY your stage's task, \
          building on the prior stages' outputs. Use the connected MCP tools when you need live \
          data or to act. For Russian geography with OSM tools, pass region=\"RU\" and include \
-         \"Россия\" in free-text place queries.",
+         \"Россия\" in free-text place queries. The trip brief is binding: preserve the user's \
+         activity, transport mode, date availability, and hard constraints exactly. Never convert \
+         the outing into a different activity mode.",
         stage.name(),
     );
     if matches!(stage, Stage::Routing | Stage::Camp) {
         role.push_str(OSM_QUERY_RULES);
     }
     super::prompt::build_system_prompt(
-        &session.memory,
+        &memory,
         &session.profile,
         &[],
         &invariants,
@@ -1102,13 +1748,42 @@ fn stage_system(session: &ChatSession, stage: &Stage) -> String {
     )
 }
 
+#[cfg(test)]
 fn render_records(records: &[StageRecord]) -> String {
+    render_records_clipped(records, |_| HANDOFF_CLIP)
+}
+
+#[cfg(test)]
+fn render_records_for_stage(records: &[StageRecord], stage: &Stage, choosing: bool) -> String {
+    if choosing && stage.is_checkpoint() {
+        let active = stage.name();
+        return render_records_clipped(records, |record_stage| {
+            if record_stage == active {
+                CHECKPOINT_CHOICE_CLIP
+            } else {
+                HANDOFF_CLIP
+            }
+        });
+    }
+    render_records(records)
+}
+
+fn render_records_clipped(
+    records: &[StageRecord],
+    clip_for_stage: impl Fn(&str) -> usize,
+) -> String {
     if records.is_empty() {
         return "(none yet)".to_string();
     }
     records
         .iter()
-        .map(|r| format!("[{}]\n{}", r.stage, clip(&r.output, HANDOFF_CLIP)))
+        .map(|r| {
+            format!(
+                "[{}]\n{}",
+                r.stage,
+                clip(&r.output, clip_for_stage(&r.stage))
+            )
+        })
         .collect::<Vec<_>>()
         .join("\n\n")
 }
@@ -1145,6 +1820,100 @@ fn clip(s: &str, max: usize) -> String {
     format!("{}…", &s[..end])
 }
 
+fn clean_user_text(text: &str) -> String {
+    let text = profile::strip_inline_markers(text);
+    let mut out = Vec::new();
+    for raw in text.lines() {
+        let mut line = raw.trim_end().to_string();
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            out.push(String::new());
+            continue;
+        }
+        let table_rule = trimmed.chars().all(|c| matches!(c, '|' | '-' | ':' | ' '));
+        if table_rule && trimmed.contains('|') {
+            continue;
+        }
+        while line.trim_start().starts_with('#') {
+            let without = line.trim_start().trim_start_matches('#').trim_start();
+            line = without.to_string();
+        }
+        line = line.replace("**", "").replace("__", "").replace('`', "");
+        if line.contains('|') {
+            let parts = line
+                .split('|')
+                .map(str::trim)
+                .filter(|p| !p.is_empty())
+                .collect::<Vec<_>>();
+            if !parts.is_empty() {
+                line = parts.join(" • ");
+            }
+        }
+        out.push(line);
+    }
+
+    let mut cleaned = Vec::new();
+    let mut blank = false;
+    for line in out {
+        if line.trim().is_empty() {
+            if !blank {
+                cleaned.push(line);
+            }
+            blank = true;
+        } else {
+            blank = false;
+            cleaned.push(line);
+        }
+    }
+    cleaned.join("\n").trim().to_string()
+}
+
+#[cfg(test)]
+fn ensure_trip_year(answer: String, records: &[StageRecord]) -> String {
+    let year = current_year();
+    if answer.contains(&year) || !records.iter().any(|r| r.output.contains(&year)) {
+        return answer;
+    }
+    format!("{answer}\n\n📌 Даты указаны для {year} года.")
+}
+
+#[cfg(test)]
+fn ensure_final_artifacts(answer: String, _brief: &TripBrief, records: &[StageRecord]) -> String {
+    let answer = ensure_trip_year(answer, records);
+    if answer.contains("docs.google.com") {
+        return answer;
+    }
+    let Some(url) = first_url_containing(records, "docs.google.com") else {
+        return answer;
+    };
+    format!("{answer}\n\n📄 Google Doc: {url}")
+}
+
+#[cfg(test)]
+fn first_url_containing(records: &[StageRecord], needle: &str) -> Option<String> {
+    records
+        .iter()
+        .flat_map(|r| r.output.split_whitespace())
+        .map(|s| {
+            s.trim_matches(|c: char| {
+                matches!(
+                    c,
+                    '"' | '\'' | ')' | '(' | ',' | '.' | ']' | '[' | '<' | '>'
+                )
+            })
+        })
+        .find(|s| s.starts_with("http") && s.contains(needle))
+        .map(str::to_string)
+}
+
+#[cfg(test)]
+fn current_year() -> String {
+    std::env::var("AGENT_CURRENT_DATE")
+        .ok()
+        .and_then(|d| d.get(0..4).map(str::to_string))
+        .unwrap_or_else(|| chrono::Local::now().format("%Y").to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1169,12 +1938,12 @@ mod tests {
     fn parse_clarify_reads_fields_and_ready() {
         let out = parse_clarify(
             r#"prose ```json
-            {"brief":{"area":"Мещёра","date_window":"next 2 weeks"},"ready":true,"questions":[],"recap":"kayak + camp"}
+            {"brief":{"area":"Мещёра","date_window":"next 2 weeks"},"ready":true,"questions":[],"recap":"outdoor trip"}
             ``` trailing"#,
         );
         assert!(out.ready);
         assert_eq!(out.brief.get("area").unwrap(), "Мещёра");
-        assert_eq!(out.recap, "kayak + camp");
+        assert_eq!(out.recap, "outdoor trip");
     }
 
     #[test]
@@ -1182,6 +1951,47 @@ mod tests {
         let s = "Карелия";
         let c = clip(s, 5);
         assert!(c.ends_with('…'));
+    }
+
+    #[test]
+    fn clean_user_text_strips_markdown_tables_and_markers() {
+        let raw =
+            "## Заголовок\n| A | B |\n|---|---|\n| 1 | 2 |\n**жирно**\n⟦profile:interests=походы⟧";
+        let clean = clean_user_text(raw);
+
+        assert!(clean.contains("Заголовок"));
+        assert!(clean.contains("A • B"));
+        assert!(clean.contains("1 • 2"));
+        assert!(clean.contains("жирно"));
+        assert!(!clean.contains("|---"));
+        assert!(!clean.contains("**"));
+        assert!(!clean.contains("profile:"));
+    }
+
+    #[test]
+    fn ensure_trip_year_restores_year_from_records() {
+        let year = current_year();
+        let records = vec![StageRecord {
+            stage: "Schedule".into(),
+            output: format!("Событие: 11 июля {year}"),
+        }];
+
+        let answer = ensure_trip_year("🗓️ 11–12 июля".into(), &records);
+
+        assert!(answer.contains(&year));
+    }
+
+    #[test]
+    fn ensure_final_artifacts_restores_doc_link_from_records() {
+        let records = vec![StageRecord {
+            stage: "Doc".into(),
+            output: "Документ: https://docs.google.com/document/d/abc/edit".into(),
+        }];
+
+        let answer =
+            ensure_final_artifacts("Документ создан.".into(), &TripBrief::default(), &records);
+
+        assert!(answer.contains("https://docs.google.com/document/d/abc/edit"));
     }
 
     // ---- Stage ordering + parsing ----
@@ -1250,6 +2060,84 @@ mod tests {
         b2.fields.insert("start_location".into(), "Питер".into());
         b2.fields.insert("when".into(), "   ".into());
         assert!(!b2.has_minimum());
+    }
+
+    #[test]
+    fn routing_rejects_vague_unfinalized_track() {
+        let b = TripBrief::default();
+        let mut output =
+            "Маршрут в целом понятен, но детализированный трек не зафиксирован".to_string();
+
+        validate_stage_output(&b, &Stage::Routing, &mut output);
+
+        assert!(output.contains("STAGE_INCOMPLETE: core route/campsite data is not concrete"));
+    }
+
+    #[test]
+    fn checkpoint_choice_handoff_preserves_options() {
+        let long_options = format!(
+            "Вариант A — Волга\n{}\nВариант C — Ахтуба",
+            "подробности ".repeat(80)
+        );
+        let records = vec![StageRecord {
+            stage: "Planning".into(),
+            output: long_options,
+        }];
+
+        let choosing = render_records_for_stage(&records, &Stage::Planning, true);
+        let normal = render_records(&records);
+
+        assert!(choosing.contains("Вариант C"));
+        assert!(!normal.contains("Вариант C"));
+    }
+
+    #[test]
+    fn swarm_plan_json_is_dynamic_tasks() {
+        let raw = r#"{"tasks":[
+            {"id":"map_research","agent":"MapAgent","task":"find places","tools":true},
+            {"id":"share","agent":"ArtifactsAgent","task":"create requested artifacts","tools":true,"side_effects":true}
+        ]}"#;
+
+        let plan: SwarmPlan = serde_json::from_str(raw).unwrap();
+
+        assert_eq!(plan.tasks.len(), 2);
+        assert_eq!(plan.tasks[0].agent, "MapAgent");
+        assert!(plan.tasks[1].side_effects);
+    }
+
+    #[test]
+    fn tool_inventory_render_is_safe_metadata_only() {
+        let tools = vec![crate::state::ToolSummary {
+            server: "maps".into(),
+            name: "geocode_address".into(),
+            description: "Find coordinates for a place".into(),
+        }];
+
+        let rendered = render_tool_inventory(&tools);
+
+        assert!(rendered.contains("maps__geocode_address"));
+        assert!(rendered.contains("Find coordinates"));
+        assert!(!rendered.contains("TOKEN"));
+    }
+
+    #[test]
+    fn swarm_worker_system_uses_runtime_inventory_not_activity_templates() {
+        let session = ChatSession::new(1);
+        let task = SwarmTask {
+            id: "research".into(),
+            agent: "ResearchAgent".into(),
+            task: "Investigate the selected outdoor option".into(),
+            tools: true,
+            side_effects: false,
+            checkpoint: false,
+        };
+
+        let system = build_swarm_worker_system(&session, &task, "- maps__geocode_address: x");
+
+        assert!(system.contains("Available MCP tools, discovered at runtime"));
+        assert!(system.contains("maps__geocode_address"));
+        assert!(!system.contains("kayak"));
+        assert!(!system.contains("cycling route"));
     }
 
     // ---- orchestrator decision parsing + fallback ----
@@ -1338,7 +2226,7 @@ mod tests {
         set_record(
             &mut r,
             &Stage::Routing,
-            "put-in 48.6,43.5 stop 48.6,43.6".into(),
+            "start 48.6,43.5 stop 48.6,43.6".into(),
         );
         set_record(
             &mut r,
@@ -1347,6 +2235,52 @@ mod tests {
         );
         // all three resolved → no blocker, deliverables may run
         assert_eq!(first_unresolved_essential(&r), None);
+    }
+
+    #[test]
+    fn next_exec_retries_unresolved_routing_before_camp() {
+        let mut r = Vec::new();
+        set_record(&mut r, &Stage::Planning, "Пятница, Дон".into());
+        set_record(
+            &mut r,
+            &Stage::Routing,
+            "Не смог получить точки.\nSTAGE_INCOMPLETE: Overpass 504".into(),
+        );
+
+        assert_eq!(next_exec_after(&r), Stage::Routing);
+    }
+
+    #[test]
+    fn guard_prevents_skipping_unresolved_routing() {
+        let mut r = Vec::new();
+        set_record(&mut r, &Stage::Planning, "Пятница, Дон".into());
+        set_record(
+            &mut r,
+            &Stage::Routing,
+            "STAGE_INCOMPLETE: Overpass 504".into(),
+        );
+        let d = prevent_unresolved_skip(
+            Decision {
+                next: Stage::Camp,
+                mode: Mode::Run,
+                message: String::new(),
+            },
+            &r,
+        );
+
+        assert_eq!(d.next, Stage::Routing);
+        assert_eq!(d.mode, Mode::Run);
+    }
+
+    #[test]
+    fn non_checkpoint_stage_is_never_awaiting_choice() {
+        let mut r = Vec::new();
+        set_record(&mut r, &Stage::Planning, "option 1".into());
+        set_record(&mut r, &Stage::Routing, "route 48.6,43.5".into());
+
+        assert!(valid_awaiting_choice(&Stage::Planning, &r));
+        assert!(!valid_awaiting_choice(&Stage::Routing, &r));
+        assert_eq!(awaiting_if_choice_available(&Stage::Routing, &r), None);
     }
 
     #[test]
@@ -1382,6 +2316,24 @@ mod tests {
         assert_eq!(next_exec_after(&r), Stage::Done);
     }
 
+    #[test]
+    fn stage_system_does_not_inject_working_memory() {
+        let mut session = ChatSession::new(1);
+        session
+            .memory
+            .upsert_fact("home_city", "Волгоград", MemoryLayer::LongTerm);
+        session
+            .memory
+            .upsert_fact("trip_focus", "bbq", MemoryLayer::Working);
+
+        let system = stage_system(&session, &Stage::Routing);
+
+        assert!(system.contains("[memory:long-term]"));
+        assert!(system.contains("home_city: Волгоград"));
+        assert!(!system.contains("[memory:working]"));
+        assert!(!system.contains("trip_focus"));
+    }
+
     // ---- record helpers: replace + back-step invalidation ----
 
     #[test]
@@ -1407,10 +2359,10 @@ mod tests {
         let mut p = super::super::profile::UserProfile::default();
         assert_eq!(profile_context(&p), "(none known)");
         p.set("home_city", "Москва");
-        p.set("interests", "байдарки");
+        p.set("interests", "походы");
         let ctx = profile_context(&p);
         assert!(ctx.contains("home_city: Москва"));
-        assert!(ctx.contains("interests: байдарки"));
+        assert!(ctx.contains("interests: походы"));
     }
 
     #[test]

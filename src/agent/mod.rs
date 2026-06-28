@@ -1,7 +1,8 @@
 //! Agent runtime ported from ai-playground (`Ai teach`): layered sticky-facts
 //! memory, user profile, code-checked invariants, a layered PromptBuilder and a
-//! multi-agent travel-weather flow. The orchestrator is a deterministic code
-//! router; the LLM fills artifacts and answers.
+//! dynamic multi-agent outdoor planning swarm. The swarm discovers available
+//! MCP tools at runtime, delegates isolated worker tasks, verifies evidence
+//! before side effects, and then composes the answer.
 
 pub mod context_budget;
 pub mod flow;
@@ -70,8 +71,8 @@ pub async fn run_turn(
     };
 
     // --- trip-planning swarm routing (stateful, suspends across turns) ---
-    // The flow runs its own clarify → plan → route → camp → schedule → doc
-    // orchestration with user checkpoints, so it bypasses the single-shot path.
+    // The flow runs a dynamic agent swarm: brief → short options → planner-built
+    // worker tasks → verifier-gated artifacts → final answer.
     if in_flow || route == router::Route::Trip {
         if !in_flow {
             session.trip = Some(flow::TripFlowState::start());

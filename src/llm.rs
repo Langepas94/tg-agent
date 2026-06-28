@@ -176,6 +176,9 @@ impl Llm {
         }
         messages.push(json!({ "role": "user", "content": user_text }));
 
+        let mut side_effect_calls: std::collections::HashSet<(String, String)> =
+            std::collections::HashSet::new();
+
         for _ in 0..max_steps {
             // Keep the growing tool transcript under the model's window. MCP
             // results (multi-city forecasts) can overflow it mid-loop; clip the
@@ -228,24 +231,36 @@ impl Llm {
                                 None => format!("error: tool '{name}' is not available"),
                                 Some((server, real_tool)) => {
                                     normalize_tool_args(server, real_tool, &mut args);
-                                    let period = args
-                                        .as_ref()
-                                        .and_then(|m| m.get("period"))
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("1h")
-                                        .to_string();
-                                    let res = state.call_tool(server, real_tool, args).await;
-                                    // Record/clear durable push-subs so they survive restarts.
-                                    if let (Some(cid), Ok(_)) = (chat_id, &res) {
-                                        if real_tool == "subscribe_summaries" {
-                                            state.add_push_sub(cid, server.clone(), period).await;
-                                        } else if real_tool == "unsubscribe_summaries" {
-                                            state.remove_push_subs(cid, Some(server)).await;
+                                    let side_effect_key = (server.clone(), real_tool.clone());
+                                    if is_single_execution_tool(real_tool)
+                                        && !side_effect_calls.insert(side_effect_key)
+                                    {
+                                        format!(
+                                            "error: duplicate {server}/{real_tool} call blocked; \
+                                             use the earlier tool result and answer now"
+                                        )
+                                    } else {
+                                        let period = args
+                                            .as_ref()
+                                            .and_then(|m| m.get("period"))
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("1h")
+                                            .to_string();
+                                        let res = state.call_tool(server, real_tool, args).await;
+                                        // Record/clear durable push-subs so they survive restarts.
+                                        if let (Some(cid), Ok(_)) = (chat_id, &res) {
+                                            if real_tool == "subscribe_summaries" {
+                                                state
+                                                    .add_push_sub(cid, server.clone(), period)
+                                                    .await;
+                                            } else if real_tool == "unsubscribe_summaries" {
+                                                state.remove_push_subs(cid, Some(server)).await;
+                                            }
                                         }
-                                    }
-                                    match res {
-                                        Ok(out) => truncate(&out, TOOL_RESULT_CAP),
-                                        Err(e) => format!("error: {e}"),
+                                        match res {
+                                            Ok(out) => truncate(&out, TOOL_RESULT_CAP),
+                                            Err(e) => format!("error: {e}"),
+                                        }
                                     }
                                 }
                             }
@@ -300,6 +315,10 @@ impl Llm {
             Ok(answer)
         }
     }
+}
+
+fn is_single_execution_tool(real_tool: &str) -> bool {
+    matches!(real_tool, "create_doc" | "manage_event" | "create_event")
 }
 
 /// Clip the running tool-loop transcript back under the model's compaction
@@ -748,6 +767,10 @@ fn normalize_tool_args(server: &str, tool: &str, args: &mut Option<rmcp::model::
         }
         clamp_osm_bbox(map);
     }
+
+    if matches!(tool, "explore_area" | "find_nearby_places") {
+        clamp_radius_meters(map, 5_000.0);
+    }
 }
 
 /// Max bbox side, in degrees, allowed through to Overpass. A broad-tag query
@@ -787,6 +810,18 @@ fn clamp_osm_bbox(map: &mut rmcp::model::JsonObject) {
     bbox.insert("maxLat".into(), json!(nlat1));
     bbox.insert("minLon".into(), json!(nlon0));
     bbox.insert("maxLon".into(), json!(nlon1));
+}
+
+fn clamp_radius_meters(map: &mut rmcp::model::JsonObject, max: f64) {
+    let Some(radius) = map.get_mut("radius") else {
+        return;
+    };
+    let Some(r) = radius.as_f64() else {
+        return;
+    };
+    if r > max {
+        *radius = json!(max);
+    }
 }
 
 fn value_contains_cyrillic(v: &Value) -> bool {
@@ -975,6 +1010,15 @@ mod tests {
     }
 
     #[test]
+    fn high_impact_create_tools_are_single_execution() {
+        assert!(is_single_execution_tool("create_doc"));
+        assert!(is_single_execution_tool("manage_event"));
+        assert!(is_single_execution_tool("create_event"));
+        assert!(!is_single_execution_tool("inspect_doc_structure"));
+        assert!(!is_single_execution_tool("set_drive_file_permissions"));
+    }
+
+    #[test]
     fn map_geocode_cyrillic_defaults_to_ru() {
         let mut args = parse_args(r#"{"address":"Волгоград"}"#);
         normalize_tool_args("maps", "geocode_address", &mut args);
@@ -1073,6 +1117,17 @@ mod tests {
         let b = &args.unwrap()["bbox"];
         assert_eq!(b["minLat"].as_f64().unwrap(), 50.20);
         assert_eq!(b["maxLon"].as_f64().unwrap(), 43.65);
+    }
+
+    #[test]
+    fn map_radius_clamped_for_explore_area() {
+        let mut args = obj(json!({
+            "lat": 48.7,
+            "lon": 44.5,
+            "radius": 50000
+        }));
+        normalize_tool_args("maps", "explore_area", &mut args);
+        assert_eq!(args.unwrap()["radius"].as_f64().unwrap(), 5000.0);
     }
 
     #[test]

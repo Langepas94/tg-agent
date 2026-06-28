@@ -46,6 +46,11 @@ impl ChatSession {
             self.invariants.clone()
         }
     }
+
+    /// Drop legacy auto-extracted noise before it reaches the prompt again.
+    pub fn sanitize(&mut self) -> bool {
+        self.memory.sanitize()
+    }
 }
 
 /// Directory holding per-chat session files: `$SESSIONS_DIR` or `./sessions`.
@@ -62,10 +67,16 @@ fn session_path(chat_id: i64) -> PathBuf {
 pub fn load(chat_id: i64) -> ChatSession {
     let path = session_path(chat_id);
     match std::fs::read_to_string(&path) {
-        Ok(s) => serde_json::from_str(&s).unwrap_or_else(|e| {
-            tracing::warn!("session {chat_id} corrupt ({e}); starting fresh");
-            ChatSession::new(chat_id)
-        }),
+        Ok(s) => {
+            let mut session = serde_json::from_str(&s).unwrap_or_else(|e| {
+                tracing::warn!("session {chat_id} corrupt ({e}); starting fresh");
+                ChatSession::new(chat_id)
+            });
+            if session.sanitize() {
+                let _ = save(&session);
+            }
+            session
+        }
         Err(_) => ChatSession::new(chat_id),
     }
 }

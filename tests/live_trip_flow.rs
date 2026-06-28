@@ -78,6 +78,44 @@ async fn setup() -> (Arc<Llm>, BotState) {
         .await
         .expect("connect maps MCP");
 
+    let google_env_keys = [
+        "GOOGLE_OAUTH_CLIENT_ID",
+        "GOOGLE_OAUTH_CLIENT_SECRET",
+        "OAUTHLIB_INSECURE_TRANSPORT",
+        "USER_GOOGLE_EMAIL",
+        "WORKSPACE_MCP_BASE_URI",
+        "WORKSPACE_MCP_PORT",
+        "GOOGLE_OAUTH_REDIRECT_URI",
+        "WORKSPACE_MCP_HOST",
+        "WORKSPACE_MCP_PORT_FALLBACK_COUNT",
+    ];
+    let google_env = google_env_keys
+        .iter()
+        .filter_map(|k| std::env::var(k).ok().map(|v| ((*k).to_string(), v)))
+        .collect::<Vec<_>>();
+    assert!(
+        google_env
+            .iter()
+            .any(|(k, _)| k == "GOOGLE_OAUTH_CLIENT_ID"),
+        "set Google MCP env from the VPS state before running this live suite"
+    );
+    state
+        .connect_mcp(ConnectParams {
+            name: "google".into(),
+            url: String::new(),
+            auth: None,
+            headers: vec![],
+            command: std::env::var("GOOGLE_MCP_COMMAND")
+                .ok()
+                .map(|s| s.split_whitespace().map(str::to_string).collect())
+                .unwrap_or_else(|| {
+                    vec!["uvx".into(), "workspace-mcp".into(), "--single-user".into()]
+                }),
+            env: google_env,
+        })
+        .await
+        .expect("connect Google MCP");
+
     (llm, state)
 }
 
@@ -96,25 +134,118 @@ async fn step(
         println!("──── trace ────\n{}", r.trace.join("\n"));
     }
     println!("──────── BOT ────────\n{}", r.answer);
+    assert_plain_telegram(&r.answer);
     let done = session.trip.is_none();
     (r.answer, done)
 }
 
-/// Drive the flow to completion: after each pause, pick the first option / push
-/// forward, capped so a stuck flow can't hang the test forever.
-async fn drive(llm: &Llm, state: &BotState, session: &mut ChatSession, opener: &str) {
-    let (_r, mut done) = step(llm, state, session, opener).await;
+fn assert_plain_telegram(answer: &str) {
+    assert!(
+        !answer.contains("⟦profile:"),
+        "profile marker leaked: {answer}"
+    );
+    assert!(!answer.contains("**"), "markdown bold leaked: {answer}");
+    assert!(!answer.contains("|---"), "markdown table leaked: {answer}");
+    assert!(!answer.contains("```"), "code fence leaked: {answer}");
+    let lower = answer.to_lowercase();
+    assert!(
+        !lower.contains("пятница") && !lower.contains("пт,") && !lower.contains("пт "),
+        "weekend-only trip offered a Friday: {answer}"
+    );
+    assert!(
+        !lower.contains("не удалось проверить") && !lower.contains("не проверено"),
+        "flow exposed an unverified hard constraint as a normal answer: {answer}"
+    );
+}
+
+fn assert_final_concrete(answer: &str) {
+    let lower = answer.to_lowercase();
+    assert!(
+        !lower.contains("не зафиксирован")
+            && !lower.contains("не зафиксирована")
+            && !lower.contains("требует уточнения")
+            && !lower.contains("маршрутная стадия не заверш")
+            && !lower.contains("детализированный трек"),
+        "final answer is not concrete enough for a completed flow: {answer}"
+    );
+}
+
+async fn drive_assert_done(
+    llm: &Llm,
+    state: &BotState,
+    session: &mut ChatSession,
+    opener: &str,
+) -> String {
+    let (mut answer, mut done) = step(llm, state, session, opener).await;
     let mut guard = 0;
     while !done && guard < 8 {
         guard += 1;
-        // Generic forward push that works at any checkpoint (pick option / confirm).
-        let next = "Давай первый вариант, выходные 11-12 июля. Двигаемся дальше.";
-        let (_r, d) = step(llm, state, session, next).await;
+        let next = "Давай первый вариант. Подтверждаю, двигайся дальше.";
+        let (r, d) = step(llm, state, session, next).await;
+        answer = r;
         done = d;
     }
-    println!(
-        "\n==== FLOW {} after {guard} follow-ups ====",
-        if done { "DONE" } else { "STILL OPEN" }
+    assert!(done, "flow did not finish after {guard} follow-ups");
+    answer
+}
+
+#[tokio::test]
+#[ignore]
+async fn live_full_kayak_trip_creates_google_artifacts() {
+    let (llm, state) = setup().await;
+    let mut session = ChatSession::new(9101);
+    session.profile.set("home_city", "Волгоград");
+    let email = std::env::var("USER_GOOGLE_EMAIL")
+        .unwrap_or_else(|_| "artyom.tyurmorezov@gmail.com".into());
+    session.profile.set("email", &email);
+    session.profile.set("google_email", &email);
+
+    let final_answer = drive_assert_done(
+        &llm,
+        &state,
+        &mut session,
+        "Хотим сходить в поход на байдарках, посмотри в какой день лучше это сделать в течение следующих двух недель (мы можем только на выходных). И в каких местах.\n\n\
+         Сплав с одной ночевкой, команда больше хочет шашлыки, чем грести. Ночлег будет в палатках, чтобы в радиусе минимум 1км не было турбаз,сел и так далее. Вода должна быть рядом, максимум в 30 метрах от ночлега.\n\n\
+         Составь конкретный план с точками остановки и ночлега, событие в календаре, потом из гугл док поделюсь с друзьями.",
+    )
+    .await;
+
+    assert_final_concrete(&final_answer);
+    let lower = final_answer.to_lowercase();
+    assert!(
+        lower.contains("calendar")
+            || lower.contains("календар")
+            || lower.contains("event")
+            || lower.contains("событ"),
+        "final answer does not mention calendar/event: {final_answer}"
+    );
+    assert!(
+        final_answer.contains("https://docs.google.com/"),
+        "final answer does not include the shareable Google Doc link: {final_answer}"
+    );
+    assert!(
+        !final_answer.contains("2025"),
+        "trip was scheduled in the past: {final_answer}"
+    );
+    assert!(
+        final_answer.contains("2026"),
+        "final answer should include the resolved 2026 trip year: {final_answer}"
+    );
+    assert!(
+        lower.contains("байдар")
+            || lower.contains("сплав")
+            || lower.contains("греб")
+            || lower.contains("put-in"),
+        "final answer lost the kayaking/paddling activity: {final_answer}"
+    );
+    assert!(
+        !lower.contains("авто-пеш") && !lower.contains("пеший выезд"),
+        "final answer converted the kayaking trip into a walking/car trip: {final_answer}"
+    );
+    assert!(
+        (final_answer.contains('4') && final_answer.contains('5'))
+            || (final_answer.contains("11") && final_answer.contains("12")),
+        "final answer should use a Saturday-Sunday pair in the next two weeks: {final_answer}"
     );
 }
 
@@ -124,7 +255,7 @@ async fn live_water_trip_end_to_end() {
     let (llm, state) = setup().await;
     let mut session = ChatSession::new(9001);
     session.profile.set("home_city", "Волгоград");
-    drive(
+    let final_answer = drive_assert_done(
         &llm,
         &state,
         &mut session,
@@ -133,6 +264,24 @@ async fn live_water_trip_end_to_end() {
          вода максимум в 30 м. Дай план с точками и стоянкой.",
     )
     .await;
+    assert_final_concrete(&final_answer);
+    let lower = final_answer.to_lowercase();
+    assert!(
+        lower.contains("байдар")
+            || lower.contains("каяк")
+            || lower.contains("сплав")
+            || lower.contains("греб"),
+        "water trip lost paddling semantics: {final_answer}"
+    );
+    assert!(
+        lower.contains("30") && (lower.contains("вод") || lower.contains("берег")),
+        "water-distance constraint missing from final answer: {final_answer}"
+    );
+    assert!(
+        (lower.contains("1") && lower.contains("км"))
+            && (lower.contains("турбаз") || lower.contains("сел") || lower.contains("посел")),
+        "isolation constraint missing from final answer: {final_answer}"
+    );
 }
 
 #[tokio::test]
@@ -143,7 +292,7 @@ async fn live_cycling_trip_end_to_end_no_water_hardcode() {
     session.profile.set("home_city", "Волгоград");
     // A cycling trip never mentions water — the stages must NOT invent a water
     // requirement or talk about rivers/banks/put-in.
-    drive(
+    let final_answer = drive_assert_done(
         &llm,
         &state,
         &mut session,
@@ -151,4 +300,18 @@ async fn live_cycling_trip_end_to_end_no_water_hardcode() {
          Команда любительская, спокойный темп. Дай маршрут с точками и местом ночёвки.",
     )
     .await;
+    assert_final_concrete(&final_answer);
+    let lower = final_answer.to_lowercase();
+    assert!(
+        lower.contains("вел") || lower.contains("bike") || lower.contains("cycling"),
+        "cycling trip lost cycling semantics: {final_answer}"
+    );
+    assert!(
+        !lower.contains("байдар")
+            && !lower.contains("каяк")
+            && !lower.contains("сплав")
+            && !lower.contains("put-in")
+            && !lower.contains("take-out"),
+        "cycling trip was converted into a paddling route: {final_answer}"
+    );
 }
