@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use teloxide::{prelude::*, utils::command::BotCommands};
-use tg_agent::{bot, config, llm::Llm, persist, scheduler, state};
+use teloxide::{prelude::*, types::BotCommand};
+use tg_agent::{admin, bot, config, llm::Llm, persist, scheduler, state};
 use tracing::{info, warn};
 
 #[tokio::main]
@@ -30,11 +30,12 @@ async fn main() -> Result<()> {
             None
         }
     };
-    let state = state::BotState::with_llm(tx, llm);
+    let state = state::BotState::with_llm_and_password(tx, llm, cfg.bot_password.clone());
 
     let bot = Bot::new(&cfg.telegram_token);
-    bot.set_my_commands(bot::Command::bot_commands()).await?;
-    info!("Bot commands registered");
+    bot.set_my_commands(vec![BotCommand::new("start", "unlock the bot")])
+        .await?;
+    info!("Public bot command registered");
 
     // Store the bot handle so watches/agent meta-tools can post to chats.
     state.set_bot(bot.clone()).await;
@@ -43,6 +44,16 @@ async fn main() -> Result<()> {
     restore_state(&state).await;
 
     scheduler::spawn(bot.clone(), state.clone());
+    if let Some(addr) = cfg.admin_addr.clone() {
+        admin::spawn(
+            state.clone(),
+            admin::AdminConfig {
+                addr,
+                username: cfg.admin_username.clone(),
+                password: cfg.admin_password.clone(),
+            },
+        );
+    }
 
     info!("Dispatcher starting");
     Dispatcher::builder(bot, bot::handler_schema())
@@ -62,6 +73,8 @@ async fn restore_state(state: &state::BotState) {
         && saved.subscribers.is_empty()
         && saved.watches.is_empty()
         && saved.push_subs.is_empty()
+        && saved.access.authorized_chat_ids.is_empty()
+        && saved.access.root_chat_id.is_none()
     {
         return;
     }
@@ -74,6 +87,7 @@ async fn restore_state(state: &state::BotState) {
     );
 
     state.set_next_watch_id(saved.next_watch_id);
+    state.restore_access(saved.access).await;
 
     for id in saved.subscribers {
         state.subscribe(id).await;
