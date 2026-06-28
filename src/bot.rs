@@ -50,12 +50,9 @@ fn cmd(name: &str, description: &str) -> BotCommand {
     BotCommand::new(name, description)
 }
 
-fn public_commands() -> Vec<BotCommand> {
-    vec![cmd("start", "unlock the bot")]
-}
-
-fn user_commands() -> Vec<BotCommand> {
+fn base_commands() -> Vec<BotCommand> {
     vec![
+        cmd("start", "unlock the bot"),
         cmd("help", "show help"),
         cmd("profile", "view or set profile"),
         cmd("info", "view or save extra info"),
@@ -69,7 +66,7 @@ fn user_commands() -> Vec<BotCommand> {
 }
 
 fn root_commands() -> Vec<BotCommand> {
-    let mut commands = user_commands();
+    let mut commands = base_commands();
     commands.extend([
         cmd("connect", "connect an MCP server"),
         cmd("mcps", "list MCP servers"),
@@ -82,7 +79,11 @@ fn root_commands() -> Vec<BotCommand> {
 }
 
 pub async fn set_public_commands(bot: &Bot) -> anyhow::Result<()> {
-    bot.set_my_commands(public_commands()).await?;
+    let commands = base_commands();
+    bot.set_my_commands(commands.clone()).await?;
+    bot.set_my_commands(commands)
+        .scope(BotCommandScope::AllPrivateChats)
+        .await?;
     Ok(())
 }
 
@@ -90,7 +91,7 @@ pub async fn set_chat_commands(bot: &Bot, chat: ChatId, is_root: bool) -> anyhow
     let commands = if is_root {
         root_commands()
     } else {
-        user_commands()
+        base_commands()
     };
     bot.set_my_commands(commands)
         .scope(BotCommandScope::Chat {
@@ -109,7 +110,11 @@ pub async fn sync_authorized_command_menus(bot: &Bot, state: &BotState) -> anyho
         }
     }
     for chat_id in chat_ids {
-        set_chat_commands(bot, ChatId(chat_id), access.root_chat_id == Some(chat_id)).await?;
+        if let Err(e) =
+            set_chat_commands(bot, ChatId(chat_id), access.root_chat_id == Some(chat_id)).await
+        {
+            tracing::warn!("sync commands for chat {chat_id}: {e:#}");
+        }
     }
     Ok(())
 }
