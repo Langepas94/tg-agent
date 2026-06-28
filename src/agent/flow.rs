@@ -205,17 +205,24 @@ fn user_forces_go(text: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 const CLARIFY_PROMPT: &str = "You are the CLARIFY agent of an outdoor-trip planner \
-(hikes, kayak/canoe trips, camping, weekend getaways). You receive the brief gathered \
-so far and the user's newest message. \
-MERGE any new facts into the brief. Critical slots to plan a trip: \
-`area` (start region / where), `date_window` (when, even a rough range), and for overnight \
-trips `nights`. Useful extras: `party` (size + how prepared/fit), `priorities` (what they \
-care about, e.g. relaxing/BBQ over distance), `constraints` (e.g. campsite far from \
-civilization, water nearby), `transport`, `gear`. \
-Decide `ready=true` only when at least `area` and `date_window` are known. \
-If not ready, ask up to 3 SHORT friendly questions for the MOST important missing facts only — \
-never re-ask something already in the brief. \
-Reply in the user's language. \
+(hikes, kayak/canoe trips, camping, weekend getaways). You receive the user's known profile, \
+the brief gathered so far, and the user's newest message. MERGE any new facts into the brief. \
+\
+CORE PRINCIPLE: the planning agents decide WHERE to go (which river/route), WHICH day, and the \
+campsite — that is the whole point of the assistant. NEVER ask the user to choose the river, the \
+exact route, the specific day, or the campsite; do NOT ask for things already stated in the \
+message or present in the profile/brief. \
+\
+The ONLY facts to clarify are ones that only the user can know AND are still missing: \
+1) their home city / start region — but if the profile has a home city, use it as `area` and do \
+NOT ask; 2) the date window, if the message gives none; 3) group size / experience level, if not \
+implied; 4) any hard must-haves the user cares about (e.g. campsite far from civilization, water \
+nearby). If the message already conveys these (e.g. 'команда неподготовленная, хочет шашлык', \
+'одна ночёвка', 'в ближайшие 2 недели', 'вода в 30 м'), mark them filled — do NOT re-ask. \
+\
+Set `ready=true` as soon as you have a start region (from profile or message) and a rough date \
+window; everything else the planners infer. Only when something essential is genuinely missing, \
+ask up to 2 SHORT questions for it. Reply in the user's language. \
 Return ONLY JSON: {\"brief\":{\"key\":\"value\",...},\"ready\":bool,\"questions\":[\"...\"],\
 \"recap\":\"one short line summarizing the trip so far\"}.";
 
@@ -229,6 +236,20 @@ struct ClarifyOut {
     questions: Vec<String>,
     #[serde(default)]
     recap: String,
+}
+
+/// Render the user's profile as context for the Clarify agent, so it never asks
+/// for facts the profile already holds (home city, language, interests, …).
+fn profile_context(profile: &super::profile::UserProfile) -> String {
+    if profile.fields.is_empty() {
+        return "(none known)".to_string();
+    }
+    profile
+        .fields
+        .iter()
+        .map(|(k, v)| format!("- {k}: {v}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Parse the clarify agent's JSON (lenient: tolerates fences / surrounding prose).
@@ -570,7 +591,22 @@ pub async fn advance(
         match decision.next {
             // ---- Clarify: dedicated agent extracts slots / asks questions ----
             Stage::Clarify => {
-                let input = format!("Brief so far:\n{}\n\nUser message:\n{umsg}", brief.render());
+                // Seed the start region from the user's known home city so we
+                // never ask for something the profile already holds.
+                if !brief.has_minimum() {
+                    if let Some(home) = session.profile.fields.get("home_city") {
+                        if !home.trim().is_empty()
+                            && !brief.fields.keys().any(|k| k.contains("area"))
+                        {
+                            brief.fields.insert("area".into(), format!("около {home}"));
+                        }
+                    }
+                }
+                let input = format!(
+                    "Known user profile:\n{}\n\nBrief so far:\n{}\n\nUser message:\n{umsg}",
+                    profile_context(&session.profile),
+                    brief.render(),
+                );
                 let parsed = parse_clarify(
                     &llm.complete(CLARIFY_PROMPT, &input)
                         .await
@@ -952,6 +988,17 @@ mod tests {
             record_index(&r, &Stage::Camp).map(|i| &r[i].output[..]),
             Some("camp v2")
         );
+    }
+
+    #[test]
+    fn profile_context_lists_known_facts() {
+        let mut p = super::super::profile::UserProfile::default();
+        assert_eq!(profile_context(&p), "(none known)");
+        p.set("home_city", "Москва");
+        p.set("interests", "байдарки");
+        let ctx = profile_context(&p);
+        assert!(ctx.contains("home_city: Москва"));
+        assert!(ctx.contains("interests: байдарки"));
     }
 
     #[test]
