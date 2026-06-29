@@ -1,8 +1,9 @@
 //! Live end-to-end trip-flow driver. Runs the FULL stateful swarm against the
 //! real LLM + real MCP servers (weather over HTTP, maps/osmmcp over stdio) and
 //! prints every turn, so the flow can be verified by actually running it instead
-//! of guessing. Drives two activities — a water trip and a NON-water (cycling)
-//! trip — to prove the stages are activity-agnostic (no river/water hardcode).
+//! of guessing. Drives three activities — a water (kayak) trip, a NON-water
+//! (cycling) trip, and a light day-walk — to prove the swarm is
+//! activity-agnostic (no river/water/overnight hardcode).
 //!
 //! Needs on the host: LLM_API_KEY (+ optional LLM_BASE_URL / LLM_MODEL), the
 //! weather MCP reachable, and the osmmcp binary (OSM_BIN, default
@@ -313,5 +314,48 @@ async fn live_cycling_trip_end_to_end_no_water_hardcode() {
             && !lower.contains("put-in")
             && !lower.contains("take-out"),
         "cycling trip was converted into a paddling route: {final_answer}"
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn live_walk_to_see_new_place_end_to_end_no_overnight_hardcode() {
+    let (llm, state) = setup().await;
+    let mut session = ChatSession::new(9003);
+    session.profile.set("home_city", "Волгоград");
+    // A light day-walk to discover a new spot. No overnight, no paddling, no
+    // cycling. The swarm must NOT invent a campsite / water-distance / route
+    // track requirement, nor convert it into a kayak or bike trip.
+    let final_answer = drive_assert_done(
+        &llm,
+        &state,
+        &mut session,
+        "Хочу просто прогуляться в эти выходные и посмотреть какое-нибудь новое \
+         интересное место недалеко от города. Без ночёвки, пешком на пару часов. \
+         Подскажи куда сходить.",
+    )
+    .await;
+    assert_final_concrete(&final_answer);
+    let lower = final_answer.to_lowercase();
+    assert!(
+        lower.contains("прогул")
+            || lower.contains("пеш")
+            || lower.contains("walk")
+            || lower.contains("место")
+            || lower.contains("парк"),
+        "walk lost its sightseeing/walking semantics: {final_answer}"
+    );
+    assert!(
+        !lower.contains("байдар")
+            && !lower.contains("каяк")
+            && !lower.contains("сплав")
+            && !lower.contains("велопоход")
+            && !lower.contains("put-in"),
+        "walk was converted into a paddling or cycling trip: {final_answer}"
+    );
+    // a 2-hour day walk must not have an invented overnight campsite
+    assert!(
+        !lower.contains("ночёвк") && !lower.contains("ночлег") && !lower.contains("палатк"),
+        "day walk invented an overnight stay it was never asked for: {final_answer}"
     );
 }

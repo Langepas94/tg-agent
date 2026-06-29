@@ -49,24 +49,35 @@ impl Llm {
     /// Single completion with a custom system prompt and no tools.
     /// Used by staged service agents (planner, fact/profile extractor).
     pub async fn complete(&self, system: &str, user: &str) -> Result<String> {
+        self.complete_with_model(system, user, None).await
+    }
+
+    /// Single completion with an optional per-agent model override.
+    pub async fn complete_with_model(
+        &self,
+        system: &str,
+        user: &str,
+        model_override: Option<&str>,
+    ) -> Result<String> {
         let messages = vec![
             json!({ "role": "system", "content": system }),
             json!({ "role": "user", "content": user }),
         ];
-        let msg = self.chat(&messages, &[]).await?;
+        let msg = self.chat_with_model(&messages, &[], model_override).await?;
         Ok(msg["content"].as_str().unwrap_or("").trim().to_string())
     }
 
-    /// One chat-completions round. Returns the assistant `message` object.
-    async fn chat(&self, messages: &[Value], tools: &[Value]) -> Result<Value> {
-        let mut body = json!({
-            "model": self.cfg.model,
-            "messages": messages,
-        });
-        if !tools.is_empty() {
-            body["tools"] = json!(tools);
-            body["tool_choice"] = json!("auto");
-        }
+    /// One chat-completions round with an optional per-agent model override.
+    async fn chat_with_model(
+        &self,
+        messages: &[Value],
+        tools: &[Value],
+        model_override: Option<&str>,
+    ) -> Result<Value> {
+        let model = model_override
+            .filter(|m| !m.trim().is_empty())
+            .unwrap_or(&self.cfg.model);
+        let body = chat_body(model, messages, tools);
 
         let url = format!(
             "{}/chat/completions",
@@ -145,6 +156,21 @@ impl Llm {
         chat_id: Option<i64>,
         max_steps: usize,
     ) -> Result<String> {
+        self.answer_in_chat_with_model(state, system, user_text, history, chat_id, max_steps, None)
+            .await
+    }
+
+    /// Agentic loop with an optional per-agent model override.
+    pub async fn answer_in_chat_with_model(
+        &self,
+        state: &BotState,
+        system: &str,
+        user_text: &str,
+        history: &[(&str, &str)],
+        chat_id: Option<i64>,
+        max_steps: usize,
+        model_override: Option<&str>,
+    ) -> Result<String> {
         let (mut tool_defs, mut tool_map) = collect_tools(state).await;
         let can_manage_mcp = match chat_id {
             Some(cid) => state.is_root(cid).await,
@@ -178,13 +204,18 @@ impl Llm {
 
         let mut side_effect_calls: std::collections::HashSet<(String, String)> =
             std::collections::HashSet::new();
+        let model_for_budget = model_override
+            .filter(|m| !m.trim().is_empty())
+            .unwrap_or(&self.cfg.model);
 
         for _ in 0..max_steps {
             // Keep the growing tool transcript under the model's window. MCP
             // results (multi-city forecasts) can overflow it mid-loop; clip the
             // oldest results BEFORE the call so the provider never 400s.
-            fit_to_context(&mut messages, &self.cfg.model);
-            let msg = self.chat(&messages, &tool_defs).await?;
+            fit_to_context(&mut messages, model_for_budget);
+            let msg = self
+                .chat_with_model(&messages, &tool_defs, model_override)
+                .await?;
 
             let tool_calls = msg.get("tool_calls").and_then(|v| v.as_array()).cloned();
             match tool_calls {
@@ -302,8 +333,8 @@ impl Llm {
                 Commit to concrete results (with the coordinates/values you found); \
                 do not ask for more tools.",
         }));
-        fit_to_context(&mut messages, &self.cfg.model);
-        let final_msg = self.chat(&messages, &[]).await?;
+        fit_to_context(&mut messages, model_for_budget);
+        let final_msg = self.chat_with_model(&messages, &[], model_override).await?;
         let answer = final_msg["content"]
             .as_str()
             .unwrap_or("")
@@ -315,6 +346,18 @@ impl Llm {
             Ok(answer)
         }
     }
+}
+
+fn chat_body(model: &str, messages: &[Value], tools: &[Value]) -> Value {
+    let mut body = json!({
+        "model": model,
+        "messages": messages,
+    });
+    if !tools.is_empty() {
+        body["tools"] = json!(tools);
+        body["tool_choice"] = json!("auto");
+    }
+    body
 }
 
 fn is_single_execution_tool(real_tool: &str) -> bool {
@@ -1084,6 +1127,25 @@ mod tests {
             .contains("trimmed to fit context"));
         // ...the freshest tool result (in the protected last-two window) is intact.
         assert_eq!(messages[4]["content"].as_str().unwrap().len(), 90_000);
+    }
+
+    #[test]
+    fn chat_body_uses_per_agent_model_override() {
+        let messages = vec![json!({"role":"user","content":"hi"})];
+        let body = chat_body("planner-model", &messages, &[]);
+
+        assert_eq!(body["model"], "planner-model");
+        assert!(body.get("tools").is_none());
+
+        let tools = vec![json!({
+            "type": "function",
+            "function": {"name": "maps__geocode", "parameters": {"type":"object"}}
+        })];
+        let body = chat_body("map-worker-model", &messages, &tools);
+
+        assert_eq!(body["model"], "map-worker-model");
+        assert_eq!(body["tool_choice"], "auto");
+        assert_eq!(body["tools"].as_array().unwrap().len(), 1);
     }
 
     fn obj(v: Value) -> Option<rmcp::model::JsonObject> {
