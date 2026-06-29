@@ -334,6 +334,7 @@ async fn user_action(
         "make_root" => st.bot.set_root(chat_id).await,
         "compact" => {
             s.memory.clear_short_context();
+            s.trip = None;
             let _ = session::save(&s);
         }
         "reset_memory" => {

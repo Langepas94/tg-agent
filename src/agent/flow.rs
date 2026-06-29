@@ -294,6 +294,181 @@ fn output_admits_unresolved_core_data(output: &str) -> bool {
         && core.iter().any(|needle| low.contains(needle))
 }
 
+fn should_restart_flow_from_message(flow: &TripFlowState, text: &str) -> bool {
+    if flow.records.is_empty() {
+        return false;
+    }
+    if message_requests_continuation(text) {
+        return false;
+    }
+    message_requests_restart(text) || looks_like_fresh_full_request(text)
+}
+
+fn message_requests_restart(text: &str) -> bool {
+    let low = text.to_lowercase();
+    contains_any(
+        &low,
+        &[
+            "начнем заново",
+            "начнём заново",
+            "давай заново",
+            "сначала",
+            "новый запрос",
+            "перезапусти",
+            "restart",
+            "start over",
+        ],
+    )
+}
+
+fn message_requests_continuation(text: &str) -> bool {
+    let low = text.trim().to_lowercase();
+    if low.chars().count() > 120 {
+        return false;
+    }
+    contains_any(
+        &low,
+        &[
+            "продолж",
+            "дальше",
+            "подтверждаю",
+            "выбираю",
+            "первый",
+            "второй",
+            "третий",
+            "вариант",
+            "создай",
+            "создавай",
+            "давай",
+            "ок",
+            "ok",
+            "continue",
+            "go on",
+        ],
+    )
+}
+
+fn looks_like_fresh_full_request(text: &str) -> bool {
+    let low = text.trim().to_lowercase();
+    let chars = low.chars().count();
+    if chars < 140 {
+        return false;
+    }
+    let sentence_marks = low
+        .chars()
+        .filter(|c| matches!(c, '.' | '?' | '!' | '\n'))
+        .count();
+    let request_hits = count_contains(
+        &low,
+        &[
+            "хотим",
+            "хочу",
+            "сходить",
+            "поход",
+            "сплав",
+            "байдар",
+            "маршрут",
+            "план",
+            "точк",
+            "мест",
+            "trip",
+            "plan",
+            "route",
+        ],
+    );
+    let constraint_hits = count_contains(
+        &low,
+        &[
+            "выходн",
+            "ноч",
+            "палат",
+            "шашлык",
+            "календар",
+            "док",
+            "радиус",
+            "км",
+            "метр",
+            "вода",
+            "weekend",
+            "calendar",
+            "doc",
+        ],
+    );
+    sentence_marks >= 2 && request_hits >= 2 && constraint_hits >= 2
+}
+
+fn contains_any(text: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| text.contains(needle))
+}
+
+fn count_contains(text: &str, needles: &[&str]) -> usize {
+    needles
+        .iter()
+        .filter(|needle| text.contains(**needle))
+        .count()
+}
+
+fn is_data_checkpoint_task(task: &SwarmTask) -> bool {
+    task.tools && !task.side_effects
+}
+
+fn progress_message_for_task(task: &SwarmTask) -> String {
+    let text = format!("{} {} {}", task.id, task.agent, task.task).to_lowercase();
+    let msg = if task.side_effects
+        || contains_any(
+            &text,
+            &["calendar", "календар", "doc", "document", "google", "док"],
+        ) {
+        "• Готовлю календарь или документ…"
+    } else if contains_any(
+        &text,
+        &[
+            "weather",
+            "forecast",
+            "погод",
+            "ветер",
+            "осад",
+            "дат",
+            "weekend",
+        ],
+    ) {
+        "• Сравниваю ближайшие выходные по погоде…"
+    } else if contains_any(
+        &text,
+        &[
+            "camp",
+            "campsite",
+            "стоян",
+            "лагер",
+            "палат",
+            "ноч",
+            "water",
+            "вода",
+            "сел",
+            "турбаз",
+        ],
+    ) {
+        "• Проверяю стоянку: вода рядом и нет жилья поблизости…"
+    } else if contains_any(
+        &text,
+        &[
+            "route",
+            "track",
+            "point",
+            "map",
+            "osm",
+            "маршрут",
+            "точк",
+            "карт",
+        ],
+    ) {
+        "• Подбираю точки маршрута и подъезды…"
+    } else {
+        "• Проверяю один блок плана…"
+    };
+    msg.to_string()
+}
+
 // ---------------------------------------------------------------------------
 // Orchestrated turn
 // ---------------------------------------------------------------------------
@@ -304,6 +479,9 @@ fn output_admits_unresolved_core_data(output: &str) -> bool {
 /// must check water proximity AND settlement isolation across several Overpass
 /// queries) on a slow host needs more headroom before we call it stuck.
 const STAGE_TIMEOUT: Duration = Duration::from_secs(300);
+/// Keep Telegram turns interactive: one heavy data-gathering worker per user
+/// message, then return a useful checkpoint and wait for "продолжай".
+const DATA_TASKS_PER_TURN: usize = 1;
 
 /// Advance the flow by one user turn. The caller guarantees `session.trip` is
 /// `Some`. The ORCHESTRATOR agent decides every transition; the user can step
@@ -509,7 +687,9 @@ know and that block planning. Return ONLY JSON: {\"brief\":{\"key\":\"value\",..
 const SWARM_OPTIONS_PROMPT: &str = "You are OptionsAgent. Give a SHORT menu of genuinely distinct \
 options for the outdoor/recreation request. Do not deep-dive into one route yet. Use available \
 tools only as much as needed to compare options at a high level. The options must match the user's \
-actual activity and constraints, whatever they are. \
+actual activity and constraints, whatever they are. If the request has a date window/weekend \
+constraint, include the concrete candidate weekend date(s) and a short weather/daylight rationale \
+when tools allow it. \
 If the user has NOT fixed a specific spot/route and gave only a broad area or region, the options \
 MUST be genuinely DIFFERENT places (e.g. different rivers, lakes, trailheads), never date or style \
 variants of a single spot — use the geo tools to discover real candidates within the user's \
@@ -566,6 +746,11 @@ async fn advance_swarm(
     let mut tool_context = render_tool_inventory(&tools);
     let mut flow = session.trip.clone().unwrap_or_else(TripFlowState::start);
     let mut trace = Vec::new();
+
+    if should_restart_flow_from_message(&flow, user_text) {
+        trace.push("active flow restarted from a fresh full request".to_string());
+        flow = TripFlowState::start();
+    }
 
     // The first agent call (BriefAgent) can itself take many seconds on a slow
     // model, so announce the swarm is working BEFORE it — otherwise the chat is
@@ -694,7 +879,10 @@ async fn advance_swarm(
     // True once we skip a side-effecting task because the verifier wasn't ready:
     // we keep planning/answering but must not mark the turn done (no artifacts yet).
     let mut artifacts_skipped = false;
-    for task in plan.tasks {
+    let tasks = plan.tasks;
+    let task_count = tasks.len();
+    let mut completed_data_tasks_this_turn = 0usize;
+    for (task_index, task) in tasks.into_iter().enumerate() {
         let id = sanitize_record_id(&task.id, &task.agent);
         let task_agent = registry.for_task(&task);
         if let Some(existing) = flow.records.iter().find(|r| r.stage == id) {
@@ -720,7 +908,7 @@ async fn advance_swarm(
         }
         if let Some(p) = progress {
             // Neutral liveness only — never leak internal agent names to the user.
-            let _ = p.send("• собираю данные для плана…".to_string());
+            let _ = p.send(progress_message_for_task(&task));
         }
         let system = build_swarm_worker_system(session, &task, &task_agent, &tool_context);
         let query = format!(
@@ -762,10 +950,30 @@ async fn advance_swarm(
         }
         trace.push(format!("• {}: {}", task_agent.name, clip(&output, 90)));
         set_named_record(&mut flow.records, &id, output.clone());
+        if is_data_checkpoint_task(&task) {
+            completed_data_tasks_this_turn += 1;
+        }
         if task.checkpoint {
             session.trip = Some(flow);
             return Ok(FlowTurn {
                 reply: output,
+                trace,
+                done: false,
+            });
+        }
+        let has_more_tasks = task_index + 1 < task_count;
+        if completed_data_tasks_this_turn >= DATA_TASKS_PER_TURN && has_more_tasks {
+            let checkpoint = compose_progress_checkpoint(
+                llm,
+                &registry,
+                &flow.brief,
+                &flow.records,
+                &tool_context,
+            )
+            .await;
+            session.trip = Some(flow);
+            return Ok(FlowTurn {
+                reply: checkpoint,
                 trace,
                 done: false,
             });
@@ -1100,6 +1308,37 @@ async fn compose_best_effort(
          unconfirmed with «(не подтверждено)». Never reply that nothing is ready. Create NO \
          external artifacts and do not claim any were created. End with one short line inviting \
          the user to reply «продолжай» to finish the remaining checks."
+    );
+    complete_swarm_agent(
+        llm,
+        &final_agent,
+        &system,
+        &format!(
+            "[brief]\n{}\n\n[available-tools]\n{}\n\n[agent-records]\n{}",
+            brief.render(),
+            tool_context,
+            render_records_clipped(records, |_| 1800)
+        ),
+    )
+    .await
+    .map(|s| clean_user_text(&s))
+    .unwrap_or_else(|_| fallback_compose(records))
+}
+
+async fn compose_progress_checkpoint(
+    llm: &Llm,
+    registry: &SwarmAgentRegistry,
+    brief: &TripBrief,
+    records: &[StageRecord],
+    tool_context: &str,
+) -> String {
+    let final_agent = registry.get("FinalAgent");
+    let system = format!(
+        "{SWARM_FINAL_PROMPT}\n\nThis is an INTERMEDIATE checkpoint after one data-gathering \
+         worker. Produce a useful partial result now, in the user's language. Include concrete \
+         dates, places, coordinates, and constraints already found. Do not pretend the whole flow \
+         is finished. Do not claim any calendar event or document was created. End with one short \
+         line: ask the user to reply «продолжай» to run the next check/create artifacts."
     );
     complete_swarm_agent(
         llm,
@@ -1484,6 +1723,62 @@ mod tests {
         assert!(out.contains("Донская излучина"));
         assert!(!out.contains("(stage failed:"));
         assert!(out.contains("Внешние артефакты ещё не создавал"));
+    }
+
+    #[test]
+    fn long_fresh_request_restarts_active_flow() {
+        let mut flow = TripFlowState::start();
+        flow.records.push(StageRecord {
+            stage: "OptionsAgent".into(),
+            output: "1. Старый вариант".into(),
+        });
+        flow.awaiting_choice = Some(Stage::Planning);
+
+        let text = "Хотим сходить в поход на байдарках, посмотри в какой день лучше это сделать в течение следующих двух недель (мы можем только на выходных). И в каких местах.\n\n\
+            Сплав с одной ночевкой, команда больше хочет шашлыки, чем грести. Ночлег будет в палатках, чтобы в радиусе минимум 1км не было турбаз,сел и так далее. Вода должна быть рядом, максимум в 30 метрах от ночлега.\n\n\
+            Составь конкретный план с точками остановки и ночлега, событие в календаре, потом из гугл док поделюсь с друзьями.";
+
+        assert!(should_restart_flow_from_message(&flow, text));
+    }
+
+    #[test]
+    fn short_choice_continues_active_flow() {
+        let mut flow = TripFlowState::start();
+        flow.records.push(StageRecord {
+            stage: "OptionsAgent".into(),
+            output: "1. Старый вариант".into(),
+        });
+
+        assert!(!should_restart_flow_from_message(
+            &flow,
+            "Давай первый вариант. Подтверждаю, двигайся дальше."
+        ));
+        assert!(!should_restart_flow_from_message(&flow, "продолжай"));
+    }
+
+    #[test]
+    fn progress_messages_describe_task_kind() {
+        let camp = SwarmTask {
+            id: "camp".into(),
+            agent: "WorkerAgent".into(),
+            model: None,
+            task: "find campsite with water nearby and no settlements".into(),
+            tools: true,
+            side_effects: false,
+            checkpoint: false,
+        };
+        let route = SwarmTask {
+            id: "route".into(),
+            agent: "WorkerAgent".into(),
+            model: None,
+            task: "build route points".into(),
+            tools: true,
+            side_effects: false,
+            checkpoint: false,
+        };
+
+        assert!(progress_message_for_task(&camp).contains("стоянку"));
+        assert!(progress_message_for_task(&route).contains("маршрута"));
     }
 
     #[test]

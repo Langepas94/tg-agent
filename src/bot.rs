@@ -42,7 +42,7 @@ pub enum Command {
     Trip(String),
     #[command(description = "reset this chat's memory (keeps long-term)")]
     Reset,
-    #[command(description = "clear short context, keep profile and durable facts")]
+    #[command(description = "clear short context and active flow, keep profile and durable facts")]
     Compact,
 }
 
@@ -60,7 +60,7 @@ fn base_commands() -> Vec<BotCommand> {
         cmd("trip", "run the travel-weather flow"),
         cmd("watches", "list active watches"),
         cmd("unwatch", "stop a watch"),
-        cmd("compact", "clear short context"),
+        cmd("compact", "clear short context and active flow"),
         cmd("reset", "reset chat memory"),
     ]
 }
@@ -351,6 +351,7 @@ async fn handle_command(
         Command::Reset => {
             let mut session = crate::agent::session::load(chat.0);
             session.memory.reset_for_new_session();
+            session.trip = None;
             let _ = crate::agent::session::save(&session);
             bot.send_message(chat, "✅ Chat memory reset (long-term facts kept).")
                 .await?;
@@ -418,7 +419,8 @@ async fn send_help(bot: &Bot, chat: ChatId, is_root: bool) -> anyhow::Result<()>
         "/trip <cities/dates> — travel-weather flow".to_string(),
         "/watches — list your active watches".to_string(),
         "/unwatch <id> | all — stop your watches".to_string(),
-        "/compact — clear short context, keep profile and durable facts".to_string(),
+        "/compact — clear short context and active flow, keep profile and durable facts"
+            .to_string(),
         "/reset — reset chat memory, keep long-term facts".to_string(),
     ];
     if is_root {
@@ -559,17 +561,24 @@ async fn compact_chat_context(bot: &Bot, chat: ChatId) -> anyhow::Result<()> {
     let mut session = crate::agent::session::load(chat.0);
     let before_recent = session.memory.recent.len();
     let had_summary = !session.memory.summary.trim().is_empty();
+    let had_flow = session.trip.is_some();
     session.memory.clear_short_context();
+    session.trip = None;
     let _ = crate::agent::session::save(&session);
     let summary_note = if had_summary {
         " and compacted summary"
     } else {
         ""
     };
+    let flow_note = if had_flow {
+        " Active trip flow cleared."
+    } else {
+        ""
+    };
     bot.send_message(
         chat,
         format!(
-            "✅ Cleared short context ({before_recent} recent message(s){summary_note}). Profile and durable facts kept."
+            "✅ Cleared short context ({before_recent} recent message(s){summary_note}).{flow_note} Profile and durable facts kept."
         ),
     )
     .await?;

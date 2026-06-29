@@ -2043,7 +2043,7 @@ dependencies = [
 
 [[package]]
 name = "tg-agent"
-version = "0.12.2"
+version = "0.12.3"
 dependencies = [
  "anyhow",
  "axum",
