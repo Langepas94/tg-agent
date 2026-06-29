@@ -195,7 +195,7 @@ async fn handle_text(bot: Bot, msg: Message, state: BotState) -> anyhow::Result<
             let answer = if result.answer.trim().is_empty() {
                 "✅ Готово.".to_string()
             } else {
-                result.answer
+                crate::agent::flow::linkify_geo(&result.answer)
             };
             for chunk in split_chunks(&answer, 3900) {
                 if chunk.trim().is_empty() {
@@ -617,7 +617,7 @@ async fn handle_trip(bot: &Bot, chat: ChatId, state: &BotState, args: &str) -> a
             let answer = if result.answer.trim().is_empty() {
                 "✅ Готово.".to_string()
             } else {
-                result.answer
+                crate::agent::flow::linkify_geo(&result.answer)
             };
             for chunk in split_chunks(&answer, 3900) {
                 if chunk.trim().is_empty() {
