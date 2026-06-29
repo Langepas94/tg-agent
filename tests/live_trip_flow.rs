@@ -364,9 +364,15 @@ async fn live_walk_to_see_new_place_end_to_end_no_overnight_hardcode() {
             && !lower.contains("put-in"),
         "walk was converted into a paddling or cycling trip: {final_answer}"
     );
-    // a 2-hour day walk must not have an invented overnight campsite
+    // a 2-hour day walk must not have an invented overnight campsite. Note: the
+    // bot legitimately says "без ночёвки" (NO overnight), so ban only a
+    // POSITIVELY proposed overnight/tent stay, not the negated mention.
     assert!(
-        !lower.contains("ночёвк") && !lower.contains("ночлег") && !lower.contains("палатк"),
+        !lower.contains("с ночёвкой")
+            && !lower.contains("место ночёвк")
+            && !lower.contains("в палатк")
+            && !lower.contains("ночёвка у")
+            && !lower.contains("разбить лагерь"),
         "day walk invented an overnight stay it was never asked for: {final_answer}"
     );
 }

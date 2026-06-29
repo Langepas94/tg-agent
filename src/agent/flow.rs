@@ -172,6 +172,60 @@ fn profile_context(profile: &super::profile::UserProfile) -> String {
         .join("\n")
 }
 
+/// Recent user turns joined oldest→newest, so BriefAgent always sees the full
+/// request even across clarify rounds (the structured brief may capture it only
+/// partially). Assistant turns are excluded to keep the brief input focused.
+fn recent_user_requests(session: &ChatSession) -> String {
+    let joined = session
+        .memory
+        .recent
+        .iter()
+        .filter(|(role, _)| role == "user")
+        .map(|(_, text)| text.trim())
+        .filter(|t| !t.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n---\n");
+    if joined.is_empty() {
+        "(none)".to_string()
+    } else {
+        joined
+    }
+}
+
+/// Seed the start area from the known profile (home city) when the brief has no
+/// location yet, so BriefAgent never asks for a place the profile already holds
+/// and downstream agents always have a start point. Location-only — makes no
+/// assumption about the activity.
+fn seed_area_from_profile(brief: &mut TripBrief, profile: &super::profile::UserProfile) {
+    let area_needles = [
+        "area",
+        "region",
+        "start",
+        "location",
+        "место",
+        "регион",
+        "старт",
+        "город",
+    ];
+    let has_area = brief
+        .fields
+        .iter()
+        .any(|(k, v)| !v.trim().is_empty() && area_needles.iter().any(|n| k.contains(n)));
+    if has_area {
+        return;
+    }
+    let home_needles = ["home_city", "home", "city", "город", "родной"];
+    if let Some((_, city)) = profile
+        .fields
+        .iter()
+        .find(|(k, v)| !v.trim().is_empty() && home_needles.iter().any(|n| k.contains(n)))
+    {
+        brief
+            .fields
+            .insert("start_area".into(), city.trim().to_string());
+    }
+}
+
 /// Parse the clarify agent's JSON (lenient: tolerates fences / surrounding prose).
 fn parse_clarify(raw: &str) -> ClarifyOut {
     serde_json::from_str(&extract_json(raw)).unwrap_or(ClarifyOut {
@@ -467,10 +521,15 @@ explains the missing capability. Return ONLY JSON: {\"tasks\":[{\"id\":\"short_s
 verification task before any side-effect task.";
 
 const SWARM_VERIFIER_PROMPT: &str = "You are VerifierAgent. Decide whether the gathered evidence is \
-concrete enough to perform external side effects or present the final plan. Check the user's actual \
-brief and constraints, not a fixed schema. If a route/place/date/constraint/artifact needed by the \
-request is vague, missing, contradicted, or merely 'to be checked later', ready=false. Return ONLY \
-JSON: {\"ready\":bool,\"missing\":[\"short missing item\",...]}";
+concrete enough to perform external side effects or present the final plan. Judge ONLY against the \
+user's OWN stated deliverables and constraints — do NOT invent extra requirements or demand a \
+precision the user never asked for. ready=true when each deliverable the user actually requested is \
+present as concrete data (a named place plus coordinates where the user asked for points, a chosen \
+date, and every explicit constraint addressed), EVEN IF further optional detail could still be \
+added. Set ready=false only when something the user explicitly asked for is still vague, missing, \
+contradicted, or merely 'to be checked later'. Do not block on nice-to-have sub-details \
+(return-leg minutiae, ferry crossings, parking) the user did not request. Return ONLY JSON: \
+{\"ready\":bool,\"missing\":[\"short missing item the USER asked for\",...]}";
 
 const SWARM_FINAL_PROMPT: &str =
     "You are FinalAgent. Compose the user-facing answer from the swarm \
@@ -492,9 +551,31 @@ async fn advance_swarm(
     let mut trace = Vec::new();
 
     if flow.records.is_empty() {
+        // Preserve the user's ORIGINAL request verbatim so no later agent ever
+        // loses it across clarify rounds — the structured brief may capture it
+        // only partially, but the raw request always flows to Options/Planner.
+        if flow
+            .brief
+            .fields
+            .get("request")
+            .map(|s| s.trim().is_empty())
+            .unwrap_or(true)
+            && !user_text.trim().is_empty()
+        {
+            flow.brief
+                .fields
+                .insert("request".into(), user_text.trim().to_string());
+        }
+        // Seed the start area from the known profile (home city) so BriefAgent
+        // never interrogates for a location the profile already holds.
+        seed_area_from_profile(&mut flow.brief, &session.profile);
+
         let input = format!(
-            "Known profile:\n{}\n\nUser request:\n{}",
+            "Known profile:\n{}\n\nConversation so far (user turns, oldest first):\n{}\n\n\
+             Brief gathered so far:\n{}\n\nLatest message:\n{}",
             profile_context(&session.profile),
+            recent_user_requests(session),
+            flow.brief.render(),
             user_text
         );
         let brief_agent = registry.get("BriefAgent");
@@ -503,8 +584,19 @@ async fn advance_swarm(
         );
         flow.brief.merge(parsed.brief);
         flow.clarify_rounds = flow.clarify_rounds.saturating_add(1);
-        let ready =
-            parsed.ready || flow.brief.has_minimum() || flow.clarify_rounds >= MAX_CLARIFY_ROUNDS;
+        // Proceed when the model says ready, when the heuristic minimum is met,
+        // after the round cap, OR when we already hold a real request and the
+        // model has nothing more to ask — never stall on a detailed opener.
+        let have_request = flow
+            .brief
+            .fields
+            .get("request")
+            .map(|s| s.trim().chars().count() > 12)
+            .unwrap_or(false);
+        let ready = parsed.ready
+            || flow.brief.has_minimum()
+            || flow.clarify_rounds >= MAX_CLARIFY_ROUNDS
+            || (have_request && parsed.questions.is_empty());
         if !ready {
             flow.stage = Stage::Clarify;
             session.trip = Some(flow);
@@ -765,8 +857,16 @@ async fn run_swarm_worker(
 ) -> String {
     let full_system = format!(
         "{system}\n\nYou are {}. You are one worker in a real swarm: do only your task, \
-         use only the context passed to you, and return a compact handoff artifact for the next agent."
-        , agent.name
+         use only the context passed to you, and return a compact handoff artifact for the next \
+         agent.\n\
+         COMMIT, do not narrate: your output MUST be the finished artifact with concrete values \
+         (names, coordinates, distances, dates), not a description of what you are about to do. \
+         Never end with a promise like 'I will call…', 'сейчас вызову', 'уточню', 'собираю' — that \
+         is not a valid handoff. Make the tool calls now and return the result. If after your tool \
+         calls a required concrete value is still missing, output the marker \
+         `STAGE_INCOMPLETE: <what is missing>` plus the concrete data you DID obtain — never a vague \
+         plan.",
+        agent.name
     );
     let run = async {
         if allow_tools && agent.tools_allowed {
@@ -1345,6 +1445,57 @@ mod tests {
         let spec = registry.for_task(&task);
         assert_eq!(spec.name, "ArtifactsAgent");
         assert!(!spec.side_effects_allowed);
+    }
+
+    #[test]
+    fn seed_area_from_profile_fills_start_area_from_home_city() {
+        let mut profile = super::super::profile::UserProfile::default();
+        profile.set("home_city", "Волгоград");
+        let mut brief = TripBrief::default();
+
+        seed_area_from_profile(&mut brief, &profile);
+
+        assert_eq!(
+            brief.fields.get("start_area").map(String::as_str),
+            Some("Волгоград")
+        );
+    }
+
+    #[test]
+    fn seed_area_from_profile_is_noop_when_brief_has_area() {
+        let mut profile = super::super::profile::UserProfile::default();
+        profile.set("home_city", "Волгоград");
+        let mut brief = TripBrief::default();
+        brief.fields.insert("area".into(), "Карелия".into());
+
+        seed_area_from_profile(&mut brief, &profile);
+
+        // existing location is kept; profile home does not overwrite it
+        assert_eq!(
+            brief.fields.get("area").map(String::as_str),
+            Some("Карелия")
+        );
+        assert!(!brief.fields.contains_key("start_area"));
+    }
+
+    #[test]
+    fn recent_user_requests_keeps_only_user_turns_in_order() {
+        let mut session = ChatSession::new(1);
+        session
+            .memory
+            .push_message("user", "Хотим велопоход на выходных");
+        session
+            .memory
+            .push_message("assistant", "Расскажите подробнее?");
+        session
+            .memory
+            .push_message("user", "Команда любительская, одна ночёвка");
+
+        let joined = recent_user_requests(&session);
+
+        assert!(joined.contains("велопоход"));
+        assert!(joined.contains("одна ночёвка"));
+        assert!(!joined.contains("Расскажите подробнее"));
     }
 
     // ---- swarm orchestra: distinct, independently configured agents ----
