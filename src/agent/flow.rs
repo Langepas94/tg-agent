@@ -297,10 +297,10 @@ fn output_admits_unresolved_core_data(output: &str) -> bool {
 
 /// Safety net for ONE stage attempt that is genuinely stuck (a stalled external
 /// tool connection), not a planning budget. A normal OSM/weather stage finishes
-/// well under this; we also retry once and never dead-end on a hit, so a high
-/// value just prevents a hang — it does not make the user wait this long in the
-/// common case.
-const STAGE_TIMEOUT: Duration = Duration::from_secs(200);
+/// well under this, but a constraint-heavy stage (e.g. a campsite search that
+/// must check water proximity AND settlement isolation across several Overpass
+/// queries) on a slow host needs more headroom before we call it stuck.
+const STAGE_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Advance the flow by one user turn. The caller guarantees `session.trip` is
 /// `Some`. The ORCHESTRATOR agent decides every transition; the user can step
