@@ -509,8 +509,15 @@ know and that block planning. Return ONLY JSON: {\"brief\":{\"key\":\"value\",..
 const SWARM_OPTIONS_PROMPT: &str = "You are OptionsAgent. Give a SHORT menu of genuinely distinct \
 options for the outdoor/recreation request. Do not deep-dive into one route yet. Use available \
 tools only as much as needed to compare options at a high level. The options must match the user's \
-actual activity and constraints, whatever they are. End by asking the user to choose one option. \
-Plain text, no Markdown table.";
+actual activity and constraints, whatever they are. \
+If the user has NOT fixed a specific spot/route and gave only a broad area or region, the options \
+MUST be genuinely DIFFERENT places (e.g. different rivers, lakes, trailheads), never date or style \
+variants of a single spot — use the geo tools to discover real candidates within the user's \
+travel-time/area limit and present every genuinely distinct, suitable one that exists. Let the \
+count follow the terrain: offer as few or as many as are truly distinct and worthwhile; never pad \
+to a number and never collapse to one when alternatives exist. If the user DID name a specific \
+spot, offer distinct variants of that spot instead. Give each candidate's approximate coordinates \
+as `lat, lon`. End by asking the user to choose one option. Plain text, no Markdown table.";
 
 const SWARM_PLANNER_PROMPT: &str = "You are SwarmPlanner. Build a minimal swarm plan from the \
 brief, the user's chosen option, prior records, and the ACTUAL connected MCP tool inventory. Do \
@@ -1122,6 +1129,103 @@ fn is_stage_failure(output: &str) -> bool {
         || text.starts_with("(stage timed out")
 }
 
+/// Byte length of the UTF-8 char that begins with `first`.
+fn utf8_len(first: u8) -> usize {
+    match first {
+        b if b < 0x80 => 1,
+        b if b >> 5 == 0b110 => 2,
+        b if b >> 4 == 0b1110 => 3,
+        _ => 4,
+    }
+}
+
+/// Parse a signed decimal like `50.1347` or `-43.5` starting exactly at `start`.
+/// Returns the matched text and its end byte index. Requires a fractional part
+/// and an integer part of 1–3 digits, so plain integers and version-like tokens
+/// never match.
+fn parse_decimal(s: &str, start: usize) -> Option<(String, usize)> {
+    let b = s.as_bytes();
+    let mut i = start;
+    if i < b.len() && (b[i] == b'+' || b[i] == b'-') {
+        i += 1;
+    }
+    let int_start = i;
+    while i < b.len() && b[i].is_ascii_digit() {
+        i += 1;
+    }
+    let int_len = i - int_start;
+    if int_len == 0 || int_len > 3 || i >= b.len() || b[i] != b'.' {
+        return None;
+    }
+    i += 1;
+    let frac_start = i;
+    while i < b.len() && b[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i == frac_start {
+        return None;
+    }
+    Some((s[start..i].to_string(), i))
+}
+
+/// Parse a `lat, lon` pair at `start` and validate plausible geographic ranges,
+/// so only real coordinates (not arbitrary number pairs) become map links.
+fn parse_coord_pair(s: &str, start: usize) -> Option<(String, String, usize)> {
+    let (lat, p1) = parse_decimal(s, start)?;
+    let after = s[p1..].strip_prefix(',')?;
+    let spaces = after.len() - after.trim_start_matches(' ').len();
+    let (lon, end) = parse_decimal(s, p1 + 1 + spaces)?;
+    let latf: f64 = lat.parse().ok()?;
+    let lonf: f64 = lon.parse().ok()?;
+    if (-90.0..=90.0).contains(&latf) && (-180.0..=180.0).contains(&lonf) {
+        Some((lat, lon, end))
+    } else {
+        None
+    }
+}
+
+/// Append a tappable map link after every `lat, lon` pair in user-facing text,
+/// so a point opens in a map app instead of forcing the reader to copy raw
+/// coordinates. Plain Yandex Maps URL — the chat uses no Markdown parse mode, so
+/// Telegram auto-links bare URLs. Existing `http…` URLs are copied verbatim so we
+/// never double-link or mangle them. No regex dependency.
+pub fn linkify_geo(text: &str) -> String {
+    let b = text.as_bytes();
+    let mut out = String::with_capacity(text.len() + 64);
+    let mut i = 0;
+    let mut prev: u8 = b' ';
+    while i < b.len() {
+        if text[i..].starts_with("http") {
+            let end = text[i..]
+                .find(char::is_whitespace)
+                .map(|d| i + d)
+                .unwrap_or(b.len());
+            out.push_str(&text[i..end]);
+            prev = b' ';
+            i = end;
+            continue;
+        }
+        let at_num_start = (b[i].is_ascii_digit() || b[i] == b'+' || b[i] == b'-')
+            && !(prev.is_ascii_digit() || prev == b'.');
+        if at_num_start {
+            if let Some((lat, lon, end)) = parse_coord_pair(text, i) {
+                out.push_str(&text[i..end]);
+                out.push_str(&format!(
+                    " (https://yandex.ru/maps/?ll={lon}%2C{lat}&z=14&pt={lon}%2C{lat})"
+                ));
+                prev = b')';
+                i = end;
+                continue;
+            }
+        }
+        let len = utf8_len(b[i]);
+        out.push_str(&text[i..i + len]);
+        prev = b[i];
+        i += len;
+    }
+    out
+}
+
 /// A stage output is UNRESOLVED when it failed/timed out, OR the worker agent
 /// itself signalled it could not obtain the real geo data (the `STAGE_INCOMPLETE`
 /// marker we ask it to emit instead of writing vague "уточняется" prose).
@@ -1266,6 +1370,36 @@ mod tests {
         let s = "Карелия";
         let c = clip(s, 5);
         assert!(c.ends_with('…'));
+    }
+
+    #[test]
+    fn linkify_geo_links_coords_lon_lat_order() {
+        let out = linkify_geo("Лагерь — 50.160, 43.535 (излучина)");
+        assert!(out.contains("50.160, 43.535"));
+        // Yandex wants lon,lat — longitude first.
+        assert!(out.contains("https://yandex.ru/maps/?ll=43.535%2C50.160"));
+    }
+
+    #[test]
+    fn linkify_geo_ignores_non_coordinate_numbers() {
+        // Sunshine hours, precipitation, wind, scores, dates — none are lat/lon
+        // pairs, so none must get a map link.
+        let raw = "Солнце 15.6 ч, осадки 3.4 мм (22%), ветер 15 км/ч, оценка 142/100, 4–5 июля";
+        assert_eq!(linkify_geo(raw), raw);
+    }
+
+    #[test]
+    fn linkify_geo_leaves_existing_urls_intact() {
+        let raw = "точка https://yandex.ru/maps/?ll=43.5%2C50.1 рядом";
+        // The coords live inside the URL → copied verbatim, no second link.
+        assert_eq!(linkify_geo(raw), raw);
+    }
+
+    #[test]
+    fn linkify_geo_rejects_out_of_range_pair() {
+        // 200.0 is not a valid latitude — must stay plain.
+        let raw = "версия 200.0, 43.5 тест";
+        assert_eq!(linkify_geo(raw), raw);
     }
 
     #[test]
