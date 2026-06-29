@@ -13,6 +13,13 @@ use crate::{
     persist::{self, AccessState, Persisted, WatchSpec},
 };
 
+#[derive(Debug, Clone)]
+pub struct ToolSummary {
+    pub server: String,
+    pub name: String,
+    pub description: String,
+}
+
 #[derive(Clone)]
 pub struct BotState {
     /// name -> live MCP connection
@@ -375,6 +382,24 @@ impl BotState {
         let mut v: Vec<String> = self.mcps.lock().await.keys().cloned().collect();
         v.sort();
         v
+    }
+
+    /// Safe capability inventory for planner agents. Contains only public MCP
+    /// metadata (server, tool name, description), never saved env/secrets.
+    pub async fn tool_inventory(&self) -> Vec<ToolSummary> {
+        let guard = self.mcps.lock().await;
+        let mut out = Vec::new();
+        for (server, client) in guard.iter() {
+            for tool in client.tools().await {
+                out.push(ToolSummary {
+                    server: server.clone(),
+                    name: tool.name.to_string(),
+                    description: tool.description.unwrap_or_default().to_string(),
+                });
+            }
+        }
+        out.sort_by(|a, b| a.server.cmp(&b.server).then_with(|| a.name.cmp(&b.name)));
+        out
     }
 
     pub async fn subscribe(&self, chat_id: i64) {

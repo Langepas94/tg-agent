@@ -68,15 +68,16 @@ fn sensitive_rejected_from_longterm() {
     let mut m = AgentMemory::default();
     assert!(!m.upsert_fact("token", "sk-abcdef1234567890abcdef", MemoryLayer::LongTerm));
     assert!(m.facts.is_empty());
-    // but allowed in working (non-durable)
-    assert!(m.upsert_fact("tmp", "sk-abcdef1234567890abcdef", MemoryLayer::Working));
+    // Auto facts use a closed schema, so arbitrary working keys are rejected too.
+    assert!(!m.upsert_fact("tmp", "sk-abcdef1234567890abcdef", MemoryLayer::Working));
+    assert!(m.facts.is_empty());
 }
 
 #[test]
 fn reset_keeps_longterm_only() {
     let mut m = AgentMemory::default();
     m.upsert_fact("home_city", "Volgograd", MemoryLayer::LongTerm);
-    m.upsert_fact("goal", "trip", MemoryLayer::Working);
+    m.upsert_fact("trip_focus", "bbq", MemoryLayer::Working);
     m.push_message("user", "hi");
     m.append_summary("old short context");
     m.reset_for_new_session();
@@ -91,7 +92,7 @@ fn merge_extracted_json_demotes_shortterm() {
     let mut m = AgentMemory::default();
     let json = r#"{"facts":[
         {"key":"home_city","value":"Volgograd","layer":"long-term"},
-        {"key":"goal","value":"weekend trip","layer":"short-term"}
+        {"key":"trip_focus","value":"weekend trip","layer":"short-term"}
     ]}"#;
     assert_eq!(m.merge_extracted_json(json), 2);
     assert_eq!(m.facts_in_layer(MemoryLayer::LongTerm).len(), 1);
@@ -105,6 +106,64 @@ fn merge_extracted_json_missing_layer_uses_default() {
     let json = r#"{"facts":[{"key":"interests","value":"hiking"}]}"#;
     assert_eq!(m.merge_extracted_json(json), 1);
     assert_eq!(m.facts[0].layer, MemoryLayer::LongTerm);
+}
+
+#[test]
+fn memory_rejects_noisy_weather_and_task_facts() {
+    let mut m = AgentMemory::default();
+    let json = r#"{"facts":[
+        {"key":"task_type","value":"weather_monitor","layer":"working"},
+        {"key":"weather_query_city_date","value":"Волгоград tomorrow","layer":"working"},
+        {"key":"current_task","value":"unsubscribe_from_weather","layer":"working"},
+        {"key":"trip_duration","value":"one night","layer":"working"},
+        {"key":"likes_kayaking","value":"true","layer":"long-term"}
+    ]}"#;
+
+    assert_eq!(m.merge_extracted_json(json), 2);
+    assert!(!m.facts.iter().any(|f| f.key.contains("weather")));
+    assert!(!m.facts.iter().any(|f| f.key.contains("task")));
+    assert!(m
+        .facts
+        .iter()
+        .any(|f| f.key == "trip_duration" && f.value == "one night"));
+    assert!(m
+        .facts
+        .iter()
+        .any(|f| f.key == "interests" && f.value == "kayaking"));
+}
+
+#[test]
+fn memory_sanitize_cleans_legacy_noise() {
+    let mut m = AgentMemory {
+        facts: vec![
+            super::memory::Fact {
+                key: "weather_query_location".into(),
+                value: "volgograd".into(),
+                layer: MemoryLayer::Working,
+            },
+            super::memory::Fact {
+                key: "likes_kayaking".into(),
+                value: "true".into(),
+                layer: MemoryLayer::LongTerm,
+            },
+            super::memory::Fact {
+                key: "constraint_water_distance".into(),
+                value: "30m max".into(),
+                layer: MemoryLayer::Working,
+            },
+        ],
+        recent: Vec::new(),
+        summary: String::new(),
+    };
+
+    assert!(m.sanitize());
+    assert_eq!(m.facts.len(), 2);
+    assert!(m.facts.iter().any(|f| f.key == "interests"));
+    assert!(m
+        .facts
+        .iter()
+        .any(|f| f.key == "trip_constraints" && f.value.contains("30m max")));
+    assert!(!m.facts.iter().any(|f| f.key.starts_with("weather_")));
 }
 
 #[test]
@@ -258,7 +317,7 @@ fn invariant_advisory_is_advisory() {
 fn prompt_layers_in_order_and_dedup() {
     let mut memory = AgentMemory::default();
     memory.upsert_fact("home_city", "Volgograd", MemoryLayer::LongTerm);
-    memory.upsert_fact("goal", "weekend trip", MemoryLayer::Working);
+    memory.upsert_fact("trip_focus", "weekend trip", MemoryLayer::Working);
     let mut profile = UserProfile::default();
     profile.set("language", "ru");
     let inv = invariants::travel_weather_defaults();
@@ -366,7 +425,7 @@ fn parse_selected_labels_tolerates_prose() {
 #[test]
 fn prompt_injects_notes_between_profile_and_working() {
     let mut memory = AgentMemory::default();
-    memory.upsert_fact("goal", "weekend trip", MemoryLayer::Working);
+    memory.upsert_fact("trip_focus", "weekend trip", MemoryLayer::Working);
     let mut profile = UserProfile::default();
     profile.set("language", "ru");
     let notes_ctx = vec![("files".to_string(), "always .docx".to_string())];

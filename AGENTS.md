@@ -10,7 +10,7 @@ MCP-серверы подключаются **в чате** (команды ил
   свободный текст через LLM tool-loop поверх их tools, гоняет периодическиеджобы.
 - MCP-клиент: `rmcp` 1.8, два транспорта (HTTP Streamable + stdio child).
 - Агент-рантайм портирован из ai-playground: sticky-facts память, профиль,
-  инварианты, PromptBuilder, multi-agent travel-weather FSM.
+  инварианты, PromptBuilder, динамический multi-agent рой планирования поездок.
 
 ## Карта кода
 
@@ -21,7 +21,15 @@ MCP-серверы подключаются **в чате** (команды ил
 - `src/mcp_client.rs` — `ConnectParams`, `connect()` → `spawn_stdio` / `connect_http`.
 - `src/llm.rs` — LLM tool-loop + meta-tools `mcp_connect` / `mcp_disconnect` /
   `schedule_summary`; defs и хендлеры здесь.
-- `src/agent/flow.rs` — travel-weather FSM (Planning→Execution→Validation→Done), `/trip`.
+- `src/agent/flow.rs` — динамический рой агентов (BriefAgent → OptionsAgent →
+  SwarmPlanner → WorkerAgents → VerifierAgent → ArtifactsAgent → FinalAgent),
+  `/trip`. План задач строит SwarmPlanner из живого инвентаря MCP-tools, а не
+  фиксированный stage-граф. Реестр агентов — `SwarmAgentRegistry`: каждый агент
+  отдельная сущность (`SwarmAgentSpec`: имя, роль, модель, права на tools и
+  side-effects). Старые `Stage`-метки остались только для serde-совместимости
+  персиста, в логику флоу не входят.
+- `src/agent/router.rs` — семантический роутер (LLM, без keyword-списков):
+  trip / chat / offtopic.
 - `src/agent/prompt.rs` — `BASE_SYSTEM` + `build_system_prompt` (слои промпта).
 - `src/persist.rs`, `src/state.rs` — персист серверов/подписок/watch, общий стейт.
 - `src/scheduler.rs` — периодические watch-джобы и push-summaries.
@@ -32,18 +40,23 @@ MCP-серверы подключаются **в чате** (команды ил
 - `LLM_API_KEY` или `DEEPSEEK_API_KEY` — **без него free-text отключён**, работают
   только команды. Для агент-флоу нужен.
 - `LLM_BASE_URL` — default `https://api.deepseek.com`.
-- `LLM_MODEL` — default `deepseek-chat`.
+- `LLM_MODEL` — default `deepseek-chat`. Базовая модель всех агентов роя.
+- `SWARM_MODEL_<AGENT>` — переопределение модели одного агента роя (опционально).
+  Суффикс — имя агента в UPPER_SNAKE, не-буквенно-цифровое → `_`. Примеры:
+  `SWARM_MODEL_VERIFIERAGENT`, `SWARM_MODEL_ARTIFACTSAGENT`, `SWARM_MODEL_BRIEFAGENT`.
+  Не задано → агент берёт `LLM_MODEL`. Плюс план может задать модель на отдельную
+  задачу через поле `model` в task-графе (приоритетнее env).
 - `BOT_PASSWORD` — пароль для `/start`, default `202020`.
 - `ADMIN_ADDR` — web-админка, default `127.0.0.1:8080` (`/admin`).
 - `ADMIN_USERNAME` — логин web-админки, default `admin`.
-- `ADMIN_PASSWORD` — пароль web-админки, default = `BOT_PASSWORD`.
+- `ADMIN_PASSWORD` — пароль web-админки; без него `/admin` отключён. Должен отличаться от `BOT_PASSWORD`.
 - `DIGEST_INTERVAL_MINUTES` — default 360.
 - `STATE_FILE` (default `state.json`), `SESSIONS_DIR` (default `sessions`).
 
 ## Команды (`src/bot.rs` enum `Command`)
 
 `/start` `/help` `/connect` `/mcps` `/tools` `/call` `/watch` `/unwatch`
-`/watches` `/disconnect` `/profile` `/info` `/facts` `/trip` `/reset`
+`/watches` `/disconnect` `/profile` `/info` `/facts` `/trip` `/compact` `/reset`
 
 ## Подключение MCP — ТОЧНЫЙ синтаксис (`parse_connect`)
 
@@ -73,11 +86,20 @@ stdio (бот спавнит child-процесс; `program` обязан быт
 - Токены/секреты не печатать в чат; агент их только запрашивает и передаёт в connect.
 - Подключённые серверы персистятся и реконнектятся при рестарте (`restore_state`).
 - HTTP-транспорт = ничего не ставить на хост бота; stdio = бинарь обязан быть в PATH.
+- Рой настоящий, не стейт-машина: задачи строит планировщик-LLM, каждый агент —
+  отдельная сущность со своей моделью/ролью/правами. В систем-промпт агента
+  попадает только его identity/role/model + контекст его задачи; working-память и
+  чужие identity не протекают (см. `build_swarm_worker_system`/`swarm_agent_system`).
+- Side-effects (внешние артефакты) разрешены только `ArtifactsAgent` и только
+  после гейта `VerifierAgent`; обычный worker не может эскалироваться до side-effects.
 
 ## Сборка / тест
 
 ```bash
 cargo build --release
-cargo test                            # unit
-cargo test -- --ignored --nocapture   # live (нужны MCP + LLM key)
+cargo test                            # unit (рой: реестр агентов, изоляция промптов, гейты)
+cargo test -- --ignored --nocapture   # live (нужны MCP + LLM key): kayak / cycling / walk
 ```
+
+Live-сценарии роя — `tests/live_trip_flow.rs` (байдарки, велопоход, прогулка):
+прогоняются на VPS с `LLM_API_KEY` + MCP (weather/osm/google).

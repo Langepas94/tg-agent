@@ -1,7 +1,7 @@
 use teloxide::{
     dispatching::{HandlerExt, UpdateFilterExt, UpdateHandler},
     prelude::*,
-    types::{InlineKeyboardButton, InlineKeyboardMarkup},
+    types::{BotCommand, BotCommandScope, InlineKeyboardButton, InlineKeyboardMarkup, Recipient},
     utils::command::BotCommands,
 };
 
@@ -44,6 +44,79 @@ pub enum Command {
     Reset,
     #[command(description = "clear short context, keep profile and durable facts")]
     Compact,
+}
+
+fn cmd(name: &str, description: &str) -> BotCommand {
+    BotCommand::new(name, description)
+}
+
+fn base_commands() -> Vec<BotCommand> {
+    vec![
+        cmd("start", "unlock the bot"),
+        cmd("help", "show help"),
+        cmd("profile", "view or set profile"),
+        cmd("info", "view or save extra info"),
+        cmd("facts", "show learned facts"),
+        cmd("trip", "run the travel-weather flow"),
+        cmd("watches", "list active watches"),
+        cmd("unwatch", "stop a watch"),
+        cmd("compact", "clear short context"),
+        cmd("reset", "reset chat memory"),
+    ]
+}
+
+fn root_commands() -> Vec<BotCommand> {
+    let mut commands = base_commands();
+    commands.extend([
+        cmd("connect", "connect an MCP server"),
+        cmd("mcps", "list MCP servers"),
+        cmd("tools", "list MCP tools"),
+        cmd("call", "call an MCP tool"),
+        cmd("watch", "create an admin watch"),
+        cmd("disconnect", "disconnect an MCP server"),
+    ]);
+    commands
+}
+
+pub async fn set_public_commands(bot: &Bot) -> anyhow::Result<()> {
+    let commands = base_commands();
+    bot.set_my_commands(commands.clone()).await?;
+    bot.set_my_commands(commands)
+        .scope(BotCommandScope::AllPrivateChats)
+        .await?;
+    Ok(())
+}
+
+pub async fn set_chat_commands(bot: &Bot, chat: ChatId, is_root: bool) -> anyhow::Result<()> {
+    let commands = if is_root {
+        root_commands()
+    } else {
+        base_commands()
+    };
+    bot.set_my_commands(commands)
+        .scope(BotCommandScope::Chat {
+            chat_id: Recipient::Id(chat),
+        })
+        .await?;
+    Ok(())
+}
+
+pub async fn sync_authorized_command_menus(bot: &Bot, state: &BotState) -> anyhow::Result<()> {
+    let access = state.access_snapshot().await;
+    let mut chat_ids = access.authorized_chat_ids;
+    if let Some(root_chat_id) = access.root_chat_id {
+        if !chat_ids.contains(&root_chat_id) {
+            chat_ids.push(root_chat_id);
+        }
+    }
+    for chat_id in chat_ids {
+        if let Err(e) =
+            set_chat_commands(bot, ChatId(chat_id), access.root_chat_id == Some(chat_id)).await
+        {
+            tracing::warn!("sync commands for chat {chat_id}: {e:#}");
+        }
+    }
+    Ok(())
 }
 
 pub fn handler_schema() -> UpdateHandler<anyhow::Error> {
@@ -93,6 +166,7 @@ async fn handle_text(bot: Bot, msg: Message, state: BotState) -> anyhow::Result<
     };
 
     let typing = spawn_typing(bot.clone(), chat);
+    bot.send_message(chat, "⏳ Обрабатываю запрос…").await.ok();
     // Live progress: the trip swarm streams "step in progress" lines; relay each
     // to Telegram as it arrives so a multi-minute turn is never silent.
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
@@ -156,11 +230,11 @@ async fn handle_command(
     match cmd {
         Command::Start(_) => {
             state.subscribe(chat.0).await;
-            let role = if state.is_root(chat.0).await {
-                "root"
-            } else {
-                "user"
-            };
+            let is_root = state.is_root(chat.0).await;
+            if let Err(e) = set_chat_commands(&bot, chat, is_root).await {
+                tracing::warn!("set commands for chat {}: {e:#}", chat.0);
+            }
+            let role = if is_root { "root" } else { "user" };
             bot.send_message(chat, format!("✅ Authorized as {role}. Send /help."))
                 .await?;
         }
@@ -518,6 +592,9 @@ async fn handle_trip(bot: &Bot, chat: ChatId, state: &BotState, args: &str) -> a
     // Explicit command just force-starts the same stateful swarm; the normal
     // text path then continues it across turns (clarify → plan → … → doc).
     let typing = spawn_typing(bot.clone(), chat);
+    bot.send_message(chat, "⏳ Запускаю travel-flow…")
+        .await
+        .ok();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let prog_bot = bot.clone();
     let prog_task = tokio::spawn(async move {
@@ -540,7 +617,12 @@ async fn handle_trip(bot: &Bot, chat: ChatId, state: &BotState, args: &str) -> a
                     .send_message(chat, format!("🧭 Swarm:\n{}", result.trace.join("\n")))
                     .await;
             }
-            for chunk in split_chunks(&result.answer, 3900) {
+            let answer = if result.answer.trim().is_empty() {
+                "✅ Готово.".to_string()
+            } else {
+                result.answer
+            };
+            for chunk in split_chunks(&answer, 3900) {
                 if chunk.trim().is_empty() {
                     continue;
                 }

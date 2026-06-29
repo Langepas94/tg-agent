@@ -14,7 +14,7 @@ use super::{
 
 pub const BASE_SYSTEM: &str =
     "You are a helpful outdoor-trip and travel-weather assistant with access to MCP tools. \
-You help plan hikes, kayak/canoe trips, camping and weekend getaways as well as answer weather questions. \
+You help plan outdoor and nature-recreation activities of any kind, plus answer weather questions. \
 When a question needs live data, call the appropriate tool(s); resolve place names to coordinates \
 with a geocode tool before weather tools. \
 If fulfilling the request needs a capability none of the currently-connected servers provide \
@@ -54,6 +54,14 @@ pub fn build_system_prompt(
 ) -> String {
     let mut blocks: Vec<String> = vec![BASE_SYSTEM.to_string()];
     let mut seen_values: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    blocks.push(format!(
+        "[current-date]\nToday is {}. Interpret relative dates such as tomorrow, next weekend, \
+next two weeks, and this summer from this date. Never schedule or document a future trip in a \
+past calendar year. If the user says they are available only on weekends, use Saturday-Sunday \
+overnight pairs only; do not choose Friday or any weekday unless the user explicitly allows it.",
+        current_date_iso()
+    ));
 
     // [memory:long-term]
     let long = memory.facts_in_layer(MemoryLayer::LongTerm);
@@ -137,4 +145,11 @@ pub fn build_system_prompt(
     }
 
     blocks.join("\n\n")
+}
+
+fn current_date_iso() -> String {
+    std::env::var("AGENT_CURRENT_DATE")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| chrono::Local::now().date_naive().to_string())
 }

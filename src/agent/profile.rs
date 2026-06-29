@@ -8,11 +8,12 @@ use serde::{Deserialize, Serialize};
 
 pub const PROFILE_EXTRACTION_PROMPT: &str = "You maintain a compact user profile for a travel-weather assistant. \
 From the latest user message, extract any STABLE personal trait that would shape how the user \
-asks about weather or plans travel. The key set is OPEN (snake_case) — use the common keys when \
-they fit (home_city, google_email, email, preferred_units, comfort_temp_min, comfort_temp_max, \
-dislikes_rain, language, age, occupation, household), and for hobbies/activities/sports use the `interests` key with a \
-comma-separated list (e.g. \"kayaking, basketball\"), MERGING with any you already know. \
-Capture only durable facts, never one-off trip details and never secrets. \
+asks about weather or plans travel. The automatic key set is CLOSED: home_city, google_email, \
+email, preferred_units, comfort_temp_min, comfort_temp_max, dislikes_rain, language, age, \
+occupation, household, interests, preferred_food, accommodation_preference, max_travel_time_hours. \
+For hobbies/activities/sports use the `interests` key with a comma-separated list (e.g. \
+\"hiking, photography\"), MERGING with any you already know. Capture only durable facts, never \
+one-off trip details, current task state, weather query parameters, subscriptions, or secrets. \
 Return ONLY JSON {\"fields\":[{\"key\":\"snake_case\",\"value\":\"short\"}]}; use {\"fields\":[]} if none.";
 
 /// Known profile keys we surface in /profile help (free keys are allowed too).
@@ -29,7 +30,12 @@ pub const KNOWN_KEYS: &[&str] = &[
     "occupation",
     "household",
     "interests",
+    "preferred_food",
+    "accommodation_preference",
+    "max_travel_time_hours",
 ];
+
+const MAX_PROFILE_VALUE_CHARS: usize = 160;
 
 /// Union two comma-separated lists, preserving order, dropping case-insensitive
 /// duplicates and empties.
@@ -50,6 +56,54 @@ fn union_csv(existing: Option<&str>, addition: &str) -> String {
         }
     }
     out.join(", ")
+}
+
+fn truthy(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "true" | "yes" | "y" | "1" | "да" | "ага" | "люблю" | "нравится"
+    )
+}
+
+fn normalize_auto_field(key: &str, value: &str) -> Option<(String, String)> {
+    let key = key.trim().to_ascii_lowercase();
+    let value = value.trim();
+    if value.is_empty() || value.chars().count() > MAX_PROFILE_VALUE_CHARS {
+        return None;
+    }
+    let value = value.to_string();
+    let field = match key.as_str() {
+        "home_city"
+        | "google_email"
+        | "email"
+        | "preferred_units"
+        | "comfort_temp_min"
+        | "comfort_temp_max"
+        | "dislikes_rain"
+        | "language"
+        | "age"
+        | "occupation"
+        | "household"
+        | "interests"
+        | "preferred_food"
+        | "accommodation_preference"
+        | "max_travel_time_hours" => (key, value),
+        "interest_activity" | "activity_interest" | "hobby" | "hobbies" => {
+            ("interests".to_string(), value)
+        }
+        _ if key.starts_with("likes_") => {
+            if truthy(&value) {
+                (
+                    "interests".to_string(),
+                    key.trim_start_matches("likes_").to_string(),
+                )
+            } else {
+                return None;
+            }
+        }
+        _ => return None,
+    };
+    Some(field)
 }
 
 /// Opening / closing delimiters for inline profile markers.
@@ -161,6 +215,9 @@ impl UserProfile {
     pub fn apply_inline_markers(&mut self, answer: &str) -> usize {
         let mut n = 0;
         for (key, value) in scan_inline_markers(answer) {
+            let Some((key, value)) = normalize_auto_field(&key, &value) else {
+                continue;
+            };
             if super::memory::looks_sensitive(&value) {
                 continue;
             }
@@ -188,10 +245,13 @@ impl UserProfile {
         };
         let mut n = 0;
         for f in parsed.fields {
-            if super::memory::looks_sensitive(&f.value) {
+            let Some((key, value)) = normalize_auto_field(&f.key, &f.value) else {
+                continue;
+            };
+            if super::memory::looks_sensitive(&value) {
                 continue;
             }
-            self.set(&f.key, &f.value);
+            self.set(&key, &value);
             n += 1;
         }
         n

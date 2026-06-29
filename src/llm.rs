@@ -11,10 +11,11 @@ use crate::{config::LlmConfig, state::BotState};
 /// Default tool-loop budget for an ordinary chat turn.
 pub const MAX_STEPS: usize = 12;
 /// Budget for a trip-swarm worker stage. A stage needs a handful of OSM queries
-/// (geocode + a few small-bbox lookups), then it must COMMIT. A high cap just
-/// let a chatty model fire 20 slow queries and blow the wall-clock, so keep it
-/// tight and pair it with "commit, don't over-verify" stage instructions.
-pub const STAGE_MAX_STEPS: usize = 10;
+/// (geocode + a few small-bbox lookups, sometimes a route + waypoint split),
+/// then it must COMMIT. A high cap just lets a chatty model fire 20 slow queries
+/// and blow the wall-clock, so keep it bounded and pair it with the worker's
+/// "commit concrete data, don't narrate" instruction.
+pub const STAGE_MAX_STEPS: usize = 14;
 /// Per-tool-result char cap before feeding it back to the model. Sized for a
 /// 7-day hourly forecast (~10–15k chars); `fit_to_context` reclaims the window
 /// if many such results accumulate across the loop.
@@ -49,24 +50,35 @@ impl Llm {
     /// Single completion with a custom system prompt and no tools.
     /// Used by staged service agents (planner, fact/profile extractor).
     pub async fn complete(&self, system: &str, user: &str) -> Result<String> {
+        self.complete_with_model(system, user, None).await
+    }
+
+    /// Single completion with an optional per-agent model override.
+    pub async fn complete_with_model(
+        &self,
+        system: &str,
+        user: &str,
+        model_override: Option<&str>,
+    ) -> Result<String> {
         let messages = vec![
             json!({ "role": "system", "content": system }),
             json!({ "role": "user", "content": user }),
         ];
-        let msg = self.chat(&messages, &[]).await?;
+        let msg = self.chat_with_model(&messages, &[], model_override).await?;
         Ok(msg["content"].as_str().unwrap_or("").trim().to_string())
     }
 
-    /// One chat-completions round. Returns the assistant `message` object.
-    async fn chat(&self, messages: &[Value], tools: &[Value]) -> Result<Value> {
-        let mut body = json!({
-            "model": self.cfg.model,
-            "messages": messages,
-        });
-        if !tools.is_empty() {
-            body["tools"] = json!(tools);
-            body["tool_choice"] = json!("auto");
-        }
+    /// One chat-completions round with an optional per-agent model override.
+    async fn chat_with_model(
+        &self,
+        messages: &[Value],
+        tools: &[Value],
+        model_override: Option<&str>,
+    ) -> Result<Value> {
+        let model = model_override
+            .filter(|m| !m.trim().is_empty())
+            .unwrap_or(&self.cfg.model);
+        let body = chat_body(model, messages, tools);
 
         let url = format!(
             "{}/chat/completions",
@@ -145,6 +157,21 @@ impl Llm {
         chat_id: Option<i64>,
         max_steps: usize,
     ) -> Result<String> {
+        self.answer_in_chat_with_model(state, system, user_text, history, chat_id, max_steps, None)
+            .await
+    }
+
+    /// Agentic loop with an optional per-agent model override.
+    pub async fn answer_in_chat_with_model(
+        &self,
+        state: &BotState,
+        system: &str,
+        user_text: &str,
+        history: &[(&str, &str)],
+        chat_id: Option<i64>,
+        max_steps: usize,
+        model_override: Option<&str>,
+    ) -> Result<String> {
         let (mut tool_defs, mut tool_map) = collect_tools(state).await;
         let can_manage_mcp = match chat_id {
             Some(cid) => state.is_root(cid).await,
@@ -176,12 +203,20 @@ impl Llm {
         }
         messages.push(json!({ "role": "user", "content": user_text }));
 
+        let mut side_effect_calls: std::collections::HashSet<(String, String)> =
+            std::collections::HashSet::new();
+        let model_for_budget = model_override
+            .filter(|m| !m.trim().is_empty())
+            .unwrap_or(&self.cfg.model);
+
         for _ in 0..max_steps {
             // Keep the growing tool transcript under the model's window. MCP
             // results (multi-city forecasts) can overflow it mid-loop; clip the
             // oldest results BEFORE the call so the provider never 400s.
-            fit_to_context(&mut messages, &self.cfg.model);
-            let msg = self.chat(&messages, &tool_defs).await?;
+            fit_to_context(&mut messages, model_for_budget);
+            let msg = self
+                .chat_with_model(&messages, &tool_defs, model_override)
+                .await?;
 
             let tool_calls = msg.get("tool_calls").and_then(|v| v.as_array()).cloned();
             match tool_calls {
@@ -228,24 +263,36 @@ impl Llm {
                                 None => format!("error: tool '{name}' is not available"),
                                 Some((server, real_tool)) => {
                                     normalize_tool_args(server, real_tool, &mut args);
-                                    let period = args
-                                        .as_ref()
-                                        .and_then(|m| m.get("period"))
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("1h")
-                                        .to_string();
-                                    let res = state.call_tool(server, real_tool, args).await;
-                                    // Record/clear durable push-subs so they survive restarts.
-                                    if let (Some(cid), Ok(_)) = (chat_id, &res) {
-                                        if real_tool == "subscribe_summaries" {
-                                            state.add_push_sub(cid, server.clone(), period).await;
-                                        } else if real_tool == "unsubscribe_summaries" {
-                                            state.remove_push_subs(cid, Some(server)).await;
+                                    let side_effect_key = (server.clone(), real_tool.clone());
+                                    if is_single_execution_tool(real_tool)
+                                        && !side_effect_calls.insert(side_effect_key)
+                                    {
+                                        format!(
+                                            "error: duplicate {server}/{real_tool} call blocked; \
+                                             use the earlier tool result and answer now"
+                                        )
+                                    } else {
+                                        let period = args
+                                            .as_ref()
+                                            .and_then(|m| m.get("period"))
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("1h")
+                                            .to_string();
+                                        let res = state.call_tool(server, real_tool, args).await;
+                                        // Record/clear durable push-subs so they survive restarts.
+                                        if let (Some(cid), Ok(_)) = (chat_id, &res) {
+                                            if real_tool == "subscribe_summaries" {
+                                                state
+                                                    .add_push_sub(cid, server.clone(), period)
+                                                    .await;
+                                            } else if real_tool == "unsubscribe_summaries" {
+                                                state.remove_push_subs(cid, Some(server)).await;
+                                            }
                                         }
-                                    }
-                                    match res {
-                                        Ok(out) => truncate(&out, TOOL_RESULT_CAP),
-                                        Err(e) => format!("error: {e}"),
+                                        match res {
+                                            Ok(out) => truncate(&out, TOOL_RESULT_CAP),
+                                            Err(e) => format!("error: {e}"),
+                                        }
                                     }
                                 }
                             }
@@ -287,8 +334,8 @@ impl Llm {
                 Commit to concrete results (with the coordinates/values you found); \
                 do not ask for more tools.",
         }));
-        fit_to_context(&mut messages, &self.cfg.model);
-        let final_msg = self.chat(&messages, &[]).await?;
+        fit_to_context(&mut messages, model_for_budget);
+        let final_msg = self.chat_with_model(&messages, &[], model_override).await?;
         let answer = final_msg["content"]
             .as_str()
             .unwrap_or("")
@@ -300,6 +347,22 @@ impl Llm {
             Ok(answer)
         }
     }
+}
+
+fn chat_body(model: &str, messages: &[Value], tools: &[Value]) -> Value {
+    let mut body = json!({
+        "model": model,
+        "messages": messages,
+    });
+    if !tools.is_empty() {
+        body["tools"] = json!(tools);
+        body["tool_choice"] = json!("auto");
+    }
+    body
+}
+
+fn is_single_execution_tool(real_tool: &str) -> bool {
+    matches!(real_tool, "create_doc" | "manage_event" | "create_event")
 }
 
 /// Clip the running tool-loop transcript back under the model's compaction
@@ -748,6 +811,10 @@ fn normalize_tool_args(server: &str, tool: &str, args: &mut Option<rmcp::model::
         }
         clamp_osm_bbox(map);
     }
+
+    if matches!(tool, "explore_area" | "find_nearby_places") {
+        clamp_radius_meters(map, 5_000.0);
+    }
 }
 
 /// Max bbox side, in degrees, allowed through to Overpass. A broad-tag query
@@ -787,6 +854,18 @@ fn clamp_osm_bbox(map: &mut rmcp::model::JsonObject) {
     bbox.insert("maxLat".into(), json!(nlat1));
     bbox.insert("minLon".into(), json!(nlon0));
     bbox.insert("maxLon".into(), json!(nlon1));
+}
+
+fn clamp_radius_meters(map: &mut rmcp::model::JsonObject, max: f64) {
+    let Some(radius) = map.get_mut("radius") else {
+        return;
+    };
+    let Some(r) = radius.as_f64() else {
+        return;
+    };
+    if r > max {
+        *radius = json!(max);
+    }
 }
 
 fn value_contains_cyrillic(v: &Value) -> bool {
@@ -975,6 +1054,15 @@ mod tests {
     }
 
     #[test]
+    fn high_impact_create_tools_are_single_execution() {
+        assert!(is_single_execution_tool("create_doc"));
+        assert!(is_single_execution_tool("manage_event"));
+        assert!(is_single_execution_tool("create_event"));
+        assert!(!is_single_execution_tool("inspect_doc_structure"));
+        assert!(!is_single_execution_tool("set_drive_file_permissions"));
+    }
+
+    #[test]
     fn map_geocode_cyrillic_defaults_to_ru() {
         let mut args = parse_args(r#"{"address":"Волгоград"}"#);
         normalize_tool_args("maps", "geocode_address", &mut args);
@@ -1042,6 +1130,25 @@ mod tests {
         assert_eq!(messages[4]["content"].as_str().unwrap().len(), 90_000);
     }
 
+    #[test]
+    fn chat_body_uses_per_agent_model_override() {
+        let messages = vec![json!({"role":"user","content":"hi"})];
+        let body = chat_body("planner-model", &messages, &[]);
+
+        assert_eq!(body["model"], "planner-model");
+        assert!(body.get("tools").is_none());
+
+        let tools = vec![json!({
+            "type": "function",
+            "function": {"name": "maps__geocode", "parameters": {"type":"object"}}
+        })];
+        let body = chat_body("map-worker-model", &messages, &tools);
+
+        assert_eq!(body["model"], "map-worker-model");
+        assert_eq!(body["tool_choice"], "auto");
+        assert_eq!(body["tools"].as_array().unwrap().len(), 1);
+    }
+
     fn obj(v: Value) -> Option<rmcp::model::JsonObject> {
         v.as_object().cloned()
     }
@@ -1073,6 +1180,17 @@ mod tests {
         let b = &args.unwrap()["bbox"];
         assert_eq!(b["minLat"].as_f64().unwrap(), 50.20);
         assert_eq!(b["maxLon"].as_f64().unwrap(), 43.65);
+    }
+
+    #[test]
+    fn map_radius_clamped_for_explore_area() {
+        let mut args = obj(json!({
+            "lat": 48.7,
+            "lon": 44.5,
+            "radius": 50000
+        }));
+        normalize_tool_args("maps", "explore_area", &mut args);
+        assert_eq!(args.unwrap()["radius"].as_f64().unwrap(), 5000.0);
     }
 
     #[test]

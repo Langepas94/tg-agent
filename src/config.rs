@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -8,7 +8,7 @@ pub struct Config {
     /// Web admin UI bind address, e.g. 127.0.0.1:8080 behind nginx.
     pub admin_addr: Option<String>,
     pub admin_username: String,
-    pub admin_password: String,
+    pub admin_password: Option<String>,
     /// How often to send digest, in minutes
     pub digest_interval_minutes: u64,
     /// LLM config; None means the agent answers only via explicit commands.
@@ -39,8 +39,11 @@ impl Config {
         let admin_username = std::env::var("ADMIN_USERNAME").unwrap_or_else(|_| "admin".into());
         let admin_password = std::env::var("ADMIN_PASSWORD")
             .ok()
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| bot_password.clone());
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        if admin_password.as_deref() == Some(bot_password.as_str()) {
+            bail!("ADMIN_PASSWORD must be different from BOT_PASSWORD");
+        }
 
         // Accept DEEPSEEK_API_KEY or generic LLM_API_KEY.
         let api_key = std::env::var("LLM_API_KEY")
