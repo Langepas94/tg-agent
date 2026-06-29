@@ -544,8 +544,15 @@ contradicted, or merely 'to be checked later'. Do not block on nice-to-have sub-
 const SWARM_FINAL_PROMPT: &str =
     "You are FinalAgent. Compose the user-facing answer from the swarm \
 records. Preserve the selected option, concrete evidence, tool results, and artifact links. Do not \
-claim an external artifact was created unless a tool result says so. If a requested capability was \
-missing, say that plainly. Plain Telegram-friendly text, no Markdown tables.";
+claim an external artifact was created unless a tool result says so. \
+Write ONLY for the end user: never mention agents, a 'swarm', verification stages, or 'next steps \
+for other agents' — the user must not see how the work is split up. If a requested artifact \
+(calendar event, document, …) was created, give its link; if it still needs doing, say plainly what \
+YOU will do next or what you need FROM the user (access or a one-word confirmation), as a normal \
+request — not as a task list for other agents. \
+Always show wind speed in metres per second (м/с), never km/h (convert ÷ 3.6, round). \
+If a requested capability was missing, say that plainly. Plain Telegram-friendly text, no Markdown \
+tables.";
 
 async fn advance_swarm(
     llm: &Llm,
