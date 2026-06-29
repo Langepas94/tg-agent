@@ -397,6 +397,73 @@ fn looks_like_fresh_full_request(text: &str) -> bool {
     sentence_marks >= 2 && request_hits >= 2 && constraint_hits >= 2
 }
 
+fn broad_place_choice_required(brief: &TripBrief, text: &str) -> bool {
+    let combined = format!("{}\n{}", brief.render(), text).to_lowercase();
+    let asks_where = contains_any(
+        &combined,
+        &[
+            "в каких местах",
+            "какие места",
+            "где лучше",
+            "куда лучше",
+            "подбери места",
+            "варианты мест",
+            "which places",
+            "where should",
+        ],
+    );
+    let broad_area = contains_any(
+        &combined,
+        &[
+            "рядом",
+            "недалеко",
+            "в радиусе",
+            "область",
+            "регион",
+            "из волгограда",
+            "от волгограда",
+            "near",
+            "around",
+            "region",
+        ],
+    );
+    asks_where || broad_area
+}
+
+fn option_candidate_count(text: &str) -> usize {
+    let mut numbered = 0usize;
+    let mut candidate_lines = 0usize;
+    for raw in text.lines() {
+        let line = raw.trim_start();
+        if line.is_empty() {
+            continue;
+        }
+        let mut chars = line.chars();
+        let first = chars.next();
+        let second = chars.next();
+        if first.is_some_and(|c| c.is_ascii_digit()) && matches!(second, Some('.') | Some(')')) {
+            numbered += 1;
+            continue;
+        }
+        let low = line.to_lowercase();
+        if low.starts_with("вариант ")
+            || low.starts_with("- вариант ")
+            || low.starts_with("* вариант ")
+        {
+            candidate_lines += 1;
+        }
+    }
+    numbered.max(candidate_lines)
+}
+
+fn options_need_repair(brief: &TripBrief, user_text: &str, options: &str) -> bool {
+    broad_place_choice_required(brief, user_text) && option_candidate_count(options) < 2
+}
+
+fn render_options_repair_needed() -> String {
+    "Не хочу выбирать за вас один случайный маршрут: запрос широкий, а сравнительный список мест не собрался достаточно надёжно. Я сохранил состояние; напишите «продолжай», и я сначала соберу именно несколько разных вариантов мест, а не буду строить маршрут по одному варианту.".to_string()
+}
+
 fn contains_any(text: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| text.contains(needle))
 }
@@ -467,6 +534,43 @@ fn progress_message_for_task(task: &SwarmTask) -> String {
         "• Проверяю один блок плана…"
     };
     msg.to_string()
+}
+
+fn record_is_internal_bookkeeping(stage: &str) -> bool {
+    matches!(stage, "OptionsAgent" | "UserChoice")
+}
+
+fn records_contain_unconfirmed_output(records: &[StageRecord]) -> bool {
+    records.iter().any(|r| {
+        let low = r.output.to_lowercase();
+        worker_output_needs_best_effort(&r.output)
+            || contains_any(
+                &low,
+                &[
+                    "драфт",
+                    "draft",
+                    "не подтверж",
+                    "неподтверж",
+                    "частично подтверж",
+                    "осталось проверить",
+                    "оставшиеся проверки",
+                    "нужно до конца подтвердить",
+                    "to be verified",
+                    "unconfirmed",
+                    "not verified",
+                ],
+            )
+    })
+}
+
+fn records_have_data_result(records: &[StageRecord]) -> bool {
+    records.iter().any(|r| {
+        !record_is_internal_bookkeeping(&r.stage) && !worker_output_needs_best_effort(&r.output)
+    })
+}
+
+fn side_effects_locally_allowed(records: &[StageRecord]) -> bool {
+    records_have_data_result(records) && !records_contain_unconfirmed_output(records)
 }
 
 // ---------------------------------------------------------------------------
@@ -695,14 +799,19 @@ MUST be genuinely DIFFERENT places (e.g. different rivers, lakes, trailheads), n
 variants of a single spot — use the geo tools to discover real candidates within the user's \
 travel-time/area limit and present every genuinely distinct, suitable one that exists. Let the \
 count follow the terrain: offer as few or as many as are truly distinct and worthwhile; never pad \
-to a number and never collapse to one when alternatives exist. If the user DID name a specific \
-spot, offer distinct variants of that spot instead. Give each candidate's approximate coordinates \
-as `lat, lon`. End by asking the user to choose one option. Plain text, no Markdown table.";
+to a number and never collapse to one when alternatives exist. If broad-place tools/data cannot \
+support at least two real candidates, output `STAGE_INCOMPLETE: comparative place options missing` \
+and say what capability/data was missing; do not silently pick one place. If the user DID name a \
+specific spot, offer distinct variants of that spot instead. Give each candidate's approximate \
+coordinates as `lat, lon`. End by asking the user to choose one option. Plain text, no Markdown \
+table.";
 
 const SWARM_PLANNER_PROMPT: &str = "You are SwarmPlanner. Build a minimal swarm plan from the \
 brief, the user's chosen option, prior records, and the ACTUAL connected MCP tool inventory. Do \
 not assume calendar/docs/maps/weather tools exist; inspect the inventory. Do not use fixed \
 activity templates. Create separate worker tasks with narrow responsibilities and isolated context. \
+If the prior records are still only broad options or an unverified draft, do NOT include \
+side_effects=true tasks yet; first gather/verify the selected place, date, route and camp. \
 Include a side_effects=true task only for external artifacts explicitly requested by the user AND \
 only if plausible tools are present or connectable; otherwise include a non-side-effect task that \
 explains the missing capability. Return ONLY JSON: {\"tasks\":[{\"id\":\"short_snake\",\
@@ -820,7 +929,7 @@ async fn advance_swarm(
             let _ = p.send("🧭 Подбираю короткие варианты…".to_string());
         }
         let options_agent = registry.get("OptionsAgent");
-        let options = run_swarm_worker(
+        let mut options = run_swarm_worker(
             llm,
             state,
             session,
@@ -835,7 +944,44 @@ async fn advance_swarm(
             true,
         )
         .await;
-        let options = clean_user_text(&options);
+        options = clean_user_text(&options);
+        if options_need_repair(&flow.brief, user_text, &options) {
+            let repair_prompt = format!(
+                "{SWARM_OPTIONS_PROMPT}\n\nYour previous response did not offer enough distinct \
+                 place choices for a broad-location request. One river/route is NOT acceptable. \
+                 Try again: compare genuinely different candidate places/water bodies reachable \
+                 from the user's start area. Do not build a detailed route yet. Return at least \
+                 two candidates if the tools/data can support them; otherwise say plainly that \
+                 a comparative place list could not be gathered.\n\n[previous-response]\n{options}"
+            );
+            let repaired = run_swarm_worker(
+                llm,
+                state,
+                session,
+                &options_agent,
+                &repair_prompt,
+                &format!(
+                    "[brief]\n{}\n\n[available-tools]\n{}\n\n[user-request]\n{}",
+                    flow.brief.render(),
+                    tool_context,
+                    user_text
+                ),
+                true,
+            )
+            .await;
+            options = clean_user_text(&repaired);
+        }
+        if options_need_repair(&flow.brief, user_text, &options) {
+            flow.stage = Stage::Planning;
+            set_named_record(&mut flow.records, "OptionsAgent", options);
+            flow.awaiting_choice = Some(Stage::Planning);
+            session.trip = Some(flow);
+            return Ok(FlowTurn {
+                reply: render_options_repair_needed(),
+                trace,
+                done: false,
+            });
+        }
         flow.stage = Stage::Planning;
         set_named_record(&mut flow.records, "OptionsAgent", options.clone());
         flow.awaiting_choice = Some(Stage::Planning);
@@ -845,6 +991,61 @@ async fn advance_swarm(
             trace,
             done: false,
         });
+    }
+
+    if flow.awaiting_choice == Some(Stage::Planning) && message_requests_continuation(user_text) {
+        if let Some(existing_options) = flow
+            .records
+            .iter()
+            .find(|r| r.stage == "OptionsAgent")
+            .map(|r| r.output.clone())
+        {
+            let original_request = flow
+                .brief
+                .fields
+                .get("request")
+                .cloned()
+                .unwrap_or_else(|| user_text.to_string());
+            if options_need_repair(&flow.brief, &original_request, &existing_options)
+                || existing_options.contains("STAGE_INCOMPLETE")
+            {
+                if let Some(p) = progress {
+                    let _ = p.send("🧭 Сначала сравниваю разные места…".to_string());
+                }
+                let options_agent = registry.get("OptionsAgent");
+                let repaired = run_swarm_worker(
+                    llm,
+                    state,
+                    session,
+                    &options_agent,
+                    SWARM_OPTIONS_PROMPT,
+                    &format!(
+                        "[brief]\n{}\n\n[available-tools]\n{}\n\n[user-request]\n{}",
+                        flow.brief.render(),
+                        tool_context,
+                        original_request
+                    ),
+                    true,
+                )
+                .await;
+                let repaired = clean_user_text(&repaired);
+                let still_needs_repair =
+                    options_need_repair(&flow.brief, &original_request, &repaired);
+                set_named_record(&mut flow.records, "OptionsAgent", repaired.clone());
+                flow.awaiting_choice = Some(Stage::Planning);
+                session.trip = Some(flow);
+                let reply = if still_needs_repair {
+                    render_options_repair_needed()
+                } else {
+                    repaired
+                };
+                return Ok(FlowTurn {
+                    reply,
+                    trace,
+                    done: false,
+                });
+            }
+        }
     }
 
     let user_choice = user_text.trim();
@@ -892,6 +1093,13 @@ async fn advance_swarm(
             flow.records.retain(|r| r.stage != id);
         }
         if registry.task_requires_verifier_gate(&task) {
+            if !side_effects_locally_allowed(&flow.records) {
+                trace.push(
+                    "side-effect gate not ready: local records are not fully confirmed".into(),
+                );
+                artifacts_skipped = true;
+                continue;
+            }
             let verdict =
                 verify_swarm_ready(llm, &registry, &flow.brief, &flow.records, &tool_context).await;
             if !verdict.ready {
@@ -1710,7 +1918,7 @@ mod tests {
         let records = vec![
             StageRecord {
                 stage: "OptionsAgent".into(),
-                output: "Вариант: Донская излучина, 50.100, 43.200.".into(),
+                output: "Вариант: Река А, 50.100, 43.200.".into(),
             },
             StageRecord {
                 stage: "research".into(),
@@ -1720,7 +1928,7 @@ mod tests {
 
         let out = fallback_compose(&records);
 
-        assert!(out.contains("Донская излучина"));
+        assert!(out.contains("Река А"));
         assert!(!out.contains("(stage failed:"));
         assert!(out.contains("Внешние артефакты ещё не создавал"));
     }
@@ -1779,6 +1987,59 @@ mod tests {
 
         assert!(progress_message_for_task(&camp).contains("стоянку"));
         assert!(progress_message_for_task(&route).contains("маршрута"));
+    }
+
+    #[test]
+    fn broad_place_request_rejects_single_option() {
+        let mut brief = TripBrief::default();
+        brief.fields.insert(
+            "request".into(),
+            "в каких местах рядом с Волгоградом".into(),
+        );
+        let one = "1. Река А — спокойный сплав, 50.1347, 43.5215";
+        let many = "1. Река А — 50.1347, 43.5215\n2. Река Б — 48.700, 44.500";
+
+        assert!(options_need_repair(
+            &brief,
+            "Хотим байдарки, в каких местах рядом с Волгоградом?",
+            one
+        ));
+        assert!(!options_need_repair(
+            &brief,
+            "Хотим байдарки, в каких местах рядом с Волгоградом?",
+            many
+        ));
+    }
+
+    #[test]
+    fn side_effect_gate_rejects_draft_or_unconfirmed_records() {
+        let draft = vec![StageRecord {
+            stage: "route".into(),
+            output: "ДРАФТ: лагерь не подтвержден, осталось проверить турбазы".into(),
+        }];
+        let confirmed = vec![StageRecord {
+            stage: "route".into(),
+            output: "Маршрут подтвержден: старт 50.100, 43.200; лагерь 50.120, 43.230; вода 10 м; села дальше 1 км.".into(),
+        }];
+
+        assert!(!side_effects_locally_allowed(&draft));
+        assert!(side_effects_locally_allowed(&confirmed));
+    }
+
+    #[test]
+    fn side_effect_gate_requires_real_data_record() {
+        let only_choice = vec![
+            StageRecord {
+                stage: "OptionsAgent".into(),
+                output: "1. Река А\n2. Река Б".into(),
+            },
+            StageRecord {
+                stage: "UserChoice".into(),
+                output: "первый вариант".into(),
+            },
+        ];
+
+        assert!(!side_effects_locally_allowed(&only_choice));
     }
 
     #[test]
