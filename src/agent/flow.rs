@@ -655,7 +655,7 @@ async fn advance_swarm(
     }
 
     if let Some(p) = progress {
-        let _ = p.send("🧠 Планирую шаги роя…".to_string());
+        let _ = p.send("🧠 Планирую маршрут…".to_string());
     }
     let plan = make_swarm_plan(
         llm,
@@ -674,6 +674,9 @@ async fn advance_swarm(
         });
     }
 
+    // True once we skip a side-effecting task because the verifier wasn't ready:
+    // we keep planning/answering but must not mark the turn done (no artifacts yet).
+    let mut artifacts_skipped = false;
     for task in plan.tasks {
         let id = sanitize_record_id(&task.id, &task.agent);
         let task_agent = registry.for_task(&task);
@@ -689,17 +692,20 @@ async fn advance_swarm(
             let verdict =
                 verify_swarm_ready(llm, &registry, &flow.brief, &flow.records, &tool_context).await;
             if !verdict.ready {
-                flow.awaiting_choice = None;
-                session.trip = Some(flow);
-                return Ok(FlowTurn {
-                    reply: render_swarm_incomplete(&verdict.missing),
-                    trace,
-                    done: false,
-                });
+                // Verifier not satisfied: skip THIS side-effecting task (no gdoc /
+                // calendar on unconfirmed data) but keep going — the user still
+                // gets a draft from what was gathered, never a bare "not ready".
+                trace.push(format!(
+                    "verifier-gate not ready: {}",
+                    verdict.missing.join("; ")
+                ));
+                artifacts_skipped = true;
+                continue;
             }
         }
         if let Some(p) = progress {
-            let _ = p.send(format!("• {}: работаю", task_agent.name));
+            // Neutral liveness only — never leak internal agent names to the user.
+            let _ = p.send("• собираю данные для плана…".to_string());
         }
         let system = build_swarm_worker_system(session, &task, &task_agent, &tool_context);
         let query = format!(
@@ -726,10 +732,15 @@ async fn advance_swarm(
         if output_admits_unresolved_core_data(&output) || output.contains("STAGE_INCOMPLETE") {
             set_named_record(&mut flow.records, &id, output.clone());
             flow.awaiting_choice = None;
-            session.trip = Some(flow);
             trace.push(format!("• {}: {}", task_agent.name, clip(&output, 90)));
+            // A worker couldn't get every concrete value — hand back a draft of
+            // what we DO have (places, dates, stops) instead of stranding the user.
+            let draft =
+                compose_best_effort(llm, &registry, &flow.brief, &flow.records, &tool_context)
+                    .await;
+            session.trip = Some(flow);
             return Ok(FlowTurn {
-                reply: render_swarm_incomplete(&[clip(&output, 160)]),
+                reply: draft,
                 trace,
                 done: false,
             });
@@ -749,10 +760,18 @@ async fn advance_swarm(
     let verdict =
         verify_swarm_ready(llm, &registry, &flow.brief, &flow.records, &tool_context).await;
     if !verdict.ready {
+        // Don't strand the user: hand back a concrete draft of what was gathered
+        // (places, dates, stops) flagged as unconfirmed, with no artifacts created.
         flow.awaiting_choice = None;
+        trace.push(format!(
+            "final verify not ready: {}",
+            verdict.missing.join("; ")
+        ));
+        let draft =
+            compose_best_effort(llm, &registry, &flow.brief, &flow.records, &tool_context).await;
         session.trip = Some(flow);
         return Ok(FlowTurn {
-            reply: render_swarm_incomplete(&verdict.missing),
+            reply: draft,
             trace,
             done: false,
         });
@@ -776,6 +795,16 @@ async fn advance_swarm(
     .await
     .map(|s| clean_user_text(&s))
     .unwrap_or_else(|_| fallback_compose(&flow.records));
+    if artifacts_skipped {
+        // Data is confirmed now, but the side-effect step was skipped this turn —
+        // keep the flow open so «продолжай» creates the gdoc / calendar event.
+        session.trip = Some(flow);
+        return Ok(FlowTurn {
+            reply: final_answer,
+            trace,
+            done: false,
+        });
+    }
     session.trip = None;
     Ok(FlowTurn {
         reply: final_answer,
@@ -1006,20 +1035,40 @@ fn sanitize_record_id(id: &str, agent: &str) -> String {
         .collect()
 }
 
-fn render_swarm_incomplete(missing: &[String]) -> String {
-    let items = if missing.is_empty() {
-        "• не хватает подтверждённых данных".to_string()
-    } else {
-        missing
-            .iter()
-            .take(5)
-            .map(|m| format!("• {m}"))
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
-    format!(
-        "Финал ещё не готов: верификатор не подтвердил план, поэтому внешние артефакты не создаю.\n{items}\n\nМожно написать «продолжай» — рой продолжит с недостающих проверок."
+/// Compose a best-effort DRAFT when the verifier could not confirm the plan or
+/// a worker stage came back incomplete. We never strand the user with a bare
+/// "not ready" notice: surface the concrete places/dates/stops already gathered,
+/// flag what is unconfirmed, and create NO external artifacts.
+async fn compose_best_effort(
+    llm: &Llm,
+    registry: &SwarmAgentRegistry,
+    brief: &TripBrief,
+    records: &[StageRecord],
+    tool_context: &str,
+) -> String {
+    let final_agent = registry.get("FinalAgent");
+    let system = format!(
+        "{SWARM_FINAL_PROMPT}\n\nThe plan is NOT fully verified yet. Produce a concrete, useful \
+         DRAFT the user can act on right now: give the candidate place(s), date(s) and stops you \
+         DO have with their real values (names, coordinates, distances), and mark anything \
+         unconfirmed with «(не подтверждено)». Never reply that nothing is ready. Create NO \
+         external artifacts and do not claim any were created. End with one short line inviting \
+         the user to reply «продолжай» to finish the remaining checks."
+    );
+    complete_swarm_agent(
+        llm,
+        &final_agent,
+        &system,
+        &format!(
+            "[brief]\n{}\n\n[available-tools]\n{}\n\n[agent-records]\n{}",
+            brief.render(),
+            tool_context,
+            render_records_clipped(records, |_| 1800)
+        ),
     )
+    .await
+    .map(|s| clean_user_text(&s))
+    .unwrap_or_else(|_| fallback_compose(records))
 }
 
 impl SwarmTask {
