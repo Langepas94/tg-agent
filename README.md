@@ -33,7 +33,10 @@ natural language using their tools, and runs periodic jobs 24/7.
   - **invariants** checked in code (Pass/Fail/Advisory) and injected into the
     system prompt
   - layered **PromptBuilder**
-  - multi-agent **travel-weather flow** (Planning → Execution → Validation → Done)
+  - dynamic multi-agent **trip-planning swarm** — a planner LLM builds the task
+    graph from the live MCP tool inventory; each agent (Brief / Options / Planner
+    / Worker / Verifier / Artifacts / Final) is a separate entity with its own
+    role, permissions and (optionally) its own model via `SWARM_MODEL_<AGENT>`
 - **Persistence** — connected servers, subscribers, watches and per-chat
   sessions survive restarts.
 

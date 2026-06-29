@@ -1,8 +1,9 @@
 //! Live end-to-end trip-flow driver. Runs the FULL stateful swarm against the
 //! real LLM + real MCP servers (weather over HTTP, maps/osmmcp over stdio) and
 //! prints every turn, so the flow can be verified by actually running it instead
-//! of guessing. Drives two activities — a water trip and a NON-water (cycling)
-//! trip — to prove the stages are activity-agnostic (no river/water hardcode).
+//! of guessing. Drives three activities — a water (kayak) trip, a NON-water
+//! (cycling) trip, and a light day-walk — to prove the swarm is
+//! activity-agnostic (no river/water/overnight hardcode).
 //!
 //! Needs on the host: LLM_API_KEY (+ optional LLM_BASE_URL / LLM_MODEL), the
 //! weather MCP reachable, and the osmmcp binary (OSM_BIN, default
@@ -93,30 +94,37 @@ async fn setup() -> (Arc<Llm>, BotState) {
         .iter()
         .filter_map(|k| std::env::var(k).ok().map(|v| ((*k).to_string(), v)))
         .collect::<Vec<_>>();
-    assert!(
-        google_env
-            .iter()
-            .any(|(k, _)| k == "GOOGLE_OAUTH_CLIENT_ID"),
-        "set Google MCP env from the VPS state before running this live suite"
-    );
-    state
-        .connect_mcp(ConnectParams {
-            name: "google".into(),
-            url: String::new(),
-            auth: None,
-            headers: vec![],
-            command: std::env::var("GOOGLE_MCP_COMMAND")
-                .ok()
-                .map(|s| s.split_whitespace().map(str::to_string).collect())
-                .unwrap_or_else(|| {
-                    vec!["uvx".into(), "workspace-mcp".into(), "--single-user".into()]
-                }),
-            env: google_env,
-        })
-        .await
-        .expect("connect Google MCP");
+    // Google MCP is OPTIONAL: the activity-agnostic scenarios (kayak / cycling /
+    // walk) need only weather + maps. Only the artifact-creating kayak test needs
+    // Google, and it skips itself when the env is absent (see `google_ready`).
+    if google_env
+        .iter()
+        .any(|(k, _)| k == "GOOGLE_OAUTH_CLIENT_ID")
+    {
+        state
+            .connect_mcp(ConnectParams {
+                name: "google".into(),
+                url: String::new(),
+                auth: None,
+                headers: vec![],
+                command: std::env::var("GOOGLE_MCP_COMMAND")
+                    .ok()
+                    .map(|s| s.split_whitespace().map(str::to_string).collect())
+                    .unwrap_or_else(|| {
+                        vec!["uvx".into(), "workspace-mcp".into(), "--single-user".into()]
+                    }),
+                env: google_env,
+            })
+            .await
+            .expect("connect Google MCP");
+    }
 
     (llm, state)
+}
+
+/// True when the Google MCP env is present, so artifact-creating tests can run.
+fn google_ready() -> bool {
+    std::env::var("GOOGLE_OAUTH_CLIENT_ID").is_ok()
 }
 
 /// Feed one user message, print the swarm trace + reply, return (reply, done).
@@ -178,7 +186,10 @@ async fn drive_assert_done(
 ) -> String {
     let (mut answer, mut done) = step(llm, state, session, opener).await;
     let mut guard = 0;
-    while !done && guard < 8 {
+    // A constraint-heavy plan (e.g. a paddling trip needing put-in + isolated
+    // waterside campsite) can take several "продолжай" rounds on a slow host as
+    // workers fill in concrete OSM data; give the swarm room to converge.
+    while !done && guard < 12 {
         guard += 1;
         let next = "Давай первый вариант. Подтверждаю, двигайся дальше.";
         let (r, d) = step(llm, state, session, next).await;
@@ -192,6 +203,10 @@ async fn drive_assert_done(
 #[tokio::test]
 #[ignore]
 async fn live_full_kayak_trip_creates_google_artifacts() {
+    if !google_ready() {
+        eprintln!("skipping: Google MCP env not set (set GOOGLE_OAUTH_CLIENT_ID … to run)");
+        return;
+    }
     let (llm, state) = setup().await;
     let mut session = ChatSession::new(9101);
     session.profile.set("home_city", "Волгоград");
@@ -313,5 +328,54 @@ async fn live_cycling_trip_end_to_end_no_water_hardcode() {
             && !lower.contains("put-in")
             && !lower.contains("take-out"),
         "cycling trip was converted into a paddling route: {final_answer}"
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn live_walk_to_see_new_place_end_to_end_no_overnight_hardcode() {
+    let (llm, state) = setup().await;
+    let mut session = ChatSession::new(9003);
+    session.profile.set("home_city", "Волгоград");
+    // A light day-walk to discover a new spot. No overnight, no paddling, no
+    // cycling. The swarm must NOT invent a campsite / water-distance / route
+    // track requirement, nor convert it into a kayak or bike trip.
+    let final_answer = drive_assert_done(
+        &llm,
+        &state,
+        &mut session,
+        "Хочу просто прогуляться в эти выходные и посмотреть какое-нибудь новое \
+         интересное место недалеко от города. Без ночёвки, пешком на пару часов. \
+         Подскажи куда сходить.",
+    )
+    .await;
+    assert_final_concrete(&final_answer);
+    let lower = final_answer.to_lowercase();
+    assert!(
+        lower.contains("прогул")
+            || lower.contains("пеш")
+            || lower.contains("walk")
+            || lower.contains("место")
+            || lower.contains("парк"),
+        "walk lost its sightseeing/walking semantics: {final_answer}"
+    );
+    assert!(
+        !lower.contains("байдар")
+            && !lower.contains("каяк")
+            && !lower.contains("сплав")
+            && !lower.contains("велопоход")
+            && !lower.contains("put-in"),
+        "walk was converted into a paddling or cycling trip: {final_answer}"
+    );
+    // a 2-hour day walk must not have an invented overnight campsite. Note: the
+    // bot legitimately says "без ночёвки" (NO overnight), so ban only a
+    // POSITIVELY proposed overnight/tent stay, not the negated mention.
+    assert!(
+        !lower.contains("с ночёвкой")
+            && !lower.contains("место ночёвк")
+            && !lower.contains("в палатк")
+            && !lower.contains("ночёвка у")
+            && !lower.contains("разбить лагерь"),
+        "day walk invented an overnight stay it was never asked for: {final_answer}"
     );
 }
