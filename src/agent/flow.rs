@@ -550,6 +550,13 @@ async fn advance_swarm(
     let mut flow = session.trip.clone().unwrap_or_else(TripFlowState::start);
     let mut trace = Vec::new();
 
+    // The first agent call (BriefAgent) can itself take many seconds on a slow
+    // model, so announce the swarm is working BEFORE it — otherwise the chat is
+    // silent until the first stage boundary.
+    if let Some(p) = progress {
+        let _ = p.send("🔎 Разбираю запрос…".to_string());
+    }
+
     if flow.records.is_empty() {
         // Preserve the user's ORIGINAL request verbatim so no later agent ever
         // loses it across clarify rounds — the structured brief may capture it
@@ -647,6 +654,9 @@ async fn advance_swarm(
         );
     }
 
+    if let Some(p) = progress {
+        let _ = p.send("🧠 Планирую шаги роя…".to_string());
+    }
     let plan = make_swarm_plan(
         llm,
         &registry,
@@ -748,6 +758,9 @@ async fn advance_swarm(
         });
     }
 
+    if let Some(p) = progress {
+        let _ = p.send("📝 Собираю финальный план…".to_string());
+    }
     let final_agent = registry.get("FinalAgent");
     let final_answer = complete_swarm_agent(
         llm,
