@@ -12,7 +12,10 @@
 //! `SWARM_MODEL_<AGENT>` or per task). The old fixed `Stage` labels are retained
 //! only as serialized-state compatibility shells; they no longer drive the flow.
 
-use std::{collections::BTreeMap, time::Duration};
+use std::{
+    collections::BTreeMap,
+    time::{Duration, Instant},
+};
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -927,7 +930,26 @@ async fn run_swarm_worker(
                 .await
         }
     };
-    match tokio::time::timeout(STAGE_TIMEOUT, run).await {
+    let started = Instant::now();
+    let result = tokio::time::timeout(STAGE_TIMEOUT, run).await;
+    let ms = started.elapsed().as_millis();
+    // Per-stage timing so a `(stage timed out)` names WHICH worker was slow and
+    // for how long — the only way to tell an LLM tool-loop from a hung MCP call.
+    match &result {
+        Err(_) => tracing::warn!(
+            agent = %agent.name, model = %agent.model, tools = allow_tools && agent.tools_allowed,
+            elapsed_ms = ms, "swarm worker TIMED OUT (limit {}s)", STAGE_TIMEOUT.as_secs()
+        ),
+        Ok(Err(e)) => tracing::warn!(
+            agent = %agent.name, model = %agent.model, elapsed_ms = ms,
+            "swarm worker failed: {e}"
+        ),
+        Ok(Ok(_)) => tracing::debug!(
+            agent = %agent.name, model = %agent.model, tools = allow_tools && agent.tools_allowed,
+            elapsed_ms = ms, "swarm worker done"
+        ),
+    }
+    match result {
         Err(_) => "(stage timed out)".to_string(),
         Ok(Ok(o)) if !o.trim().is_empty() => o,
         Ok(Ok(_)) => "(no output)".to_string(),
@@ -989,8 +1011,20 @@ async fn complete_swarm_agent(
     input: &str,
 ) -> Result<String> {
     let system = swarm_agent_system(agent, system);
-    llm.complete_with_model(&system, input, Some(&agent.model))
-        .await
+    let started = Instant::now();
+    let out = llm
+        .complete_with_model(&system, input, Some(&agent.model))
+        .await;
+    let ms = started.elapsed().as_millis();
+    match &out {
+        Ok(_) => {
+            tracing::debug!(agent = %agent.name, model = %agent.model, elapsed_ms = ms, "swarm agent done")
+        }
+        Err(e) => {
+            tracing::warn!(agent = %agent.name, model = %agent.model, elapsed_ms = ms, "swarm agent failed: {e}")
+        }
+    }
+    out
 }
 
 fn render_tool_inventory(tools: &[crate::state::ToolSummary]) -> String {
