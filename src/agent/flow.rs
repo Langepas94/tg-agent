@@ -698,9 +698,7 @@ async fn advance_swarm(
         let id = sanitize_record_id(&task.id, &task.agent);
         let task_agent = registry.for_task(&task);
         if let Some(existing) = flow.records.iter().find(|r| r.stage == id) {
-            if !is_stage_unresolved(&existing.output)
-                && !output_admits_unresolved_core_data(&existing.output)
-            {
+            if !worker_output_needs_best_effort(&existing.output) {
                 continue;
             }
             flow.records.retain(|r| r.stage != id);
@@ -746,7 +744,7 @@ async fn advance_swarm(
             tool_context = render_tool_inventory(&state.tool_inventory().await);
         }
         let output = clean_user_text(&output);
-        if output_admits_unresolved_core_data(&output) || output.contains("STAGE_INCOMPLETE") {
+        if worker_output_needs_best_effort(&output) {
             set_named_record(&mut flow.records, &id, output.clone());
             flow.awaiting_choice = None;
             trace.push(format!("• {}: {}", task_agent.name, clip(&output, 90)));
@@ -1240,6 +1238,10 @@ fn is_stage_unresolved(output: &str) -> bool {
     is_stage_failure(output) || output.contains("STAGE_INCOMPLETE")
 }
 
+fn worker_output_needs_best_effort(output: &str) -> bool {
+    is_stage_unresolved(output) || output_admits_unresolved_core_data(output)
+}
+
 fn render_records_clipped(
     records: &[StageRecord],
     clip_for_stage: impl Fn(&str) -> usize,
@@ -1260,13 +1262,25 @@ fn render_records_clipped(
         .join("\n\n")
 }
 
-/// LLM-free fallback if the compose call fails: concatenate stage outputs.
+/// LLM-free fallback if the compose call fails.
 fn fallback_compose(records: &[StageRecord]) -> String {
-    records
+    let useful = records
         .iter()
+        .filter(|r| {
+            let output = r.output.trim();
+            !output.is_empty() && output != "(no output)" && !is_stage_failure(output)
+        })
         .map(|r| format!("{}:\n{}", r.stage, r.output))
         .collect::<Vec<_>>()
-        .join("\n\n")
+        .join("\n\n");
+
+    if useful.trim().is_empty() {
+        return "Пока не смог завершить сбор данных: один из внешних запросов завис или вернул пустой ответ. Состояние сохранено; напишите «продолжай», и я повторю сбор без создания календаря или документа на непроверенных данных.".to_string();
+    }
+
+    format!(
+        "Пока не удалось довести проверку до конца, но вот что уже собрано. Внешние артефакты ещё не создавал.\n\n{useful}\n\nНапишите «продолжай», и я повторю недостающий сбор данных."
+    )
 }
 
 /// Extract the first JSON object from a possibly fenced LLM reply.
@@ -1422,6 +1436,54 @@ mod tests {
         assert!(!clean.contains("|---"));
         assert!(!clean.contains("**"));
         assert!(!clean.contains("profile:"));
+    }
+
+    #[test]
+    fn worker_failures_trigger_best_effort_path() {
+        assert!(worker_output_needs_best_effort("(stage timed out)"));
+        assert!(worker_output_needs_best_effort(
+            "(stage failed: MCP request failed)"
+        ));
+        assert!(worker_output_needs_best_effort(
+            "STAGE_INCOMPLETE: не найдена стоянка у воды"
+        ));
+        assert!(!worker_output_needs_best_effort(
+            "Маршрут готов: старт 50.100, 43.200; лагерь 50.120, 43.230."
+        ));
+    }
+
+    #[test]
+    fn fallback_compose_hides_internal_stage_failures() {
+        let records = vec![StageRecord {
+            stage: "research".into(),
+            output: "(stage timed out)".into(),
+        }];
+
+        let out = fallback_compose(&records);
+
+        assert!(!out.contains("(stage timed out)"));
+        assert!(!out.contains("research:"));
+        assert!(out.contains("продолжай"));
+    }
+
+    #[test]
+    fn fallback_compose_keeps_useful_records_and_skips_failures() {
+        let records = vec![
+            StageRecord {
+                stage: "OptionsAgent".into(),
+                output: "Вариант: Донская излучина, 50.100, 43.200.".into(),
+            },
+            StageRecord {
+                stage: "research".into(),
+                output: "(stage failed: timeout)".into(),
+            },
+        ];
+
+        let out = fallback_compose(&records);
+
+        assert!(out.contains("Донская излучина"));
+        assert!(!out.contains("(stage failed:"));
+        assert!(out.contains("Внешние артефакты ещё не создавал"));
     }
 
     #[test]
