@@ -94,30 +94,37 @@ async fn setup() -> (Arc<Llm>, BotState) {
         .iter()
         .filter_map(|k| std::env::var(k).ok().map(|v| ((*k).to_string(), v)))
         .collect::<Vec<_>>();
-    assert!(
-        google_env
-            .iter()
-            .any(|(k, _)| k == "GOOGLE_OAUTH_CLIENT_ID"),
-        "set Google MCP env from the VPS state before running this live suite"
-    );
-    state
-        .connect_mcp(ConnectParams {
-            name: "google".into(),
-            url: String::new(),
-            auth: None,
-            headers: vec![],
-            command: std::env::var("GOOGLE_MCP_COMMAND")
-                .ok()
-                .map(|s| s.split_whitespace().map(str::to_string).collect())
-                .unwrap_or_else(|| {
-                    vec!["uvx".into(), "workspace-mcp".into(), "--single-user".into()]
-                }),
-            env: google_env,
-        })
-        .await
-        .expect("connect Google MCP");
+    // Google MCP is OPTIONAL: the activity-agnostic scenarios (kayak / cycling /
+    // walk) need only weather + maps. Only the artifact-creating kayak test needs
+    // Google, and it skips itself when the env is absent (see `google_ready`).
+    if google_env
+        .iter()
+        .any(|(k, _)| k == "GOOGLE_OAUTH_CLIENT_ID")
+    {
+        state
+            .connect_mcp(ConnectParams {
+                name: "google".into(),
+                url: String::new(),
+                auth: None,
+                headers: vec![],
+                command: std::env::var("GOOGLE_MCP_COMMAND")
+                    .ok()
+                    .map(|s| s.split_whitespace().map(str::to_string).collect())
+                    .unwrap_or_else(|| {
+                        vec!["uvx".into(), "workspace-mcp".into(), "--single-user".into()]
+                    }),
+                env: google_env,
+            })
+            .await
+            .expect("connect Google MCP");
+    }
 
     (llm, state)
+}
+
+/// True when the Google MCP env is present, so artifact-creating tests can run.
+fn google_ready() -> bool {
+    std::env::var("GOOGLE_OAUTH_CLIENT_ID").is_ok()
 }
 
 /// Feed one user message, print the swarm trace + reply, return (reply, done).
@@ -193,6 +200,10 @@ async fn drive_assert_done(
 #[tokio::test]
 #[ignore]
 async fn live_full_kayak_trip_creates_google_artifacts() {
+    if !google_ready() {
+        eprintln!("skipping: Google MCP env not set (set GOOGLE_OAUTH_CLIENT_ID … to run)");
+        return;
+    }
     let (llm, state) = setup().await;
     let mut session = ChatSession::new(9101);
     session.profile.set("home_city", "Волгоград");
