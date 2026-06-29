@@ -186,11 +186,10 @@ async fn handle_text(bot: Bot, msg: Message, state: BotState) -> anyhow::Result<
             if let Err(e) = crate::agent::session::save(&session) {
                 tracing::error!("save session {}: {e}", chat.0);
             }
-            // Show the swarm pipeline trace (only set when the trip flow ran).
+            // Swarm trace is internal telemetry (agent names, raw stage outputs,
+            // timeouts) — log it, never surface it to the user.
             if !result.trace.is_empty() {
-                let _ = bot
-                    .send_message(chat, format!("🧭 Swarm:\n{}", result.trace.join("\n")))
-                    .await;
+                tracing::debug!("swarm trace {}:\n{}", chat.0, result.trace.join("\n"));
             }
             // Never send an empty message (Telegram rejects it -> silent failure).
             let answer = if result.answer.trim().is_empty() {
@@ -613,9 +612,7 @@ async fn handle_trip(bot: &Bot, chat: ChatId, state: &BotState, args: &str) -> a
                 tracing::error!("save session {}: {e}", chat.0);
             }
             if !result.trace.is_empty() {
-                let _ = bot
-                    .send_message(chat, format!("🧭 Swarm:\n{}", result.trace.join("\n")))
-                    .await;
+                tracing::debug!("swarm trace {}:\n{}", chat.0, result.trace.join("\n"));
             }
             let answer = if result.answer.trim().is_empty() {
                 "✅ Готово.".to_string()
