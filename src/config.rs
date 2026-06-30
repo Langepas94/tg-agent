@@ -1,4 +1,5 @@
 use anyhow::{bail, Context, Result};
+use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -13,6 +14,8 @@ pub struct Config {
     pub digest_interval_minutes: u64,
     /// LLM config; None means the agent answers only via explicit commands.
     pub llm: Option<LlmConfig>,
+    /// Optional local RAG client config.
+    pub rag: Option<RagConfig>,
 }
 
 #[derive(Debug, Clone)]
@@ -20,6 +23,18 @@ pub struct LlmConfig {
     pub api_key: String,
     pub base_url: String,
     pub model: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct RagConfig {
+    pub bin: String,
+    pub index: PathBuf,
+    pub embed_model: String,
+    pub chat_model: String,
+    pub chat_url: String,
+    pub ollama_url: String,
+    pub search_mode: String,
+    pub top_k: usize,
 }
 
 impl Config {
@@ -58,6 +73,27 @@ impl Config {
             model: std::env::var("LLM_MODEL").unwrap_or_else(|_| "deepseek-chat".into()),
         });
 
+        let rag = std::env::var("RAG_INDEX")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .map(|index| RagConfig {
+                bin: std::env::var("RAG_INDEXER_BIN").unwrap_or_else(|_| "rag-indexer".into()),
+                index: PathBuf::from(index),
+                embed_model: std::env::var("RAG_EMBED_MODEL")
+                    .unwrap_or_else(|_| "qwen3-embedding".into()),
+                chat_model: std::env::var("RAG_CHAT_MODEL").unwrap_or_else(|_| "qwen2.5:7b".into()),
+                chat_url: std::env::var("RAG_CHAT_URL")
+                    .unwrap_or_else(|_| "http://localhost:11434".into()),
+                ollama_url: std::env::var("RAG_OLLAMA_URL")
+                    .unwrap_or_else(|_| "http://localhost:11434".into()),
+                search_mode: std::env::var("RAG_SEARCH_MODE").unwrap_or_else(|_| "hybrid".into()),
+                top_k: std::env::var("RAG_TOP_K")
+                    .ok()
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(5),
+            });
+
         Ok(Config {
             telegram_token,
             bot_password,
@@ -66,6 +102,7 @@ impl Config {
             admin_password,
             digest_interval_minutes,
             llm,
+            rag,
         })
     }
 }

@@ -11,6 +11,7 @@ use crate::{
     llm::Llm,
     mcp_client::{ConnectParams, EventSender, McpClient},
     persist::{self, AccessState, Persisted, WatchSpec},
+    rag_client::RagClient,
 };
 
 #[derive(Debug, Clone)]
@@ -36,6 +37,8 @@ pub struct BotState {
     pub events: EventSender,
     /// optional LLM for natural-language agent answers
     pub llm: Option<Arc<Llm>>,
+    /// optional local RAG client for document-grounded answers
+    pub rag: Option<Arc<RagClient>>,
     /// bot handle (set at startup) so watches/agent can post to chats
     pub bot: Arc<Mutex<Option<teloxide::Bot>>>,
     /// durable server-push subscriptions (re-applied on MCP reconnect)
@@ -54,12 +57,21 @@ impl BotState {
     }
 
     pub fn with_llm(events: EventSender, llm: Option<Arc<Llm>>) -> Self {
-        Self::with_llm_and_password(events, llm, "202020".to_string())
+        Self::with_llm_rag_and_password(events, llm, None, "202020".to_string())
     }
 
     pub fn with_llm_and_password(
         events: EventSender,
         llm: Option<Arc<Llm>>,
+        bot_password: String,
+    ) -> Self {
+        Self::with_llm_rag_and_password(events, llm, None, bot_password)
+    }
+
+    pub fn with_llm_rag_and_password(
+        events: EventSender,
+        llm: Option<Arc<Llm>>,
+        rag: Option<Arc<RagClient>>,
         bot_password: String,
     ) -> Self {
         Self {
@@ -70,6 +82,7 @@ impl BotState {
             next_watch_id: Arc::new(AtomicU64::new(1)),
             events,
             llm,
+            rag,
             bot: Arc::new(Mutex::new(None)),
             push_subs: Arc::new(Mutex::new(Vec::new())),
             authorized_chat_ids: Arc::new(Mutex::new(HashSet::new())),

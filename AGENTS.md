@@ -21,6 +21,8 @@ MCP-серверы подключаются **в чате** (команды ил
 - `src/mcp_client.rs` — `ConnectParams`, `connect()` → `spawn_stdio` / `connect_http`.
 - `src/llm.rs` — LLM tool-loop + meta-tools `mcp_connect` / `mcp_disconnect` /
   `schedule_summary`; defs и хендлеры здесь.
+- `src/rag_client.rs` — тонкий клиент к локальному `rag-indexer answer --mode rag`;
+  включается в чате через `/rag on`, выключается через `/rag off`.
 - `src/agent/flow.rs` — динамический рой агентов (BriefAgent → OptionsAgent →
   SwarmPlanner → WorkerAgents → VerifierAgent → ArtifactsAgent → FinalAgent),
   `/trip`. План задач строит SwarmPlanner из живого инвентаря MCP-tools, а не
@@ -52,11 +54,17 @@ MCP-серверы подключаются **в чате** (команды ил
 - `ADMIN_PASSWORD` — пароль web-админки; без него `/admin` отключён. Должен отличаться от `BOT_PASSWORD`.
 - `DIGEST_INTERVAL_MINUTES` — default 360.
 - `STATE_FILE` (default `state.json`), `SESSIONS_DIR` (default `sessions`).
+- `RAG_INDEX` — путь к готовому индексу `rag-indexer` (`.../structural`). Если
+  не задан, `/rag on` недоступен.
+- `RAG_INDEXER_BIN` — путь к CLI `rag-indexer`, default `rag-indexer`.
+- `RAG_EMBED_MODEL`, `RAG_CHAT_MODEL`, `RAG_OLLAMA_URL`, `RAG_CHAT_URL`,
+  `RAG_SEARCH_MODE`, `RAG_TOP_K` — параметры RAG-клиента.
 
 ## Команды (`src/bot.rs` enum `Command`)
 
 `/start` `/help` `/connect` `/mcps` `/tools` `/call` `/watch` `/unwatch`
-`/watches` `/disconnect` `/profile` `/info` `/facts` `/trip` `/compact` `/reset`
+`/watches` `/disconnect` `/profile` `/info` `/facts` `/trip` `/rag`
+`/compact` `/reset`
 
 ## Подключение MCP — ТОЧНЫЙ синтаксис (`parse_connect`)
 

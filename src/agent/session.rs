@@ -24,6 +24,10 @@ pub struct ChatSession {
     /// turns). `None` outside a planning conversation.
     #[serde(default)]
     pub trip: Option<super::flow::TripFlowState>,
+    /// When true, ordinary text questions are answered through the local RAG
+    /// client instead of the default MCP tool-loop.
+    #[serde(default)]
+    pub rag_enabled: bool,
 }
 
 impl ChatSession {
@@ -35,6 +39,7 @@ impl ChatSession {
             notes: UserNotes::default(),
             invariants: Vec::new(),
             trip: None,
+            rag_enabled: false,
         }
     }
 

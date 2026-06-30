@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use teloxide::prelude::*;
-use tg_agent::{admin, bot, config, llm::Llm, persist, scheduler, state};
+use tg_agent::{admin, bot, config, llm::Llm, persist, rag_client::RagClient, scheduler, state};
 use tracing::{info, warn};
 
 #[tokio::main]
@@ -30,7 +30,11 @@ async fn main() -> Result<()> {
             None
         }
     };
-    let state = state::BotState::with_llm_and_password(tx, llm, cfg.bot_password.clone());
+    let rag = cfg.rag.clone().map(|c| {
+        info!("RAG client enabled: {}", c.index.display());
+        Arc::new(RagClient::new(c))
+    });
+    let state = state::BotState::with_llm_rag_and_password(tx, llm, rag, cfg.bot_password.clone());
 
     let bot = Bot::new(&cfg.telegram_token);
     bot::set_public_commands(&bot).await?;

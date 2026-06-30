@@ -15,6 +15,10 @@ natural language using their tools, and runs periodic jobs 24/7.
 - **Natural-language agent** — free-text questions go through an LLM
   (OpenAI-compatible, DeepSeek by default) tool-calling loop over the connected
   MCP tools.
+- **RAG mode** — `/rag on` routes ordinary questions through a local
+  `rag-indexer` client: question → relevant chunks → context + question → LLM.
+  `/rag off` returns to the default MCP/LLM agent; `/rag status` shows the active
+  mode and index client.
 - **Agent self-connect** — the agent can attach MCP servers on its own via the
   `mcp_connect` / `mcp_disconnect` meta-tools: when a request needs a capability
   no connected server provides, it picks the server, asks the user for any
@@ -55,6 +59,16 @@ ADMIN_PASSWORD=...          # required for web admin; must differ from BOT_PASSW
 DIGEST_INTERVAL_MINUTES=360
 STATE_FILE=state.json
 SESSIONS_DIR=sessions
+
+# Optional RAG client
+RAG_INDEX=/path/to/ollama-rag-indexer/indexes-real-qwen/structural
+RAG_INDEXER_BIN=/path/to/ollama-rag-indexer/.venv/bin/rag-indexer
+RAG_EMBED_MODEL=qwen3-embedding
+RAG_CHAT_MODEL=qwen2.5:7b
+RAG_OLLAMA_URL=http://localhost:11434
+RAG_CHAT_URL=http://localhost:11434
+RAG_SEARCH_MODE=hybrid
+RAG_TOP_K=5
 ```
 
 ## Web admin
@@ -86,4 +100,5 @@ cargo test -- --ignored --nocapture          # live tests (need MCP + LLM key)
 ## Commands
 
 `/start` `/help` `/connect` `/mcps` `/tools` `/call` `/watch` `/unwatch`
-`/watches` `/disconnect` `/profile` `/info` `/facts` `/trip` `/compact` `/reset`
+`/watches` `/disconnect` `/profile` `/info` `/facts` `/trip` `/rag`
+`/compact` `/reset`

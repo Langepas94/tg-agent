@@ -40,6 +40,8 @@ pub enum Command {
     Facts,
     #[command(description = "travel-weather flow: /trip <cities/dates>")]
     Trip(String),
+    #[command(description = "RAG mode: /rag on | off | status")]
+    Rag(String),
     #[command(description = "reset this chat's memory (keeps long-term)")]
     Reset,
     #[command(description = "clear short context and active flow, keep profile and durable facts")]
@@ -58,6 +60,7 @@ fn base_commands() -> Vec<BotCommand> {
         cmd("info", "view or save extra info"),
         cmd("facts", "show learned facts"),
         cmd("trip", "run the travel-weather flow"),
+        cmd("rag", "RAG mode: on/off/status"),
         cmd("watches", "list active watches"),
         cmd("unwatch", "stop a watch"),
         cmd("compact", "clear short context and active flow"),
@@ -156,6 +159,12 @@ async fn handle_text(bot: Bot, msg: Message, state: BotState) -> anyhow::Result<
     if text.is_empty() {
         return Ok(());
     }
+
+    let mut session = crate::agent::session::load(chat.0);
+    if session.rag_enabled {
+        return handle_rag_text(&bot, chat, &state, &text).await;
+    }
+
     let Some(llm) = state.llm.clone() else {
         bot.send_message(
             chat,
@@ -177,7 +186,6 @@ async fn handle_text(bot: Bot, msg: Message, state: BotState) -> anyhow::Result<
         }
     });
 
-    let mut session = crate::agent::session::load(chat.0);
     let outcome = crate::agent::run_turn(&llm, &state, &mut session, &text, Some(tx)).await;
     typing.abort();
     let _ = prog_task.await;
@@ -348,10 +356,14 @@ async fn handle_command(
         Command::Trip(args) => {
             handle_trip(&bot, chat, &state, &args).await?;
         }
+        Command::Rag(args) => {
+            handle_rag_command(&bot, chat, &state, &args).await?;
+        }
         Command::Reset => {
             let mut session = crate::agent::session::load(chat.0);
             session.memory.reset_for_new_session();
             session.trip = None;
+            session.rag_enabled = false;
             let _ = crate::agent::session::save(&session);
             bot.send_message(chat, "✅ Chat memory reset (long-term facts kept).")
                 .await?;
@@ -417,6 +429,7 @@ async fn send_help(bot: &Bot, chat: ChatId, is_root: bool) -> anyhow::Result<()>
         "/info [label text | clear] — save extra preferences".to_string(),
         "/facts — show your learned facts".to_string(),
         "/trip <cities/dates> — travel-weather flow".to_string(),
+        "/rag on|off|status — switch ordinary questions between RAG and default agent".to_string(),
         "/watches — list your active watches".to_string(),
         "/unwatch <id> | all — stop your watches".to_string(),
         "/compact — clear short context and active flow, keep profile and durable facts"
@@ -440,6 +453,110 @@ async fn send_help(bot: &Bot, chat: ChatId, is_root: bool) -> anyhow::Result<()>
         );
     }
     bot.send_message(chat, lines.join("\n")).await?;
+    Ok(())
+}
+
+async fn handle_rag_text(
+    bot: &Bot,
+    chat: ChatId,
+    state: &BotState,
+    text: &str,
+) -> anyhow::Result<()> {
+    let Some(rag) = state.rag.clone() else {
+        bot.send_message(
+            chat,
+            "RAG включен в сессии, но клиент не настроен. Задай RAG_INDEX и перезапусти бота или выключи: /rag off.",
+        )
+        .await?;
+        return Ok(());
+    };
+    if !rag.is_ready() {
+        bot.send_message(
+            chat,
+            "RAG включен, но индекс не найден или неполный. Проверь RAG_INDEX или выключи: /rag off.",
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let typing = spawn_typing(bot.clone(), chat);
+    bot.send_message(chat, "⏳ Ищу релевантные чанки и отвечаю через RAG…")
+        .await
+        .ok();
+    let outcome = rag.answer(text).await;
+    typing.abort();
+
+    match outcome {
+        Ok(answer) => {
+            for chunk in split_chunks(&answer, 3900) {
+                if chunk.trim().is_empty() {
+                    continue;
+                }
+                bot.send_message(chat, chunk).await?;
+            }
+        }
+        Err(e) => {
+            tracing::error!("RAG turn for chat {}: {e:#}", chat.0);
+            bot.send_message(chat, format!("❌ RAG error: {e:#}"))
+                .await?;
+        }
+    }
+    Ok(())
+}
+
+async fn handle_rag_command(
+    bot: &Bot,
+    chat: ChatId,
+    state: &BotState,
+    args: &str,
+) -> anyhow::Result<()> {
+    let arg = args.trim().to_lowercase();
+    let mut session = crate::agent::session::load(chat.0);
+
+    match arg.as_str() {
+        "" | "status" => {
+            let mode = if session.rag_enabled { "on" } else { "off" };
+            let client = match state.rag.as_ref() {
+                Some(rag) if rag.is_ready() => format!("configured ({})", rag.describe()),
+                Some(rag) => format!("configured but index is not ready ({})", rag.describe()),
+                None => "not configured (set RAG_INDEX)".to_string(),
+            };
+            bot.send_message(chat, format!("RAG mode: {mode}\nRAG client: {client}"))
+                .await?;
+        }
+        "on" => {
+            let Some(rag) = state.rag.as_ref() else {
+                bot.send_message(
+                    chat,
+                    "RAG client is not configured. Set RAG_INDEX and restart the bot.",
+                )
+                .await?;
+                return Ok(());
+            };
+            if !rag.is_ready() {
+                bot.send_message(chat, format!("RAG index is not ready: {}", rag.describe()))
+                    .await?;
+                return Ok(());
+            }
+            session.rag_enabled = true;
+            let _ = crate::agent::session::save(&session);
+            bot.send_message(chat, "✅ RAG mode enabled for ordinary questions.")
+                .await?;
+        }
+        "off" => {
+            session.rag_enabled = false;
+            let _ = crate::agent::session::save(&session);
+            bot.send_message(
+                chat,
+                "✅ RAG mode disabled. Ordinary questions use the default agent.",
+            )
+            .await?;
+        }
+        _ => {
+            bot.send_message(chat, "Usage: /rag on | off | status")
+                .await?;
+        }
+    }
     Ok(())
 }
 
