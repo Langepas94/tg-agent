@@ -65,7 +65,11 @@ pub async fn run_turn(
     // off-topic and should be refused early.
     let in_flow = session.trip.is_some();
     let route = if in_flow {
-        router::Route::Trip
+        match router::classify_active_flow(llm, user_text).await {
+            router::ActiveFlowRoute::ContinueTrip => router::Route::Trip,
+            router::ActiveFlowRoute::SideChat => router::Route::Chat,
+            router::ActiveFlowRoute::OffTopic => router::Route::OffTopic,
+        }
     } else {
         router::classify(llm, user_text).await
     };
@@ -73,7 +77,7 @@ pub async fn run_turn(
     // --- trip-planning swarm routing (stateful, suspends across turns) ---
     // The flow runs a dynamic agent swarm: brief → short options → planner-built
     // worker tasks → verifier-gated artifacts → final answer.
-    if in_flow || route == router::Route::Trip {
+    if route == router::Route::Trip {
         if !in_flow {
             session.trip = Some(flow::TripFlowState::start());
         }
