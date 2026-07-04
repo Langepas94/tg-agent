@@ -3,6 +3,9 @@
 Telegram AI agent that connects to **MCP servers** at runtime, answers in
 natural language using their tools, and runs periodic jobs 24/7.
 
+Демо RAG-режима для показа заказчику (источники/цитаты/«не знаю» + диалог с
+памятью задачи): [docs/demo-rag-tasks-4-5.md](docs/demo-rag-tasks-4-5.md).
+
 ## Features
 
 - **Runtime MCP management** — `/connect`, `/mcps`, `/tools`, `/call`,
