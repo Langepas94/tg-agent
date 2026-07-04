@@ -25,6 +25,7 @@ fn rag_client_from_env() -> RagClient {
         embed_model: std::env::var("RAG_EMBED_MODEL").unwrap_or_else(|_| "qwen3-embedding".into()),
         chat_model: std::env::var("RAG_CHAT_MODEL").unwrap_or_else(|_| "qwen2.5:7b".into()),
         chat_url: std::env::var("RAG_CHAT_URL").unwrap_or_else(|_| "http://localhost:11434".into()),
+        chat_provider: std::env::var("RAG_CHAT_PROVIDER").unwrap_or_else(|_| "ollama".into()),
         ollama_url: std::env::var("RAG_OLLAMA_URL")
             .unwrap_or_else(|_| "http://localhost:11434".into()),
         search_mode: std::env::var("RAG_SEARCH_MODE").unwrap_or_else(|_| "hybrid".into()),

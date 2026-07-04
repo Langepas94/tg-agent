@@ -66,7 +66,10 @@ DIGEST_INTERVAL_MINUTES=360
 STATE_FILE=state.json
 SESSIONS_DIR=sessions
 
-# Optional RAG client
+# Optional RAG client. On the 2GB VPS: RAG_EMBED_MODEL=bge-m3 (local Ollama),
+# RAG_CHAT_PROVIDER=openai + RAG_CHAT_URL=https://api.deepseek.com +
+# RAG_CHAT_MODEL=deepseek-chat + RAG_CHAT_API_KEY=... — embeddings local,
+# chat on the API (the box cannot host a 7B chat model).
 RAG_INDEX=/path/to/ollama-rag-indexer/indexes-real-qwen/structural
 RAG_INDEXER_BIN=/path/to/ollama-rag-indexer/.venv/bin/rag-indexer
 RAG_EMBED_MODEL=qwen3-embedding
