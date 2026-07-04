@@ -50,9 +50,10 @@ impl RagClient {
 
     pub fn describe(&self) -> String {
         format!(
-            "index={}, chat_model={}, embed_model={}, mode={}, top_k={}, rewrite={}",
+            "index={}, chat={}@{}, embed_model={}, mode={}, top_k={}, rewrite={}",
             self.cfg.index.display(),
             self.cfg.chat_model,
+            self.cfg.chat_provider,
             self.cfg.embed_model,
             self.cfg.search_mode,
             self.cfg.top_k,
@@ -88,6 +89,8 @@ impl RagClient {
             .arg(&self.cfg.chat_model)
             .arg("--chat-url")
             .arg(&self.cfg.chat_url)
+            .arg("--chat-provider")
+            .arg(&self.cfg.chat_provider)
             .arg("--ollama-url")
             .arg(&self.cfg.ollama_url)
             .arg("--search-mode")

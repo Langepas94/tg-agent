@@ -32,6 +32,11 @@ pub struct RagConfig {
     pub embed_model: String,
     pub chat_model: String,
     pub chat_url: String,
+    /// "ollama" (local) or "openai" (OpenAI-compatible API, e.g. DeepSeek —
+    /// lets the 2GB VPS keep embeddings local and chat on the API the bot
+    /// already uses). The API key is NOT passed via argv: rag-indexer reads
+    /// RAG_CHAT_API_KEY from the inherited environment.
+    pub chat_provider: String,
     pub ollama_url: String,
     pub search_mode: String,
     pub top_k: usize,
@@ -92,6 +97,8 @@ impl Config {
                 chat_model: std::env::var("RAG_CHAT_MODEL").unwrap_or_else(|_| "qwen2.5:7b".into()),
                 chat_url: std::env::var("RAG_CHAT_URL")
                     .unwrap_or_else(|_| "http://localhost:11434".into()),
+                chat_provider: std::env::var("RAG_CHAT_PROVIDER")
+                    .unwrap_or_else(|_| "ollama".into()),
                 ollama_url: std::env::var("RAG_OLLAMA_URL")
                     .unwrap_or_else(|_| "http://localhost:11434".into()),
                 search_mode: std::env::var("RAG_SEARCH_MODE").unwrap_or_else(|_| "hybrid".into()),
