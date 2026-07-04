@@ -16,9 +16,15 @@ natural language using their tools, and runs periodic jobs 24/7.
   (OpenAI-compatible, DeepSeek by default) tool-calling loop over the connected
   MCP tools.
 - **RAG mode** — `/rag on` routes ordinary questions through a local
-  `rag-indexer` client: question → relevant chunks → context + question → LLM.
-  `/rag off` returns to the default MCP/LLM agent; `/rag status` shows the active
-  mode and index client.
+  `rag-indexer` client: question → (history-aware query rewrite) → relevant
+  chunks → relevance filter → context + question → LLM. Every turn carries the
+  dialog history and a **task state** (dialog goal, what the user already
+  clarified, fixed constraints/terms — extracted by an LLM agent per message),
+  every answer ends with mandatory sources (`source / section #chunk_id`) and
+  verbatim «quotes», and a question below the relevance floor gets an honest
+  "не знаю" with a request to clarify. `/rag off` returns to the default
+  MCP/LLM agent; `/rag status` shows the active mode and index client;
+  `/reset` clears the RAG task state along with chat memory.
 - **Agent self-connect** — the agent can attach MCP servers on its own via the
   `mcp_connect` / `mcp_disconnect` meta-tools: when a request needs a capability
   no connected server provides, it picks the server, asks the user for any
@@ -69,6 +75,8 @@ RAG_OLLAMA_URL=http://localhost:11434
 RAG_CHAT_URL=http://localhost:11434
 RAG_SEARCH_MODE=hybrid
 RAG_TOP_K=5
+RAG_REWRITE=1               # history-aware query rewrite before retrieval
+RAG_MIN_SCORE=0.5           # relevance floor (unset = indexer default 0.35)
 ```
 
 ## Web admin

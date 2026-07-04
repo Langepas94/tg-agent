@@ -28,6 +28,10 @@ pub struct ChatSession {
     /// client instead of the default MCP tool-loop.
     #[serde(default)]
     pub rag_enabled: bool,
+    /// Task state of the RAG dialog (goal, clarifications, constraints);
+    /// injected into every RAG answer so long dialogs keep their goal.
+    #[serde(default)]
+    pub rag_task: super::rag_task::RagTaskState,
 }
 
 impl ChatSession {
@@ -40,6 +44,7 @@ impl ChatSession {
             invariants: Vec::new(),
             trip: None,
             rag_enabled: false,
+            rag_task: super::rag_task::RagTaskState::default(),
         }
     }
 
