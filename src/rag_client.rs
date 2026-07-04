@@ -6,7 +6,15 @@ use tokio::{process::Command, time::timeout};
 
 use crate::config::RagConfig;
 
-const RAG_TIMEOUT: Duration = Duration::from_secs(180);
+/// Per-turn budget: cold start on the 2GB VPS loads the embedding model from
+/// disk (~30-60s) before the two chat API calls. RAG_TIMEOUT_SECS overrides.
+fn rag_timeout() -> Duration {
+    let secs = std::env::var("RAG_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(180);
+    Duration::from_secs(secs)
+}
 
 #[derive(Clone, Debug)]
 pub struct RagClient {
@@ -117,7 +125,7 @@ impl RagClient {
         }
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
-        let output = timeout(RAG_TIMEOUT, cmd.output())
+        let output = timeout(rag_timeout(), cmd.output())
             .await
             .context("RAG client timed out")?
             .context("failed to run RAG client")?;
