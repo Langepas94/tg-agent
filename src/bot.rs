@@ -162,7 +162,7 @@ async fn handle_text(bot: Bot, msg: Message, state: BotState) -> anyhow::Result<
 
     let mut session = crate::agent::session::load(chat.0);
     if session.rag_enabled {
-        return handle_rag_text(&bot, chat, &state, &text).await;
+        return handle_rag_text(&bot, chat, &state, &mut session, &text).await;
     }
 
     let Some(llm) = state.llm.clone() else {
@@ -364,6 +364,7 @@ async fn handle_command(
             session.memory.reset_for_new_session();
             session.trip = None;
             session.rag_enabled = false;
+            session.rag_task = Default::default();
             let _ = crate::agent::session::save(&session);
             bot.send_message(chat, "✅ Chat memory reset (long-term facts kept).")
                 .await?;
@@ -460,6 +461,7 @@ async fn handle_rag_text(
     bot: &Bot,
     chat: ChatId,
     state: &BotState,
+    session: &mut crate::agent::session::ChatSession,
     text: &str,
 ) -> anyhow::Result<()> {
     let Some(rag) = state.rag.clone() else {
@@ -483,12 +485,37 @@ async fn handle_rag_text(
     bot.send_message(chat, "⏳ Ищу релевантные чанки и отвечаю через RAG…")
         .await
         .ok();
-    let outcome = rag.answer(text).await;
+
+    // Dialog memory: record the question, answer with prior turns as history.
+    session.memory.push_message("user", text);
+    crate::agent::rag_task::update_task_state(state.llm.as_deref(), &mut session.rag_task, text)
+        .await;
+    let history: Vec<(String, String)> = session
+        .memory
+        .history_for_answer()
+        .into_iter()
+        .map(|(role, msg)| (role.to_string(), msg.to_string()))
+        .collect();
+    let task_state = session.rag_task.to_prompt();
+
+    let outcome = rag
+        .answer(
+            text,
+            &history,
+            (!task_state.is_empty()).then_some(task_state.as_str()),
+        )
+        .await;
     typing.abort();
 
     match outcome {
-        Ok(answer) => {
-            for chunk in split_chunks(&answer, 3900) {
+        Ok(reply) => {
+            // Record the bare answer (refusal included) without the sources
+            // block, so history stays compact for follow-up turns.
+            session.memory.push_message("assistant", &reply.answer);
+            if let Err(e) = crate::agent::session::save(session) {
+                tracing::error!("save session {}: {e}", chat.0);
+            }
+            for chunk in split_chunks(&reply.render(), 3900) {
                 if chunk.trim().is_empty() {
                     continue;
                 }
@@ -496,6 +523,9 @@ async fn handle_rag_text(
             }
         }
         Err(e) => {
+            if let Err(e) = crate::agent::session::save(session) {
+                tracing::error!("save session {}: {e}", chat.0);
+            }
             tracing::error!("RAG turn for chat {}: {e:#}", chat.0);
             bot.send_message(chat, format!("❌ RAG error: {e:#}"))
                 .await?;
@@ -521,8 +551,16 @@ async fn handle_rag_command(
                 Some(rag) => format!("configured but index is not ready ({})", rag.describe()),
                 None => "not configured (set RAG_INDEX)".to_string(),
             };
-            bot.send_message(chat, format!("RAG mode: {mode}\nRAG client: {client}"))
-                .await?;
+            let task = if session.rag_task.is_empty() {
+                "нет (наполнится по ходу диалога)".to_string()
+            } else {
+                format!("\n{}", session.rag_task.to_prompt())
+            };
+            bot.send_message(
+                chat,
+                format!("RAG mode: {mode}\nRAG client: {client}\nTask state: {task}"),
+            )
+            .await?;
         }
         "on" => {
             let Some(rag) = state.rag.as_ref() else {

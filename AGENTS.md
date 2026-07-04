@@ -22,7 +22,22 @@ MCP-серверы подключаются **в чате** (команды ил
 - `src/llm.rs` — LLM tool-loop + meta-tools `mcp_connect` / `mcp_disconnect` /
   `schedule_summary`; defs и хендлеры здесь.
 - `src/rag_client.rs` — тонкий клиент к локальному `rag-indexer answer --mode rag`;
-  включается в чате через `/rag on`, выключается через `/rag off`.
+  включается в чате через `/rag on`, выключается через `/rag off`. С 2026-07
+  `rag-indexer` всегда возвращает `relevant: bool`, `retrieval` (кандидаты
+  до/после фильтра, порог), `rewritten_query` и `quote` в каждом source —
+  подробности в `Rag/ollama-rag-indexer/AGENTS.md`. `RagReply`/`RagSource`
+  парсят всё это; `render()` печатает источники как
+  `[n] source / section #chunk_id score=…` + «цитату» под каждым. Рефьюзл при
+  низкой релевантности долетает автоматически (`relevant: false`, фиксированный
+  "не знаю", `sources` пустой). Каждый ход бот передаёт `--history` (последние
+  сообщения сессии) и `--task-state`; `--rewrite` включается при непустой
+  истории (`RAG_REWRITE=0` отключает).
+- `src/agent/rag_task.rs` — task state RAG-диалога (цель / что уточнено /
+  ограничения-термины): LLM-экстракция перед каждым RAG-ответом (fallback —
+  цель из первого вопроса), хранится в `ChatSession.rag_task`, показывается в
+  `/rag status`, чистится `/reset`. Живые длинные сценарии:
+  `tests/live_rag_dialog.rs` (2 диалога 12+10 сообщений, `--ignored`, нужны
+  RAG_INDEX + Ollama).
 - `src/agent/flow.rs` — динамический рой агентов (BriefAgent → OptionsAgent →
   SwarmPlanner → WorkerAgents → VerifierAgent → ArtifactsAgent → FinalAgent),
   `/trip`. План задач строит SwarmPlanner из живого инвентаря MCP-tools, а не

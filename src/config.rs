@@ -35,6 +35,13 @@ pub struct RagConfig {
     pub ollama_url: String,
     pub search_mode: String,
     pub top_k: usize,
+    /// History-aware LLM query rewrite before retrieval (RAG_REWRITE, default on).
+    pub rewrite: bool,
+    /// Absolute dense-cosine relevance floor (RAG_MIN_SCORE). None → the
+    /// indexer's default (0.35). Calibrate per corpus: for the real
+    /// tg-agent+open-meteo corpus 0.5 separates legit questions (top chunks
+    /// ≥0.63) from off-topic near-misses (≤0.47).
+    pub min_score: Option<f64>,
 }
 
 impl Config {
@@ -92,6 +99,12 @@ impl Config {
                     .ok()
                     .and_then(|s| s.parse::<usize>().ok())
                     .unwrap_or(5),
+                rewrite: std::env::var("RAG_REWRITE")
+                    .map(|s| !matches!(s.trim(), "0" | "false" | "off" | "no"))
+                    .unwrap_or(true),
+                min_score: std::env::var("RAG_MIN_SCORE")
+                    .ok()
+                    .and_then(|s| s.parse::<f64>().ok()),
             });
 
         Ok(Config {

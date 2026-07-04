@@ -11,6 +11,7 @@ pub mod memory;
 pub mod notes;
 pub mod profile;
 pub mod prompt;
+pub mod rag_task;
 pub mod router;
 pub mod session;
 
