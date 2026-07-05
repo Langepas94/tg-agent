@@ -4,6 +4,19 @@ Telegram-бот = **MCP-клиент + LLM-агент**. Юзер общаетс
 MCP-серверы подключаются **в чате** (команды или self-connect агентом), НЕ через
 внешние конфиги (Codex Desktop / VS Code `.mcp.json` — НЕ относятся к этому проекту).
 
+## Deployment Autonomy
+
+- После правок не оставлять работу локальной: прогнать релевантные проверки,
+  закоммитить intended changes, сделать `git fetch`, влить актуальный upstream
+  (`main`) без переписывания истории, сразу `git push` и задеплоить.
+- Деплой бота: синхронизировать исходники на VPS, собрать `cargo build --release`,
+  перезапустить `tg-agent.service`, проверить `systemctl is-active` и короткий
+  journal. Если менялся RAG/Telegram runtime, проверить `/opt/tg-agent/.env`
+  `LLM_MODEL` без вывода секретов.
+- Если менялись исходники бота, синхронизировать их копию в RAG corpus и
+  запустить RAG deploy, чтобы live-индекс отвечал по актуальному коду.
+- В handoff указывать commit, branch, push/deploy status и важный smoke-output.
+
 ## Что это
 
 - Telegram-бот на `teloxide`. Подключает MCP-серверы в рантайме, отвечает на
