@@ -1,105 +1,120 @@
-# tg-agent — Codex context
+# tg-agent Agent Guide
 
-Telegram-бот = **MCP-клиент + LLM-агент**. Юзер общается ТОЛЬКО через телеграм-чат.
-MCP-серверы подключаются **в чате** (команды или self-connect агентом), НЕ через
-внешние конфиги (Codex Desktop / VS Code `.mcp.json` — НЕ относятся к этому проекту).
+## Mission
 
-## Что это
+tg-agent is a Telegram assistant for choosing and planning outdoor leisure.
+Its primary job is to use real weather and geographic data to help a user decide
+where to go, when to go, and which activity is suitable, then produce a concrete
+verified plan.
 
-- Telegram-бот на `teloxide`. Подключает MCP-серверы в рантайме, отвечает на
-  свободный текст через LLM tool-loop поверх их tools, гоняет периодическиеджобы.
-- MCP-клиент: `rmcp` 1.8, два транспорта (HTTP Streamable + stdio child).
-- Агент-рантайм портирован из ai-playground: sticky-facts память, профиль,
-  инварианты, PromptBuilder, динамический multi-agent рой планирования поездок.
+The production scope does not include RAG demos, document search, naming
+generators, local Ollama chat, or unrelated web agents.
 
-## Карта кода
+## Tech Stack
 
-- `src/main.rs` — старт: env → Config → restore_state (реконнект MCP/watches) → dispatcher.
-- `src/config.rs` — env-конфиг (см. ниже).
-- `src/bot.rs` — команды (enum `Command`), парсинг `/connect` (`parse_connect`,
-  `parse_connect_stdio`).
-- `src/mcp_client.rs` — `ConnectParams`, `connect()` → `spawn_stdio` / `connect_http`.
-- `src/llm.rs` — LLM tool-loop + meta-tools `mcp_connect` / `mcp_disconnect` /
-  `schedule_summary`; defs и хендлеры здесь.
-- `src/agent/flow.rs` — динамический рой агентов (BriefAgent → OptionsAgent →
-  SwarmPlanner → WorkerAgents → VerifierAgent → ArtifactsAgent → FinalAgent),
-  `/trip`. План задач строит SwarmPlanner из живого инвентаря MCP-tools, а не
-  фиксированный stage-граф. Реестр агентов — `SwarmAgentRegistry`: каждый агент
-  отдельная сущность (`SwarmAgentSpec`: имя, роль, модель, права на tools и
-  side-effects). Старые `Stage`-метки остались только для serde-совместимости
-  персиста, в логику флоу не входят.
-- `src/agent/router.rs` — семантический роутер (LLM, без keyword-списков):
-  trip / chat / offtopic.
-- `src/agent/prompt.rs` — `BASE_SYSTEM` + `build_system_prompt` (слои промпта).
-- `src/persist.rs`, `src/state.rs` — персист серверов/подписок/watch, общий стейт.
-- `src/scheduler.rs` — периодические watch-джобы и push-summaries.
+- Rust 2021, Tokio
+- Telegram: teloxide
+- MCP client: rmcp, Streamable HTTP and stdio transports
+- LLM: OpenAI-compatible API, DeepSeek by default
+- HTTP/admin: reqwest and axum
+- Persistence: JSON state and per-chat sessions
+- Production: systemd on Timeweb Cloud, nginx for the admin endpoint
 
-## Конфиг (env, `src/config.rs`)
+## Repository Map
 
-- `TELEGRAM_BOT_TOKEN` — **обязателен**.
-- `LLM_API_KEY` или `DEEPSEEK_API_KEY` — **без него free-text отключён**, работают
-  только команды. Для агент-флоу нужен.
-- `LLM_BASE_URL` — default `https://api.deepseek.com`.
-- `LLM_MODEL` — default `deepseek-chat`. Базовая модель всех агентов роя.
-- `SWARM_MODEL_<AGENT>` — переопределение модели одного агента роя (опционально).
-  Суффикс — имя агента в UPPER_SNAKE, не-буквенно-цифровое → `_`. Примеры:
-  `SWARM_MODEL_VERIFIERAGENT`, `SWARM_MODEL_ARTIFACTSAGENT`, `SWARM_MODEL_BRIEFAGENT`.
-  Не задано → агент берёт `LLM_MODEL`. Плюс план может задать модель на отдельную
-  задачу через поле `model` в task-графе (приоритетнее env).
-- `BOT_PASSWORD` — пароль для `/start`, default `202020`.
-- `ADMIN_ADDR` — web-админка, default `127.0.0.1:8080` (`/admin`).
-- `ADMIN_USERNAME` — логин web-админки, default `admin`.
-- `ADMIN_PASSWORD` — пароль web-админки; без него `/admin` отключён. Должен отличаться от `BOT_PASSWORD`.
-- `DIGEST_INTERVAL_MINUTES` — default 360.
-- `STATE_FILE` (default `state.json`), `SESSIONS_DIR` (default `sessions`).
+- src/main.rs: startup, state restoration, scheduler, admin and dispatcher
+- src/bot.rs: commands, access control, Telegram messages and callbacks
+- src/llm.rs: LLM tool loop and MCP meta-tools
+- src/mcp_client.rs: HTTP and stdio MCP connections
+- src/state.rs: shared runtime state and MCP registry
+- src/persist.rs: durable server, watch and access state
+- src/scheduler.rs: watches and scheduled summaries
+- src/admin.rs: protected web administration
+- src/agent/: routing, memory, profile and outdoor-planning swarm
+- tests/: ignored live integration and end-to-end scenarios
+- deploy.sh: production synchronization, release build and service restart
 
-## Команды (`src/bot.rs` enum `Command`)
+More specific rules are defined in src/AGENTS.md, src/agent/AGENTS.md and
+tests/AGENTS.md.
 
-`/start` `/help` `/connect` `/mcps` `/tools` `/call` `/watch` `/unwatch`
-`/watches` `/disconnect` `/profile` `/info` `/facts` `/trip` `/compact` `/reset`
+## Product Flow
 
-## Подключение MCP — ТОЧНЫЙ синтаксис (`parse_connect`)
+1. Collect only missing facts the user must provide: start area, date window,
+   group limits and hard constraints.
+2. Read real weather and geographic evidence through connected MCP tools.
+3. If activity is not fixed, compare genuinely different activity-and-place
+   combinations, including paddling, cycling and walking when feasible.
+4. Explain trade-offs: rain, wind, temperature, daylight, terrain, water
+   conditions and travel distance.
+5. Ask the user to choose an option.
+6. Treat the chosen activity, place and date as hard inputs.
+7. Build a concrete route and requested overnight stops.
+8. Verify every user constraint before presenting a final plan or creating an
+   external artifact.
 
-HTTP (URL-first, порядок свободный):
-```
-/connect <url> [name=NAME] [auth=TOKEN] [Header:Value ...]
-```
-stdio (бот спавнит child-процесс; `program` обязан быть в PATH хоста бота):
-```
-/connect stdio <program> [args...] [name=NAME] [env=KEY=VALUE ...]
-```
-- HTTP `auth=` → шлётся как `Authorization: Bearer <token>`.
-- stdio `env=KEY=VALUE` → переменные окружения дочернего процесса.
-- `name` опционален — выводится из URL/команды.
+Never select one arbitrary route before comparison when the request is broad.
+Never fabricate coordinates, forecasts, distances, isolation, campsite
+suitability or external artifact links.
 
-## Self-connect агентом (`mcp_connect` meta-tool, `src/llm.rs`)
+## Non-Negotiable Rules
 
-Агент сам зовёт `mcp_connect`, когда нужна способность, которой нет у подключённых
-серверов. Args: `transport` (http|stdio, required), `url`, `command` (argv array),
-`auth`, `headers`, `env`, `name`. Нужны креды → агент **сначала спрашивает их в
-чате**, потом передаёт. **Никогда не печатает секрет обратно.** После connect tools
-доступны в том же turn.
+- The user interacts through Telegram. Do not require external MCP config files.
+- MCP servers are connected at runtime through bot commands or self-connect.
+- Preserve side-question routing while a trip flow is active.
+- Keep secrets in environment variables. Never log or echo secret values.
+- Only the root Telegram user may manage MCP connections and admin watches.
+- Only ArtifactsAgent may perform external side effects, after verification.
+- Do not restore RAG code, /rag, RAG variables, Ollama or name generation.
+- Do not add code comments or TODO/FIXME markers.
+- Preserve compatible deserialization of persisted state unless a tested
+  migration is implemented.
+- Do not expose agent names, prompts, traces or raw tool failures to users.
 
-## Инварианты
+## Change Workflow
 
-- Юзер взаимодействует только через бота — НЕ предлагать внешние конфиг-файлы.
-- Токены/секреты не печатать в чат; агент их только запрашивает и передаёт в connect.
-- Подключённые серверы персистятся и реконнектятся при рестарте (`restore_state`).
-- HTTP-транспорт = ничего не ставить на хост бота; stdio = бинарь обязан быть в PATH.
-- Рой настоящий, не стейт-машина: задачи строит планировщик-LLM, каждый агент —
-  отдельная сущность со своей моделью/ролью/правами. В систем-промпт агента
-  попадает только его identity/role/model + контекст его задачи; working-память и
-  чужие identity не протекают (см. `build_swarm_worker_system`/`swarm_agent_system`).
-- Side-effects (внешние артефакты) разрешены только `ArtifactsAgent` и только
-  после гейта `VerifierAgent`; обычный worker не может эскалироваться до side-effects.
+1. Inspect the relevant scoped AGENTS.md.
+2. Keep the change limited to the product goal.
+3. Update tests for behavior changes.
+4. Run formatting, tests and a release build.
+5. Run git diff --check and confirm no secrets or generated files are staged.
+6. Commit, fetch origin/main, integrate without rewriting shared history, push.
+7. Deploy runtime changes and verify production.
 
-## Сборка / тест
+## Required Validation
 
-```bash
-cargo build --release
-cargo test                            # unit (рой: реестр агентов, изоляция промптов, гейты)
-cargo test -- --ignored --nocapture   # live (нужны MCP + LLM key): kayak / cycling / walk
-```
+    cargo fmt --all -- --check
+    cargo test
+    cargo build --release
+    git diff --check
 
-Live-сценарии роя — `tests/live_trip_flow.rs` (байдарки, велопоход, прогулка):
-прогоняются на VPS с `LLM_API_KEY` + MCP (weather/osm/google).
+Ignored live tests require external services and credentials:
+
+    cargo test -- --ignored --nocapture --test-threads=1
+
+Run the relevant ignored scenario on the VPS when Telegram, MCP, LLM routing or
+the trip flow changes.
+
+## Production
+
+- Host: root@5.129.234.9
+- App: /opt/tg-agent
+- Environment: /opt/tg-agent/.env
+- Service: tg-agent.service
+- Required weather service: open-meteo-mcp.service
+- Naming, RAG and Ollama services must remain disabled.
+
+Deploy with:
+
+    SSH_KEY=/path/to/timeweb-key ENABLE_NGINX_PROXY=0 ./deploy.sh
+
+After deployment verify version, exactly one bot process, service state and
+recent logs. Never invoke the binary with --version; that starts another bot
+because the flag is not implemented.
+
+## Definition of Done
+
+- Requested behavior is implemented without unrelated capabilities.
+- The leisure-selection pipeline remains logical and evidence-based.
+- Formatting, unit tests and release build pass.
+- Relevant live behavior is smoke-tested when credentials are available.
+- GitHub and deployment status are reported with commit and version.
