@@ -19,8 +19,8 @@ cd ~/Documents/tg-agent && ./deploy.sh
 
 `deploy.sh` = rsync source (excludes .env/state.json/sessions) → remote
 `cargo build --release` → `systemctl restart tg-agent` → prune build
-artifacts + vacuum journal (14GB disk!) → nginx /admin proxy. SSH key:
-`~/.ssh/id_ed25519_vps`, host `root@5.129.234.9`.
+artifacts + vacuum journal (14GB disk!) → nginx /admin proxy. SSH key is passed
+through `SSH_KEY`; host defaults to `root@5.129.234.9`.
 
 ## FOOTGUN — never do this
 
@@ -47,9 +47,4 @@ long-poll keeps erroring up to ~50s before it clears — do not panic-restart.
 ## Server layout
 
 - Bot: `/opt/tg-agent` (env: `/opt/tg-agent/.env`, systemd `tg-agent`).
-- RAG engine: `/opt/ollama-rag-indexer` (venv inside), index
-  `indexes-real-bge/structural`, embeddings bge-m3 via local Ollama, chat via
-  DeepSeek API (`RAG_CHAT_PROVIDER=openai`).
-- Box: 2GB RAM + 2GB swap, 2 cores, 38GB disk. 4.7GB Ollama models do NOT
-  fit — do not pull them. Env changes: edit `/opt/tg-agent/.env`, then
-  `systemctl restart tg-agent` (deploy.sh does NOT touch .env).
+- Env changes require `systemctl restart tg-agent`; `deploy.sh` does not replace `.env`.

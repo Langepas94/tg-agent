@@ -5,6 +5,5 @@ pub mod config;
 pub mod llm;
 pub mod mcp_client;
 pub mod persist;
-pub mod rag_client;
 pub mod scheduler;
 pub mod state;

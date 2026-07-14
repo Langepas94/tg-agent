@@ -1,26 +1,8 @@
 # tg-agent — Codex context
 
-Telegram-бот = **MCP-клиент + LLM-агент + RAG-фронт**. Юзер общается ТОЛЬКО через
-телеграм-чат. MCP-серверы подключаются **в чате** (команды или self-connect
-агентом), НЕ через внешние конфиги (Codex Desktop / VS Code `.mcp.json` — НЕ
-относятся к этому проекту).
-
-Проектные скиллы: `deploy-vps` (безопасный деплой + верификация),
-`rag-smoke` (проверка RAG на проде). Демо для заказчика:
-`docs/demo-rag-tasks-4-5.md`.
-
-## Deployment Autonomy
-
-- После правок не оставлять работу локальной: прогнать релевантные проверки,
-  закоммитить intended changes, сделать `git fetch`, влить актуальный upstream
-  (`main`) без переписывания истории, сразу `git push` и задеплоить.
-- Деплой бота: синхронизировать исходники на VPS, собрать `cargo build --release`,
-  перезапустить `tg-agent.service`, проверить `systemctl is-active` и короткий
-  journal. Если менялся RAG/Telegram runtime, проверить `/opt/tg-agent/.env`
-  `LLM_MODEL` без вывода секретов.
-- Если менялись исходники бота, синхронизировать их копию в RAG corpus и
-  запустить RAG deploy, чтобы live-индекс отвечал по актуальному коду.
-- В handoff указывать commit, branch, push/deploy status и важный smoke-output.
+Telegram-бот = **MCP-клиент + LLM-агент**. Юзер общается ТОЛЬКО через телеграм-чат.
+MCP-серверы подключаются **в чате** (команды или self-connect агентом), НЕ через
+внешние конфиги (Codex Desktop / VS Code `.mcp.json` — НЕ относятся к этому проекту).
 
 ## Что это
 
@@ -51,14 +33,6 @@ Telegram-бот = **MCP-клиент + LLM-агент + RAG-фронт**. Юзе
 - `src/agent/prompt.rs` — `BASE_SYSTEM` + `build_system_prompt` (слои промпта).
 - `src/persist.rs`, `src/state.rs` — персист серверов/подписок/watch, общий стейт.
 - `src/scheduler.rs` — периодические watch-джобы и push-summaries.
-- `src/rag_client.rs` — RAG-режим (`/rag on`): сабпроцесс
-  `rag-indexer answer --mode rag --json` (репо `Rag/ollama-rag-indexer`).
-  Каждый ход: `--history` (память сессии) + `--task-state` + `--rewrite`;
-  парсит sources с `chunk_id`/`quote`, рендерит «цитаты»; `relevant:false` =
-  честный «не знаю» без источников (отказ зашит в код индексера).
-- `src/agent/rag_task.rs` — task state RAG-диалога (цель / уточнено /
-  ограничения): LLM-экстракция перед каждым ответом, живёт в
-  `ChatSession.rag_task`, видна в `/rag status`, чистится `/reset`.
 
 ## Конфиг (env, `src/config.rs`)
 
@@ -78,16 +52,11 @@ Telegram-бот = **MCP-клиент + LLM-агент + RAG-фронт**. Юзе
 - `ADMIN_PASSWORD` — пароль web-админки; без него `/admin` отключён. Должен отличаться от `BOT_PASSWORD`.
 - `DIGEST_INTERVAL_MINUTES` — default 360.
 - `STATE_FILE` (default `state.json`), `SESSIONS_DIR` (default `sessions`).
-- `RAG_*` (см. `.env.example`): `RAG_INDEX` включает режим; ключевые —
-  `RAG_EMBED_MODEL` (прод: bge-m3), `RAG_CHAT_PROVIDER` (прод: openai =
-  DeepSeek, ключ `RAG_CHAT_API_KEY` только через env), `RAG_MIN_SCORE`
-  (прод: 0.5, откалиброван), `RAG_REWRITE`, `RAG_TIMEOUT_SECS`.
 
 ## Команды (`src/bot.rs` enum `Command`)
 
 `/start` `/help` `/connect` `/mcps` `/tools` `/call` `/watch` `/unwatch`
-`/watches` `/disconnect` `/profile` `/info` `/facts` `/trip` `/rag` `/compact`
-`/reset`
+`/watches` `/disconnect` `/profile` `/info` `/facts` `/trip` `/compact` `/reset`
 
 ## Подключение MCP — ТОЧНЫЙ синтаксис (`parse_connect`)
 
@@ -134,16 +103,3 @@ cargo test -- --ignored --nocapture   # live (нужны MCP + LLM key): kayak /
 
 Live-сценарии роя — `tests/live_trip_flow.rs` (байдарки, велопоход, прогулка):
 прогоняются на VPS с `LLM_API_KEY` + MCP (weather/osm/google).
-
-Live RAG-диалоги — `tests/live_rag_dialog.rs`: 2 сценария (12+10 сообщений),
-нужны `RAG_INDEX` (локальный qwen-индекс) + Ollama; проверяют источники+цитаты
-на каждом ходе, refusal без источников, удержание цели.
-
-## Деплой
-
-`./deploy.sh` (rsync → remote release build → restart → prune). Правила и
-верификация — скилл `deploy-vps`. ГЛАВНОЕ: никогда не запускать бинарь
-`tg-agent` руками на VPS (`--version` не парсится → второй поллер →
-`TerminatedByOtherGetUpdates`). Прод-раскладка: бот `/opt/tg-agent`,
-RAG-движок `/opt/ollama-rag-indexer`, box 2GB RAM + 2GB swap — модели >1.5GB
-не тянуть.

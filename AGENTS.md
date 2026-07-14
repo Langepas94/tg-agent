@@ -4,19 +4,6 @@ Telegram-бот = **MCP-клиент + LLM-агент**. Юзер общаетс
 MCP-серверы подключаются **в чате** (команды или self-connect агентом), НЕ через
 внешние конфиги (Codex Desktop / VS Code `.mcp.json` — НЕ относятся к этому проекту).
 
-## Deployment Autonomy
-
-- После правок не оставлять работу локальной: прогнать релевантные проверки,
-  закоммитить intended changes, сделать `git fetch`, влить актуальный upstream
-  (`main`) без переписывания истории, сразу `git push` и задеплоить.
-- Деплой бота: синхронизировать исходники на VPS, собрать `cargo build --release`,
-  перезапустить `tg-agent.service`, проверить `systemctl is-active` и короткий
-  journal. Если менялся RAG/Telegram runtime, проверить `/opt/tg-agent/.env`
-  `LLM_MODEL` без вывода секретов.
-- Если менялись исходники бота, синхронизировать их копию в RAG corpus и
-  запустить RAG deploy, чтобы live-индекс отвечал по актуальному коду.
-- В handoff указывать commit, branch, push/deploy status и важный smoke-output.
-
 ## Что это
 
 - Telegram-бот на `teloxide`. Подключает MCP-серверы в рантайме, отвечает на
@@ -34,23 +21,6 @@ MCP-серверы подключаются **в чате** (команды ил
 - `src/mcp_client.rs` — `ConnectParams`, `connect()` → `spawn_stdio` / `connect_http`.
 - `src/llm.rs` — LLM tool-loop + meta-tools `mcp_connect` / `mcp_disconnect` /
   `schedule_summary`; defs и хендлеры здесь.
-- `src/rag_client.rs` — тонкий клиент к локальному `rag-indexer answer --mode rag`;
-  включается в чате через `/rag on`, выключается через `/rag off`. С 2026-07
-  `rag-indexer` всегда возвращает `relevant: bool`, `retrieval` (кандидаты
-  до/после фильтра, порог), `rewritten_query` и `quote` в каждом source —
-  подробности в `Rag/ollama-rag-indexer/AGENTS.md`. `RagReply`/`RagSource`
-  парсят всё это; `render()` печатает источники как
-  `[n] source / section #chunk_id score=…` + «цитату» под каждым. Рефьюзл при
-  низкой релевантности долетает автоматически (`relevant: false`, фиксированный
-  "не знаю", `sources` пустой). Каждый ход бот передаёт `--history` (последние
-  сообщения сессии) и `--task-state`; `--rewrite` включается при непустой
-  истории (`RAG_REWRITE=0` отключает).
-- `src/agent/rag_task.rs` — task state RAG-диалога (цель / что уточнено /
-  ограничения-термины): LLM-экстракция перед каждым RAG-ответом (fallback —
-  цель из первого вопроса), хранится в `ChatSession.rag_task`, показывается в
-  `/rag status`, чистится `/reset`. Живые длинные сценарии:
-  `tests/live_rag_dialog.rs` (2 диалога 12+10 сообщений, `--ignored`, нужны
-  RAG_INDEX + Ollama).
 - `src/agent/flow.rs` — динамический рой агентов (BriefAgent → OptionsAgent →
   SwarmPlanner → WorkerAgents → VerifierAgent → ArtifactsAgent → FinalAgent),
   `/trip`. План задач строит SwarmPlanner из живого инвентаря MCP-tools, а не
@@ -82,17 +52,11 @@ MCP-серверы подключаются **в чате** (команды ил
 - `ADMIN_PASSWORD` — пароль web-админки; без него `/admin` отключён. Должен отличаться от `BOT_PASSWORD`.
 - `DIGEST_INTERVAL_MINUTES` — default 360.
 - `STATE_FILE` (default `state.json`), `SESSIONS_DIR` (default `sessions`).
-- `RAG_INDEX` — путь к готовому индексу `rag-indexer` (`.../structural`). Если
-  не задан, `/rag on` недоступен.
-- `RAG_INDEXER_BIN` — путь к CLI `rag-indexer`, default `rag-indexer`.
-- `RAG_EMBED_MODEL`, `RAG_CHAT_MODEL`, `RAG_OLLAMA_URL`, `RAG_CHAT_URL`,
-  `RAG_SEARCH_MODE`, `RAG_TOP_K` — параметры RAG-клиента.
 
 ## Команды (`src/bot.rs` enum `Command`)
 
 `/start` `/help` `/connect` `/mcps` `/tools` `/call` `/watch` `/unwatch`
-`/watches` `/disconnect` `/profile` `/info` `/facts` `/trip` `/rag`
-`/compact` `/reset`
+`/watches` `/disconnect` `/profile` `/info` `/facts` `/trip` `/compact` `/reset`
 
 ## Подключение MCP — ТОЧНЫЙ синтаксис (`parse_connect`)
 

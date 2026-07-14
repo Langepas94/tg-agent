@@ -1,10 +1,12 @@
 # tg-agent
 
 Telegram AI agent that connects to **MCP servers** at runtime, answers in
-natural language using their tools, and runs periodic jobs 24/7.
+natural language using their tools, and plans outdoor leisure around weather,
+location, dates and user constraints.
 
-Демо RAG-режима для показа заказчику (источники/цитаты/«не знаю» + диалог с
-памятью задачи): [docs/demo-rag-tasks-4-5.md](docs/demo-rag-tasks-4-5.md).
+The core flow is: collect only missing constraints → inspect weather and places
+→ compare suitable activity-and-place options → ask the user to choose → build
+and verify a concrete route → create only explicitly requested artifacts.
 
 ## Features
 
@@ -18,16 +20,6 @@ natural language using their tools, and runs periodic jobs 24/7.
 - **Natural-language agent** — free-text questions go through an LLM
   (OpenAI-compatible, DeepSeek by default) tool-calling loop over the connected
   MCP tools.
-- **RAG mode** — `/rag on` routes ordinary questions through a local
-  `rag-indexer` client: question → (history-aware query rewrite) → relevant
-  chunks → relevance filter → context + question → LLM. Every turn carries the
-  dialog history and a **task state** (dialog goal, what the user already
-  clarified, fixed constraints/terms — extracted by an LLM agent per message),
-  every answer ends with mandatory sources (`source / section #chunk_id`) and
-  verbatim «quotes», and a question below the relevance floor gets an honest
-  "не знаю" with a request to clarify. `/rag off` returns to the default
-  MCP/LLM agent; `/rag status` shows the active mode and index client;
-  `/reset` clears the RAG task state along with chat memory.
 - **Agent self-connect** — the agent can attach MCP servers on its own via the
   `mcp_connect` / `mcp_disconnect` meta-tools: when a request needs a capability
   no connected server provides, it picks the server, asks the user for any
@@ -68,21 +60,6 @@ ADMIN_PASSWORD=...          # required for web admin; must differ from BOT_PASSW
 DIGEST_INTERVAL_MINUTES=360
 STATE_FILE=state.json
 SESSIONS_DIR=sessions
-
-# Optional RAG client. On the 2GB VPS: RAG_EMBED_MODEL=bge-m3 (local Ollama),
-# RAG_CHAT_PROVIDER=openai + RAG_CHAT_URL=https://api.deepseek.com +
-# RAG_CHAT_MODEL=deepseek-chat + RAG_CHAT_API_KEY=... — embeddings local,
-# chat on the API (the box cannot host a 7B chat model).
-RAG_INDEX=/path/to/ollama-rag-indexer/indexes-real-qwen/structural
-RAG_INDEXER_BIN=/path/to/ollama-rag-indexer/.venv/bin/rag-indexer
-RAG_EMBED_MODEL=qwen3-embedding
-RAG_CHAT_MODEL=qwen2.5:7b
-RAG_OLLAMA_URL=http://localhost:11434
-RAG_CHAT_URL=http://localhost:11434
-RAG_SEARCH_MODE=hybrid
-RAG_TOP_K=5
-RAG_REWRITE=1               # history-aware query rewrite before retrieval
-RAG_MIN_SCORE=0.5           # relevance floor (unset = indexer default 0.35)
 ```
 
 ## Web admin
@@ -114,5 +91,4 @@ cargo test -- --ignored --nocapture          # live tests (need MCP + LLM key)
 ## Commands
 
 `/start` `/help` `/connect` `/mcps` `/tools` `/call` `/watch` `/unwatch`
-`/watches` `/disconnect` `/profile` `/info` `/facts` `/trip` `/rag`
-`/compact` `/reset`
+`/watches` `/disconnect` `/profile` `/info` `/facts` `/trip` `/compact` `/reset`

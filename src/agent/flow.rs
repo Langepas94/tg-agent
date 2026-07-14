@@ -430,6 +430,27 @@ fn broad_place_choice_required(brief: &TripBrief, text: &str) -> bool {
     asks_where || broad_area
 }
 
+fn activity_choice_required(brief: &TripBrief, text: &str) -> bool {
+    let combined = format!("{}\n{}", brief.render(), text).to_lowercase();
+    contains_any(
+        &combined,
+        &[
+            "байдарки или",
+            "велосипед или",
+            "пешком или",
+            "какой отдых",
+            "какой вид отдыха",
+            "что выбрать",
+            "чем заняться",
+            "куда поехать и чем",
+            "kayak or",
+            "bike or",
+            "which activity",
+            "what activity",
+        ],
+    )
+}
+
 fn option_candidate_count(text: &str) -> usize {
     let mut numbered = 0usize;
     let mut candidate_lines = 0usize;
@@ -457,11 +478,12 @@ fn option_candidate_count(text: &str) -> usize {
 }
 
 fn options_need_repair(brief: &TripBrief, user_text: &str, options: &str) -> bool {
-    broad_place_choice_required(brief, user_text) && option_candidate_count(options) < 2
+    (broad_place_choice_required(brief, user_text) || activity_choice_required(brief, user_text))
+        && option_candidate_count(options) < 2
 }
 
 fn render_options_repair_needed() -> String {
-    "Не хочу выбирать за вас один случайный маршрут: запрос широкий, а сравнительный список мест не собрался достаточно надёжно. Я сохранил состояние; напишите «продолжай», и я сначала соберу именно несколько разных вариантов мест, а не буду строить маршрут по одному варианту.".to_string()
+    "Не хочу выбирать за вас один случайный вариант: для честного сравнения пока недостаточно данных. Я сохранил состояние; напишите «продолжай», и я сначала сопоставлю несколько подходящих видов отдыха и мест по погоде и условиям, а уже потом перейду к маршруту.".to_string()
 }
 
 fn contains_any(text: &str, needles: &[&str]) -> bool {
@@ -671,7 +693,7 @@ impl SwarmAgentRegistry {
             },
             SwarmAgentSpec {
                 name: "OptionsAgent".into(),
-                role: "Compares concise candidate options before any deep research.".into(),
+                role: "Uses weather and location evidence to compare suitable activity-and-place options before deep route research.".into(),
                 model: default_model.into(),
                 tools_allowed: true,
                 side_effects_allowed: false,
@@ -785,13 +807,20 @@ const SWARM_BRIEF_PROMPT: &str = "You are BriefAgent in an outdoor-recreation pl
 Extract the user's request into an open, activity-agnostic brief. Do not use fixed activity \
 categories. Preserve the user's actual activity, constraints, preferences, requested artifacts, \
 dates, group capability, start area, and uncertainty. Ask only for facts that only the user can \
-know and that block planning. Return ONLY JSON: {\"brief\":{\"key\":\"value\",...},\
+know and that block planning. If the user wants the bot to choose the activity, record that goal \
+and do not ask them to choose it before weather and place comparison. Return ONLY JSON: \
+{\"brief\":{\"key\":\"value\",...},\
 \"ready\":bool,\"questions\":[\"...\"],\"recap\":\"short\"}.";
 
 const SWARM_OPTIONS_PROMPT: &str = "You are OptionsAgent. Give a SHORT menu of genuinely distinct \
 options for the outdoor/recreation request. Do not deep-dive into one route yet. Use available \
-tools only as much as needed to compare options at a high level. The options must match the user's \
-actual activity and constraints, whatever they are. If the request has a date window/weekend \
+weather and geo tools to compare options using current evidence. If the user has not fixed an \
+activity or explicitly asks what to choose, compare distinct activity-and-place combinations such \
+as paddling, cycling, and walking when they are feasible. Evaluate precipitation, wind, \
+temperature, daylight, terrain and activity-specific safety; exclude unsafe combinations and \
+explain the decisive trade-off in one line per option. Never ask the user to choose an activity \
+before doing this comparison. If the activity is fixed, preserve it exactly. All options must \
+respect the user's constraints. If the request has a date window/weekend \
 constraint, include the concrete candidate weekend date(s) and a short weather/daylight rationale \
 when tools allow it. \
 If the user has NOT fixed a specific spot/route and gave only a broad area or region, the options \
@@ -809,7 +838,9 @@ table.";
 const SWARM_PLANNER_PROMPT: &str = "You are SwarmPlanner. Build a minimal swarm plan from the \
 brief, the user's chosen option, prior records, and the ACTUAL connected MCP tool inventory. Do \
 not assume calendar/docs/maps/weather tools exist; inspect the inventory. Do not use fixed \
-activity templates. Create separate worker tasks with narrow responsibilities and isolated context. \
+activity templates. Treat the user's selected activity, place and date as hard inputs. Recheck \
+activity-specific weather safety before detailed routing. Create separate worker tasks with narrow \
+responsibilities and isolated context. \
 If the prior records are still only broad options or an unverified draft, do NOT include \
 side_effects=true tasks yet; first gather/verify the selected place, date, route and camp. \
 Include a side_effects=true task only for external artifacts explicitly requested by the user AND \
@@ -2009,6 +2040,20 @@ mod tests {
             "Хотим байдарки, в каких местах рядом с Волгоградом?",
             many
         ));
+    }
+
+    #[test]
+    fn activity_choice_request_rejects_single_option() {
+        let mut brief = TripBrief::default();
+        brief.fields.insert(
+            "request".into(),
+            "выбери по погоде байдарки или велосипед".into(),
+        );
+        let one = "1. Веломаршрут — 48.700, 44.500";
+        let many = "1. Веломаршрут — 48.700, 44.500\n2. Байдарки — 50.1347, 43.5215";
+
+        assert!(options_need_repair(&brief, "что выбрать?", one));
+        assert!(!options_need_repair(&brief, "что выбрать?", many));
     }
 
     #[test]
