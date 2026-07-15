@@ -18,6 +18,10 @@ The model receives the diff and retrieved context and produces a Markdown review
 with potential bugs, architectural problems and recommendations. One pull
 request comment is created and updated after later pushes.
 
+The workflow can also be started manually with `workflow_dispatch` and a pull
+request number. This is useful for smoke-testing configuration or rerunning a
+review without pushing another commit.
+
 ## Repository configuration
 
 The default setup uses GitHub Models and needs no repository secret:
