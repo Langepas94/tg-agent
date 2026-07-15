@@ -47,8 +47,9 @@ and treated as untrusted model input.
 ## Context limits
 
 The pipeline retrieves at most eight documentation chunks and twelve code
-chunks. Large diffs and changed source snapshots are clipped before the model
-call. The changed-file list is always included.
+chunks within a shared retrieval budget. Diff, changed source and metadata have
+separate limits, and the complete prompt has a hard 48,000-character ceiling.
+The changed-file list is always included.
 
 ## Local deterministic tests
 

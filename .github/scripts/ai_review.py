@@ -285,6 +285,18 @@ def upsert_comment(api, repository, number, token, review):
         github_json(api, path, token, method="POST", payload={"body": body})
 
 
+def build_prompt(pull, changed_names, raw_diff, changed_sources, retrieved):
+    prompt = (
+        f"PR title: {clip(pull['title'], 500, 'title truncated')}\n"
+        f"PR description:\n{clip(pull.get('body') or '(empty)', 2000, 'description truncated')}\n\n"
+        f"Changed files:\n{clip(changed_names, 6000, 'file list truncated')}\n\n"
+        f"Diff:\n{clip(raw_diff, 18000, 'diff truncated for model context')}\n\n"
+        f"Changed source snapshots:\n{changed_sources or '(unavailable)'}\n\n"
+        f"Retrieved project documentation and code:\n{render_chunks(retrieved) or '(no relevant chunks found)'}"
+    )
+    return clip(prompt, 48000, "total review context truncated")
+
+
 def main():
     token = required_env("GITHUB_TOKEN")
     repository = required_env("GITHUB_REPOSITORY")
@@ -300,7 +312,7 @@ def main():
         build_chunks(Path.cwd()),
         f"{changed_names}\n{raw_diff}",
         limits={"documentation": 8, "code": 12},
-        character_budget=40000,
+        character_budget=12000,
     )
     changed_sources = fetch_changed_sources(
         api,
@@ -308,15 +320,10 @@ def main():
         pull["head"]["repo"]["full_name"],
         pull["head"]["sha"],
         token,
+        budget=10000,
     )
-    prompt = (
-        f"PR title: {pull['title']}\n"
-        f"PR description:\n{pull.get('body') or '(empty)'}\n\n"
-        f"Changed files:\n{changed_names}\n\n"
-        f"Diff:\n{clip(raw_diff, 70000, 'diff truncated for model context')}\n\n"
-        f"Changed source snapshots:\n{changed_sources or '(unavailable)'}\n\n"
-        f"Retrieved project documentation and code:\n{render_chunks(retrieved) or '(no relevant chunks found)'}"
-    )
+    prompt = build_prompt(pull, changed_names, raw_diff, changed_sources, retrieved)
+    print(f"AI review context: {len(prompt)} characters, {len(files)} changed files")
     review = llm_review(base_url, api_key, model, language, prompt)
     upsert_comment(api, repository, number, token, review)
 
