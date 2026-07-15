@@ -75,6 +75,18 @@ class ReviewPipelineTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "AI_REVIEW_API_KEY"):
                 ai_review.provider_config("github-token")
 
+    def test_prompt_has_hard_total_budget(self):
+        prompt = ai_review.build_prompt(
+            {"title": "title" * 1000, "body": "body" * 10000},
+            "files" * 10000,
+            "diff" * 10000,
+            "sources" * 10000,
+            [{"path": "src/main.rs", "kind": "code", "line": 1, "text": "code" * 10000}],
+        )
+        self.assertLessEqual(len(prompt), 48100)
+        self.assertIn("Changed files", prompt)
+        self.assertIn("Diff", prompt)
+
 
 if __name__ == "__main__":
     unittest.main()
