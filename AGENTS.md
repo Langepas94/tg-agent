@@ -112,6 +112,7 @@ the trip flow changes.
 ## Production
 
 - Host: root@5.129.234.9
+- SSH key: $HOME/Documents/ai/.ssh/timeweb_tg_agent_ed25519
 - App: /opt/tg-agent
 - Environment: /opt/tg-agent/.env
 - Service: tg-agent.service
@@ -120,7 +121,7 @@ the trip flow changes.
 
 Deploy with:
 
-    SSH_KEY=/path/to/timeweb-key ENABLE_NGINX_PROXY=0 ./deploy.sh
+    ENABLE_NGINX_PROXY=0 ./deploy.sh
 
 After deployment verify version, exactly one bot process, service state and
 recent logs. Never invoke the binary with --version; that starts another bot
