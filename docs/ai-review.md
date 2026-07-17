@@ -48,8 +48,9 @@ and treated as untrusted model input.
 
 The pipeline retrieves at most eight documentation chunks and twelve code
 chunks within a shared retrieval budget. Diff, changed source and metadata have
-separate limits, and the complete prompt has a hard 48,000-character ceiling.
-The changed-file list is always included.
+separate limits. GitHub Models receives at most 20,000 prompt characters to
+stay below its request gateway limit; custom OpenAI-compatible providers retain
+a hard 48,000-character ceiling. The changed-file list is always included.
 
 ## Local deterministic tests
 
