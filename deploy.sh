@@ -24,6 +24,12 @@ echo "==> build release + restart + PRUNE artifacts"
 "${SSH[@]}" "$VPS_HOST" "bash -s" <<REMOTE
 set -e
 cd "$REMOTE_DIR"
+if git rev-parse --git-dir >/dev/null 2>&1; then
+  git fetch -q origin main
+  git update-ref refs/heads/main refs/remotes/origin/main
+  git symbolic-ref HEAD refs/heads/main
+  git read-tree HEAD
+fi
 "\$HOME/.cargo/bin/cargo" build --release 2>&1 | tail -3
 systemctl restart tg-agent
 sleep 3
