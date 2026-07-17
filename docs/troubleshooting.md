@@ -59,5 +59,6 @@ Rust process is listening on that exact loopback port.
 
 Run the deterministic tests locally first. A GitHub Models `413` means the
 combined prompt is too large; the current implementation applies separate
-budgets and a hard 48,000-character ceiling. Use `workflow_dispatch` with a PR
-number for a production smoke rerun.
+budgets, a 20,000-character GitHub Models limit and a 48,000-character custom
+provider limit. Use `workflow_dispatch` with a PR number for a production smoke
+rerun.

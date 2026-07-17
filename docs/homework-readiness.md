@@ -29,15 +29,16 @@ The audit found these assignments in the `ai` and `project-assistant` tasks:
 ## Validation performed
 
 - `tg-agent`: formatting, 138 unit tests, release build and `git diff --check`.
-- AI review: 8 deterministic Python tests.
+- AI review: 9 deterministic Python tests.
 - `project-assistant`: formatting, 15 tests and release build.
 - `/help`, `/support TICKET-1001` and `/work` search executed through the release
   assistant against `tg-agent`.
 - The change-report scenario was run twice in a disposable clone; the second
   run returned `No changes` after excluding `.assistant/` from MCP git status.
 - GitHub `main` contains merged PRs #1 and #2 for AI review.
-- The latest manual `AI code review` workflow completed successfully after the
-  48,000-character context limit fix.
+- The latest manual `AI code review` workflow completed successfully; the
+  documentation PR exposed a smaller GitHub Models gateway limit and now uses
+  a dedicated 20,000-character provider budget.
 - Production `tg-agent.service`, `open-meteo-mcp.service` and
   `project-assistant-support.service` are active.
 - Public support page and health return `200`; protected ticket context returns
