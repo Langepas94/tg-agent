@@ -20,7 +20,9 @@ cd ~/Documents/tg-agent && ./deploy.sh
 `deploy.sh` = rsync source (excludes .env/state.json/sessions) → remote
 `cargo build --release` → `systemctl restart tg-agent` → prune build
 artifacts + vacuum journal (14GB disk!) → nginx /admin proxy. SSH key is passed
-through `SSH_KEY`; host defaults to `root@5.129.234.9`.
+through `SSH_KEY`; its canonical local path is
+`$HOME/Documents/ai/.ssh/timeweb_tg_agent_ed25519`, and the host defaults to
+`root@5.129.234.9`.
 
 ## FOOTGUN — never do this
 
@@ -33,7 +35,7 @@ no effect".
 ## Verify after every deploy (mandatory)
 
 ```bash
-ssh -i ~/.ssh/id_ed25519_vps root@5.129.234.9 \
+ssh -i "$HOME/Documents/ai/.ssh/timeweb_tg_agent_ed25519" root@5.129.234.9 \
   'pgrep -af tg-agent | grep -v pgrep; \
    grep -m1 "^version" /opt/tg-agent/Cargo.toml; \
    journalctl -u tg-agent --since "-3 min" | grep -ci TerminatedByOtherGetUpdates; \

@@ -78,8 +78,13 @@ managed by `tg-agent.service`. The required weather service is
 `open-meteo-mcp.service`.
 
 ```bash
-SSH_KEY=/path/to/timeweb-key ENABLE_NGINX_PROXY=0 ./deploy.sh
+ENABLE_NGINX_PROXY=0 ./deploy.sh
 ```
+
+The canonical Timeweb private key for this workstation is
+`$HOME/Documents/ai/.ssh/timeweb_tg_agent_ed25519`. `deploy.sh` uses this path
+by default. Override `SSH_KEY` only when intentionally deploying from another
+workstation or with a rotated key.
 
 Use `ENABLE_NGINX_PROXY=0` when nginx is already shared with the support
 assistant or another explicitly retained endpoint. Otherwise review the nginx

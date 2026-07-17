@@ -44,22 +44,12 @@ The audit found these assignments in the `ai` and `project-assistant` tasks:
   `project-assistant-support.service` are active.
 - Public support page and health return `200`; protected ticket context returns
   `401` without the operator password.
+- The merged support binary was deployed on 2026-07-17. An authorized
+  `TICKET-1001` smoke joined `USER-42`, returned a non-empty answer and selected
+  `docs/user/getting-started.md` as its first source.
 - `name-gen` and `ollama` services are disabled and inactive.
 
 ## Remaining risks
-
-### Support deployment access
-
-All required pull requests are merged. The public support page and health check
-return `200`, and an unauthenticated ticket request returns `401`. Updating the
-running support binary requires the Timeweb SSH private key configured by the
-deployment environment. The expected local path is
-`~/.ssh/id_ed25519_vps`; it was not available during the final audit.
-
-After restoring VPS access, rebuild and restart
-`project-assistant-support.service`, then verify that `TICKET-1001` returns a
-response whose first source is `docs/user/getting-started.md` or
-`docs/user/support-and-faq.md`.
 
 ### Optional admin endpoint
 
@@ -79,5 +69,5 @@ and keep the CLI evidence mode available when an LLM provider is unavailable.
 
 All five assignments have working implementations, repeatable demonstrations
 and merged source code. A clean checkout of both repositories reproduces the
-verified local state. The only remaining production action is restarting the
-support service with the merged binary after VPS SSH access is restored.
+verified local state. The merged user-first support assistant is deployed and
+verified on the production VPS.
