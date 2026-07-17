@@ -9,9 +9,9 @@ use std::{future::Future, time::Duration};
 
 use crate::{mcp_client::ConnectParams, state::BotState};
 
-const AGENT_TURN_TIMEOUT: Duration = Duration::from_secs(150);
+const AGENT_TURN_TIMEOUT: Duration = Duration::from_secs(180);
 const AGENT_TURN_TIMEOUT_MESSAGE: &str =
-    "⏱ Не успел собрать проверенный ответ за 2,5 минуты. Запрос остановлен, а состояние диалога восстановлено. Попробуйте ещё раз; если повторится, сократите запрос до места старта, дат и одного вида активности.";
+    "⏱ Не успел собрать проверенный ответ за 3 минуты. Запрос остановлен, а состояние диалога восстановлено. Попробуйте ещё раз; если повторится, сократите запрос до места старта, дат и одного вида активности.";
 
 async fn run_with_timeout<F: Future>(
     duration: Duration,
