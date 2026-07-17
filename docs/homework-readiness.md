@@ -21,10 +21,10 @@ The audit found these assignments in the `ai` and `project-assistant` tasks:
 | Assignment | Implementation | Verified evidence | Demo status |
 | --- | --- | --- | --- |
 | Travel bot | `tg-agent` 0.15.0, runtime MCP, stateful trip swarm | 138 Rust tests, release build, production services active | Ready for Telegram smoke; full live route still depends on Telegram, LLM and MCP availability |
-| Project `/help` | Standalone `project-assistant`, README/docs RAG, MCP branch/files/diff | 16 assistant tests, release build, one-shot `/help` smoke | Ready in project-assistant PR #1 |
-| AI PR review | GitHub Action, GitHub API diff, RAG, one upserted comment | 8 Python tests and successful GitHub Actions smoke run | Ready; verify automatic trigger on the next documentation PR |
-| Support assistant | `/support`, JSON users/tickets, MCP join, user-first RAG, CLI and web UI | `TICKET-1001 → USER-42`, `docs/user/` first, public page and health `200`, unauthenticated API `401` | Ready in PR #1 and on VPS; deployed process must be updated after merge |
-| File assistant | `/work` search and deterministic change report, bounded MCP file tools | Multi-file search, disposable-clone report smoke and 16 tests | Ready in project-assistant PR #1; demonstrate writes only in a disposable clone |
+| Project `/help` | Standalone `project-assistant`, README/docs RAG, MCP branch/files/diff | 16 assistant tests, release build, one-shot `/help` smoke | Merged to project-assistant `main` and ready locally |
+| AI PR review | GitHub Action, GitHub API diff, RAG, one upserted comment | 9 Python tests and successful automatic review of documentation PR #3 | Merged to `main` and verified on a real pull request |
+| Support assistant | `/support`, JSON users/tickets, MCP join, user-first RAG, CLI and web UI | `TICKET-1001 → USER-42`, `docs/user/` first, public page and health `200`, unauthenticated API `401` | Merged to `main`; production endpoint is available, binary update is pending VPS access |
+| File assistant | `/work` search and deterministic change report, bounded MCP file tools | Multi-file search, disposable-clone report smoke and 16 tests | Merged to project-assistant `main`; demonstrate writes only in a disposable clone |
 
 ## Validation performed
 
@@ -36,10 +36,10 @@ The audit found these assignments in the `ai` and `project-assistant` tasks:
   assistant against `tg-agent`.
 - The change-report scenario was run twice in a disposable clone; the second
   run returned `No changes` after excluding `.assistant/` from MCP git status.
-- GitHub `main` contains merged PRs #1 and #2 for AI review.
-- The latest manual `AI code review` workflow completed successfully; the
-  documentation PR exposed a smaller GitHub Models gateway limit and now uses
-  a dedicated 20,000-character provider budget.
+- GitHub `main` contains merged AI-review PRs #1, #2 and #4 plus documentation
+  PR #3. Project-assistant PR #1 is also merged to its `main`.
+- Automatic `AI code review` completed successfully on documentation PR #3
+  after applying the dedicated 20,000-character GitHub Models budget.
 - Production `tg-agent.service`, `open-meteo-mcp.service` and
   `project-assistant-support.service` are active.
 - Public support page and health return `200`; protected ticket context returns
@@ -48,16 +48,18 @@ The audit found these assignments in the `ai` and `project-assistant` tasks:
 
 ## Remaining risks
 
-### Pending merges and support deployment
+### Support deployment access
 
-The complete assistant suite is published in
-`Langepas94/project-assistant` pull request #1 and its GitHub CI passes. The
-expanded `tg-agent` documentation is published in documentation pull request
-#3. Both changes remain reproducible, but a clean checkout of `main` will not
-contain them until the pull requests are merged.
+All required pull requests are merged. The public support page and health check
+return `200`, and an unauthenticated ticket request returns `401`. Updating the
+running support binary requires the Timeweb SSH private key configured by the
+deployment environment. The expected local path is
+`~/.ssh/id_ed25519_vps`; it was not available during the final audit.
 
-After both merges, rebuild and restart the support service so the web assistant
-uses the user-first retrieval behavior and the new `docs/user/` knowledge.
+After restoring VPS access, rebuild and restart
+`project-assistant-support.service`, then verify that `TICKET-1001` returns a
+response whose first source is `docs/user/getting-started.md` or
+`docs/user/support-and-faq.md`.
 
 ### Optional admin endpoint
 
@@ -75,8 +77,7 @@ and keep the CLI evidence mode available when an LLM provider is unavailable.
 
 ## Conclusion
 
-All five assignments have working implementations and repeatable
-demonstrations. Their latest changes are published in open pull requests. The
-support endpoint is live; merging both pull requests and redeploying the
-support service are the remaining steps before the user-first support flow is
-the default on a clean checkout and in production.
+All five assignments have working implementations, repeatable demonstrations
+and merged source code. A clean checkout of both repositories reproduces the
+verified local state. The only remaining production action is restarting the
+support service with the merged binary after VPS SSH access is restored.
