@@ -35,15 +35,24 @@ class ReviewPipelineTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "docs").mkdir()
+            (root / "docs" / "user").mkdir()
             (root / "src").mkdir()
             (root / "target").mkdir()
             (root / "README.md").write_text("readme", encoding="utf-8")
             (root / "docs" / "architecture.md").write_text("docs", encoding="utf-8")
+            (root / "docs" / "user" / "getting-started.md").write_text(
+                "user flow", encoding="utf-8"
+            )
             (root / "src" / "main.rs").write_text("fn main() {}", encoding="utf-8")
             (root / "target" / "generated.rs").write_text("generated", encoding="utf-8")
             files = ai_review.knowledge_files(root)
         self.assertEqual(
-            ["README.md", "docs/architecture.md", "src/main.rs"],
+            [
+                "README.md",
+                "docs/architecture.md",
+                "docs/user/getting-started.md",
+                "src/main.rs",
+            ],
             [path for path, _ in files],
         )
 

@@ -3,3 +3,5 @@ target/
 state.json
 state.json.tmp
 sessions/
+__pycache__/
+.DS_Store

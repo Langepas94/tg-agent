@@ -8,6 +8,10 @@ The core flow is: collect only missing constraints → inspect weather and place
 → compare suitable activity-and-place options → ask the user to choose → build
 and verify a concrete route → create only explicitly requested artifacts.
 
+The production bot is intentionally separate from the developer and support
+assistants. RAG over this repository is implemented by the standalone
+`project-assistant`; document retrieval is not part of the Telegram runtime.
+
 ## Features
 
 - **Runtime MCP management** — `/connect`, `/mcps`, `/tools`, `/call`,
@@ -64,9 +68,10 @@ SESSIONS_DIR=sessions
 
 ## Web admin
 
-The bot starts a small root admin UI at `http://ADMIN_ADDR/admin`. By default
-the Rust process binds to `127.0.0.1:8080`, and `deploy.sh` exposes it through
-nginx as `http://5.129.234.9/admin`.
+When enabled, the bot starts a small root admin UI at
+`http://ADMIN_ADDR/admin`. The source-code default bind is
+`127.0.0.1:8080`; choose another loopback port when nginx or a retained service
+already owns that port, then point the `/admin` proxy to the same address.
 
 The UI lets the owner inspect users, profile fields, notes, sticky facts,
 compacted summary, recent messages, watches, push subscriptions, raw session
@@ -81,6 +86,10 @@ be different from `BOT_PASSWORD`.
 cargo run --release
 ```
 
+Before a production run, set a non-default `BOT_PASSWORD`. Add
+`ADMIN_PASSWORD` only when the optional web admin must be enabled, and keep it
+different from the Telegram password.
+
 ## Test
 
 ```bash
@@ -92,3 +101,31 @@ cargo test -- --ignored --nocapture          # live tests (need MCP + LLM key)
 
 `/start` `/help` `/connect` `/mcps` `/tools` `/call` `/watch` `/unwatch`
 `/watches` `/disconnect` `/profile` `/info` `/facts` `/trip` `/compact` `/reset`
+
+## Documentation
+
+- [User guide](docs/user/README.md) — first launch, the canonical trip flow,
+  commands, FAQ and safe support instructions. Support assistants treat this
+  section as the authoritative product source.
+- [Architecture](docs/architecture.md) — runtime boundaries, components and
+  the verified outdoor-planning sequence.
+- [Configuration and operations](docs/configuration.md) — environment,
+  security, persistence and deployment checks.
+- [Troubleshooting](docs/troubleshooting.md) — operator checks for Telegram,
+  authorization, MCP, LLM and web endpoints after the user guide is exhausted.
+- [Demonstration guide](docs/demo.md) — reproducible scenarios for the bot,
+  developer assistant, support assistant and AI review.
+- [Homework readiness report](docs/homework-readiness.md) — assignment matrix,
+  evidence and remaining publication risk.
+- [Automatic AI review](docs/ai-review.md) — GitHub Actions design, safety and
+  local verification.
+
+## Required verification
+
+```bash
+cargo fmt --all -- --check
+cargo test
+cargo build --release
+python3 -m unittest discover -s .github/scripts -p 'test_*.py'
+git diff --check
+```
