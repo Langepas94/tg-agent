@@ -17,7 +17,7 @@ SSH=(ssh -i "$SSH_KEY" -o ConnectTimeout=15)
 echo "==> rsync source to $VPS_HOST:$REMOTE_DIR"
 rsync -az -e "ssh -i $SSH_KEY" \
   --exclude .env --exclude state.json --exclude sessions/ \
-  --exclude target/ --exclude .git/ \
+  --exclude target/ --exclude .git \
   ./ "$VPS_HOST:$REMOTE_DIR/"
 
 echo "==> build release + restart + PRUNE artifacts"
