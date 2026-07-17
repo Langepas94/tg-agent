@@ -75,6 +75,16 @@ class ReviewPipelineTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "AI_REVIEW_API_KEY"):
                 ai_review.provider_config("github-token")
 
+    def test_github_models_uses_smaller_prompt_budget(self):
+        self.assertEqual(
+            20000,
+            ai_review.provider_prompt_limit("https://models.github.ai/inference"),
+        )
+        self.assertEqual(
+            48000,
+            ai_review.provider_prompt_limit("https://api.deepseek.com"),
+        )
+
     def test_prompt_has_hard_total_budget(self):
         prompt = ai_review.build_prompt(
             {"title": "title" * 1000, "body": "body" * 10000},
