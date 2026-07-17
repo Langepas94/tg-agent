@@ -64,7 +64,9 @@ outside screen sharing, load `TICKET-1001` and ask the same question.
 Success criteria:
 
 - ticket `TICKET-1001` is joined with `USER-42` through MCP;
-- the answer uses `docs/troubleshooting.md` and does not reveal a password;
+- the first answer source is `docs/user/getting-started.md` or
+  `docs/user/support-and-faq.md`, with technical docs used only as fallback;
+- the answer never asks for or reveals a password;
 - no password returns `401`;
 - `/support/health` returns `200`.
 

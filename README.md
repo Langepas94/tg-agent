@@ -104,12 +104,15 @@ cargo test -- --ignored --nocapture          # live tests (need MCP + LLM key)
 
 ## Documentation
 
+- [User guide](docs/user/README.md) — first launch, the canonical trip flow,
+  commands, FAQ and safe support instructions. Support assistants treat this
+  section as the authoritative product source.
 - [Architecture](docs/architecture.md) — runtime boundaries, components and
   the verified outdoor-planning sequence.
 - [Configuration and operations](docs/configuration.md) — environment,
   security, persistence and deployment checks.
 - [Troubleshooting](docs/troubleshooting.md) — operator checks for Telegram,
-  authorization, MCP, LLM and web endpoints.
+  authorization, MCP, LLM and web endpoints after the user guide is exhausted.
 - [Demonstration guide](docs/demo.md) — reproducible scenarios for the bot,
   developer assistant, support assistant and AI review.
 - [Homework readiness report](docs/homework-readiness.md) — assignment matrix,

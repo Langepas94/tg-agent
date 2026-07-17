@@ -21,16 +21,17 @@ The audit found these assignments in the `ai` and `project-assistant` tasks:
 | Assignment | Implementation | Verified evidence | Demo status |
 | --- | --- | --- | --- |
 | Travel bot | `tg-agent` 0.15.0, runtime MCP, stateful trip swarm | 138 Rust tests, release build, production services active | Ready for Telegram smoke; full live route still depends on Telegram, LLM and MCP availability |
-| Project `/help` | Standalone `project-assistant`, README/docs RAG, MCP branch/files/diff | 15 assistant tests, release build, one-shot `/help` smoke | Ready locally; new docs improve source precision |
+| Project `/help` | Standalone `project-assistant`, README/docs RAG, MCP branch/files/diff | 16 assistant tests, release build, one-shot `/help` smoke | Ready in project-assistant PR #1 |
 | AI PR review | GitHub Action, GitHub API diff, RAG, one upserted comment | 8 Python tests and successful GitHub Actions smoke run | Ready; verify automatic trigger on the next documentation PR |
-| Support assistant | `/support`, JSON users/tickets, MCP join, RAG, CLI and web UI | `TICKET-1001 → USER-42`, public page and health `200`, unauthenticated API `401` | Ready on VPS; real LLM answer depends on provider availability |
-| File assistant | `/work` search and deterministic change report, bounded MCP file tools | Multi-file search, disposable-clone report smoke and 15 tests | Ready locally; demonstrate writes only in a disposable clone |
+| Support assistant | `/support`, JSON users/tickets, MCP join, user-first RAG, CLI and web UI | `TICKET-1001 → USER-42`, `docs/user/` first, public page and health `200`, unauthenticated API `401` | Ready in PR #1 and on VPS; deployed process must be updated after merge |
+| File assistant | `/work` search and deterministic change report, bounded MCP file tools | Multi-file search, disposable-clone report smoke and 16 tests | Ready in project-assistant PR #1; demonstrate writes only in a disposable clone |
 
 ## Validation performed
 
 - `tg-agent`: formatting, 138 unit tests, release build and `git diff --check`.
-- AI review: 9 deterministic Python tests.
-- `project-assistant`: formatting, 15 tests and release build.
+- AI review: 9 deterministic Python tests, including recursive `docs/user/`
+  discovery in the knowledge corpus.
+- `project-assistant`: formatting, 16 tests and release build.
 - `/help`, `/support TICKET-1001` and `/work` search executed through the release
   assistant against `tg-agent`.
 - The change-report scenario was run twice in a disposable clone; the second
@@ -47,17 +48,16 @@ The audit found these assignments in the `ai` and `project-assistant` tasks:
 
 ## Remaining risks
 
-### Project-assistant publication
+### Pending merges and support deployment
 
-The support, web and file-operation work exists in the local
-`project-assistant` checkout as uncommitted changes on top of initial commit
-`eb861fe`. Its GitHub `main` therefore cannot reproduce the demonstrated state
-yet. This is the only blocker to calling every homework artifact recoverable
-and ready for use on another machine.
+The complete assistant suite is published in
+`Langepas94/project-assistant` pull request #1 and its GitHub CI passes. The
+expanded `tg-agent` documentation is published in documentation pull request
+#3. Both changes remain reproducible, but a clean checkout of `main` will not
+contain them until the pull requests are merged.
 
-Required closure: review the existing local diff, remove generated files such
-as `.DS_Store` and local reports, commit the intended sources, push them to the
-standalone `Langepas94/project-assistant` repository and rerun its CI.
+After both merges, rebuild and restart the support service so the web assistant
+uses the user-first retrieval behavior and the new `docs/user/` knowledge.
 
 ### Optional admin endpoint
 
@@ -75,9 +75,8 @@ and keep the CLI evidence mode available when an LLM provider is unavailable.
 
 ## Conclusion
 
-All five assignments have working local or deployed implementations and
-repeatable demonstrations. The `tg-agent` repository and AI-review pipeline are
-reproducible from GitHub. The support endpoint is live. The remaining release
-gap is publication of the accumulated `project-assistant` changes; until that
-commit and push are completed, the local assistant is demonstrable but not yet
-fully recoverable for real use on a clean machine.
+All five assignments have working implementations and repeatable
+demonstrations. Their latest changes are published in open pull requests. The
+support endpoint is live; merging both pull requests and redeploying the
+support service are the remaining steps before the user-first support flow is
+the default on a clean checkout and in production.
