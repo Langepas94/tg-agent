@@ -15,7 +15,7 @@ pub const MAX_STEPS: usize = 12;
 /// then it must COMMIT. A high cap just lets a chatty model fire 20 slow queries
 /// and blow the wall-clock, so keep it bounded and pair it with the worker's
 /// "commit concrete data, don't narrate" instruction.
-pub const STAGE_MAX_STEPS: usize = 14;
+pub const STAGE_MAX_STEPS: usize = 10;
 /// Per-tool-result char cap before feeding it back to the model. Sized for a
 /// 7-day hourly forecast (~10–15k chars); `fit_to_context` reclaims the window
 /// if many such results accumulate across the loop.

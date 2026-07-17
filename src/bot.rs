@@ -5,20 +5,7 @@ use teloxide::{
     utils::command::BotCommands,
 };
 
-use std::{future::Future, time::Duration};
-
 use crate::{mcp_client::ConnectParams, state::BotState};
-
-const AGENT_TURN_TIMEOUT: Duration = Duration::from_secs(180);
-const AGENT_TURN_TIMEOUT_MESSAGE: &str =
-    "⏱ Не успел собрать проверенный ответ за 3 минуты. Запрос остановлен, а состояние диалога восстановлено. Попробуйте ещё раз; если повторится, сократите запрос до места старта, дат и одного вида активности.";
-
-async fn run_with_timeout<F: Future>(
-    duration: Duration,
-    future: F,
-) -> Result<F::Output, tokio::time::error::Elapsed> {
-    tokio::time::timeout(duration, future).await
-}
 
 #[derive(BotCommands, Clone)]
 #[command(rename_rule = "lowercase", description = "Commands:")]
@@ -191,16 +178,11 @@ async fn handle_text(bot: Bot, msg: Message, state: BotState) -> anyhow::Result<
     });
 
     let mut session = crate::agent::session::load(chat.0);
-    let session_before_turn = session.clone();
-    let outcome = run_with_timeout(
-        AGENT_TURN_TIMEOUT,
-        crate::agent::run_turn(&llm, &state, &mut session, &text, Some(tx)),
-    )
-    .await;
+    let outcome = crate::agent::run_turn(&llm, &state, &mut session, &text, Some(tx)).await;
     typing.abort();
     let _ = prog_task.await;
     match outcome {
-        Ok(Ok(result)) => {
+        Ok(result) => {
             if let Err(e) = crate::agent::session::save(&session) {
                 tracing::error!("save session {}: {e}", chat.0);
             }
@@ -222,7 +204,7 @@ async fn handle_text(bot: Bot, msg: Message, state: BotState) -> anyhow::Result<
                 bot.send_message(chat, chunk).await?;
             }
         }
-        Ok(Err(e)) => {
+        Err(e) => {
             // `{e:#}` renders the full anyhow cause chain (stage → reason),
             // e.g. "answering failed: LLM request failed: operation timed out".
             // Plain `{e}` would drop everything below the top context and is
@@ -233,18 +215,6 @@ async fn handle_text(bot: Bot, msg: Message, state: BotState) -> anyhow::Result<
                 "❌ Не удалось обработать запрос. Попробуйте ещё раз через минуту.",
             )
             .await?;
-        }
-        Err(_) => {
-            session = session_before_turn;
-            if let Err(e) = crate::agent::session::save(&session) {
-                tracing::error!("restore timed-out session {}: {e}", chat.0);
-            }
-            tracing::warn!(
-                "agent turn for chat {} timed out after {}s",
-                chat.0,
-                AGENT_TURN_TIMEOUT.as_secs()
-            );
-            bot.send_message(chat, AGENT_TURN_TIMEOUT_MESSAGE).await?;
         }
     }
     Ok(())
@@ -645,17 +615,12 @@ async fn handle_trip(bot: &Bot, chat: ChatId, state: &BotState, args: &str) -> a
         }
     });
     let mut session = crate::agent::session::load(chat.0);
-    let session_before_turn = session.clone();
     session.trip = Some(crate::agent::flow::TripFlowState::start());
-    let outcome = run_with_timeout(
-        AGENT_TURN_TIMEOUT,
-        crate::agent::run_turn(&llm, state, &mut session, kick, Some(tx)),
-    )
-    .await;
+    let outcome = crate::agent::run_turn(&llm, state, &mut session, kick, Some(tx)).await;
     typing.abort();
     let _ = prog_task.await;
     match outcome {
-        Ok(Ok(result)) => {
+        Ok(result) => {
             if let Err(e) = crate::agent::session::save(&session) {
                 tracing::error!("save session {}: {e}", chat.0);
             }
@@ -674,25 +639,13 @@ async fn handle_trip(bot: &Bot, chat: ChatId, state: &BotState, args: &str) -> a
                 bot.send_message(chat, chunk).await?;
             }
         }
-        Ok(Err(e)) => {
+        Err(e) => {
             tracing::error!("trip flow for chat {}: {e:#}", chat.0);
             bot.send_message(
                 chat,
                 "❌ Не удалось обработать поездку. Попробуйте ещё раз через минуту.",
             )
             .await?;
-        }
-        Err(_) => {
-            session = session_before_turn;
-            if let Err(e) = crate::agent::session::save(&session) {
-                tracing::error!("restore timed-out trip session {}: {e}", chat.0);
-            }
-            tracing::warn!(
-                "trip flow for chat {} timed out after {}s",
-                chat.0,
-                AGENT_TURN_TIMEOUT.as_secs()
-            );
-            bot.send_message(chat, AGENT_TURN_TIMEOUT_MESSAGE).await?;
         }
     }
     Ok(())
@@ -1305,11 +1258,5 @@ mod tests {
     fn html_escape_specials() {
         assert_eq!(html_escape("a & b < c > d"), "a &amp; b &lt; c &gt; d");
         assert_eq!(html_escape("plain"), "plain");
-    }
-
-    #[tokio::test]
-    async fn run_with_timeout_stops_stalled_future() {
-        let result = run_with_timeout(Duration::from_millis(1), std::future::pending::<()>()).await;
-        assert!(result.is_err());
     }
 }

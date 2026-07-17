@@ -115,6 +115,10 @@ pub struct TripFlowState {
     /// auto-advance. `None` whenever we are not paused on a checkpoint.
     #[serde(default)]
     pub awaiting_choice: Option<Stage>,
+    #[serde(default)]
+    pending_plan: Option<SwarmPlan>,
+    #[serde(default)]
+    selected_option: Option<String>,
 }
 
 impl TripFlowState {
@@ -125,6 +129,8 @@ impl TripFlowState {
             records: Vec::new(),
             clarify_rounds: 0,
             awaiting_choice: None,
+            pending_plan: None,
+            selected_option: None,
         }
     }
 }
@@ -397,99 +403,6 @@ fn looks_like_fresh_full_request(text: &str) -> bool {
     sentence_marks >= 2 && request_hits >= 2 && constraint_hits >= 2
 }
 
-fn broad_place_choice_required(brief: &TripBrief, text: &str) -> bool {
-    let combined = format!("{}\n{}", brief.render(), text).to_lowercase();
-    let asks_where = contains_any(
-        &combined,
-        &[
-            "в каких местах",
-            "какие места",
-            "где лучше",
-            "куда лучше",
-            "подбери места",
-            "варианты мест",
-            "which places",
-            "where should",
-        ],
-    );
-    let broad_area = contains_any(
-        &combined,
-        &[
-            "рядом",
-            "недалеко",
-            "в радиусе",
-            "область",
-            "регион",
-            "из волгограда",
-            "от волгограда",
-            "near",
-            "around",
-            "region",
-        ],
-    );
-    asks_where || broad_area
-}
-
-fn activity_choice_required(brief: &TripBrief, text: &str) -> bool {
-    let combined = format!("{}\n{}", brief.render(), text).to_lowercase();
-    contains_any(
-        &combined,
-        &[
-            "байдарки или",
-            "велосипед или",
-            "пешком или",
-            "какой отдых",
-            "какой вид отдыха",
-            "что выбрать",
-            "чем заняться",
-            "куда поехать и чем",
-            "kayak or",
-            "bike or",
-            "which activity",
-            "what activity",
-        ],
-    )
-}
-
-fn option_candidate_count(text: &str) -> usize {
-    let mut numbered = 0usize;
-    let mut candidate_lines = 0usize;
-    for raw in text.lines() {
-        let line = raw.trim_start();
-        if line.is_empty() {
-            continue;
-        }
-        let mut chars = line.chars();
-        let first = chars.next();
-        let second = chars.next();
-        if first.is_some_and(|c| c.is_ascii_digit()) && matches!(second, Some('.') | Some(')')) {
-            numbered += 1;
-            continue;
-        }
-        let low = line.to_lowercase();
-        if low.starts_with("вариант ")
-            || low.starts_with("- вариант ")
-            || low.starts_with("* вариант ")
-        {
-            candidate_lines += 1;
-        }
-    }
-    numbered.max(candidate_lines)
-}
-
-fn options_need_repair(brief: &TripBrief, user_text: &str, options: &str) -> bool {
-    (broad_place_choice_required(brief, user_text) || activity_choice_required(brief, user_text))
-        && option_candidate_count(options) < 2
-}
-
-fn options_should_retry(brief: &TripBrief, user_text: &str, options: &str) -> bool {
-    options_need_repair(brief, user_text, options) && !is_stage_failure(options)
-}
-
-fn render_options_repair_needed() -> String {
-    "Не хочу выбирать за вас один случайный вариант: для честного сравнения пока недостаточно данных. Я сохранил состояние; напишите «продолжай», и я сначала сопоставлю несколько подходящих видов отдыха и мест по погоде и условиям, а уже потом перейду к маршруту.".to_string()
-}
-
 fn contains_any(text: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| text.contains(needle))
 }
@@ -499,10 +412,6 @@ fn count_contains(text: &str, needles: &[&str]) -> usize {
         .iter()
         .filter(|needle| text.contains(**needle))
         .count()
-}
-
-fn is_data_checkpoint_task(task: &SwarmTask) -> bool {
-    task.tools && !task.side_effects
 }
 
 fn progress_message_for_task(task: &SwarmTask) -> String {
@@ -609,9 +518,7 @@ fn side_effects_locally_allowed(records: &[StageRecord]) -> bool {
 /// must check water proximity AND settlement isolation across several Overpass
 /// queries) on a slow host needs more headroom before we call it stuck.
 const STAGE_TIMEOUT: Duration = Duration::from_secs(300);
-/// Keep Telegram turns interactive: one heavy data-gathering worker per user
-/// message, then return a useful checkpoint and wait for "продолжай".
-const DATA_TASKS_PER_TURN: usize = 1;
+const OPTIONS_MAX_STEPS: usize = 6;
 
 /// Advance the flow by one user turn. The caller guarantees `session.trip` is
 /// `Some`. The ORCHESTRATOR agent decides every transition; the user can step
@@ -626,13 +533,13 @@ pub async fn advance(
     advance_swarm(llm, state, session, user_text, progress).await
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct SwarmPlan {
     #[serde(default)]
     tasks: Vec<SwarmTask>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct SwarmTask {
     #[serde(default)]
     id: String,
@@ -843,16 +750,17 @@ const SWARM_PLANNER_PROMPT: &str = "You are SwarmPlanner. Build a minimal swarm 
 brief, the user's chosen option, prior records, and the ACTUAL connected MCP tool inventory. Do \
 not assume calendar/docs/maps/weather tools exist; inspect the inventory. Do not use fixed \
 activity templates. Treat the user's selected activity, place and date as hard inputs. Recheck \
-activity-specific weather safety before detailed routing. Create separate worker tasks with narrow \
-responsibilities and isolated context. \
+activity-specific weather safety before detailed routing. Combine related weather, geography, \
+route and stop checks into as few tool-enabled tasks as possible. Use at most three evidence \
+workers. Do not create verifier, critic, summary or final-answer tasks because the orchestrator \
+already performs those steps. \
 If the prior records are still only broad options or an unverified draft, do NOT include \
 side_effects=true tasks yet; first gather/verify the selected place, date, route and camp. \
 Include a side_effects=true task only for external artifacts explicitly requested by the user AND \
 only if plausible tools are present or connectable; otherwise include a non-side-effect task that \
 explains the missing capability. Return ONLY JSON: {\"tasks\":[{\"id\":\"short_snake\",\
 \"agent\":\"AgentName\",\"task\":\"specific task\",\"tools\":true,\"side_effects\":false,\
-\"checkpoint\":false,\"model\":\"optional-model-override\"}]}. The plan must include a \
-verification task before any side-effect task.";
+\"checkpoint\":false,\"model\":\"optional-model-override\"}]}.";
 
 const SWARM_VERIFIER_PROMPT: &str = "You are VerifierAgent. Decide whether the gathered evidence is \
 concrete enough to perform external side effects or present the final plan. Judge ONLY against the \
@@ -964,7 +872,7 @@ async fn advance_swarm(
             let _ = p.send("🧭 Подбираю короткие варианты…".to_string());
         }
         let options_agent = registry.get("OptionsAgent");
-        let mut options = run_swarm_worker(
+        let options = run_swarm_worker(
             llm,
             state,
             session,
@@ -977,46 +885,10 @@ async fn advance_swarm(
                 user_text
             ),
             true,
+            OPTIONS_MAX_STEPS,
         )
         .await;
-        options = clean_user_text(&options);
-        if options_should_retry(&flow.brief, user_text, &options) {
-            let repair_prompt = format!(
-                "{SWARM_OPTIONS_PROMPT}\n\nYour previous response did not offer enough distinct \
-                 place choices for a broad-location request. One river/route is NOT acceptable. \
-                 Try again: compare genuinely different candidate places/water bodies reachable \
-                 from the user's start area. Do not build a detailed route yet. Return at least \
-                 two candidates if the tools/data can support them; otherwise say plainly that \
-                 a comparative place list could not be gathered.\n\n[previous-response]\n{options}"
-            );
-            let repaired = run_swarm_worker(
-                llm,
-                state,
-                session,
-                &options_agent,
-                &repair_prompt,
-                &format!(
-                    "[brief]\n{}\n\n[available-tools]\n{}\n\n[user-request]\n{}",
-                    flow.brief.render(),
-                    tool_context,
-                    user_text
-                ),
-                true,
-            )
-            .await;
-            options = clean_user_text(&repaired);
-        }
-        if options_need_repair(&flow.brief, user_text, &options) {
-            flow.stage = Stage::Planning;
-            set_named_record(&mut flow.records, "OptionsAgent", options);
-            flow.awaiting_choice = Some(Stage::Planning);
-            session.trip = Some(flow);
-            return Ok(FlowTurn {
-                reply: render_options_repair_needed(),
-                trace,
-                done: false,
-            });
-        }
+        let options = clean_user_text(&options);
         flow.stage = Stage::Planning;
         set_named_record(&mut flow.records, "OptionsAgent", options.clone());
         flow.awaiting_choice = Some(Stage::Planning);
@@ -1028,97 +900,46 @@ async fn advance_swarm(
         });
     }
 
-    if flow.awaiting_choice == Some(Stage::Planning) && message_requests_continuation(user_text) {
-        if let Some(existing_options) = flow
-            .records
-            .iter()
-            .find(|r| r.stage == "OptionsAgent")
-            .map(|r| r.output.clone())
-        {
-            let original_request = flow
-                .brief
-                .fields
-                .get("request")
-                .cloned()
-                .unwrap_or_else(|| user_text.to_string());
-            if options_need_repair(&flow.brief, &original_request, &existing_options)
-                || existing_options.contains("STAGE_INCOMPLETE")
-            {
-                if let Some(p) = progress {
-                    let _ = p.send("🧭 Сначала сравниваю разные места…".to_string());
-                }
-                let options_agent = registry.get("OptionsAgent");
-                let repaired = run_swarm_worker(
-                    llm,
-                    state,
-                    session,
-                    &options_agent,
-                    SWARM_OPTIONS_PROMPT,
-                    &format!(
-                        "[brief]\n{}\n\n[available-tools]\n{}\n\n[user-request]\n{}",
-                        flow.brief.render(),
-                        tool_context,
-                        original_request
-                    ),
-                    true,
-                )
-                .await;
-                let repaired = clean_user_text(&repaired);
-                let still_needs_repair =
-                    options_need_repair(&flow.brief, &original_request, &repaired);
-                set_named_record(&mut flow.records, "OptionsAgent", repaired.clone());
-                flow.awaiting_choice = Some(Stage::Planning);
-                session.trip = Some(flow);
-                let reply = if still_needs_repair {
-                    render_options_repair_needed()
-                } else {
-                    repaired
-                };
-                return Ok(FlowTurn {
-                    reply,
-                    trace,
-                    done: false,
-                });
-            }
+    if flow.awaiting_choice == Some(Stage::Planning) && !user_text.trim().is_empty() {
+        let user_choice = clean_user_text(user_text.trim());
+        set_named_record(&mut flow.records, "UserChoice", user_choice.clone());
+        flow.selected_option = Some(user_choice);
+        flow.awaiting_choice = None;
+        flow.pending_plan = None;
+    }
+
+    let user_choice = flow
+        .selected_option
+        .clone()
+        .or_else(|| {
+            flow.records
+                .iter()
+                .find(|record| record.stage == "UserChoice")
+                .map(|record| record.output.clone())
+        })
+        .unwrap_or_default();
+
+    let plan = if let Some(plan) = flow.pending_plan.clone() {
+        plan
+    } else {
+        if let Some(p) = progress {
+            let _ = p.send("🧠 Планирую маршрут…".to_string());
         }
-    }
-
-    let user_choice = user_text.trim();
-    if !user_choice.is_empty() {
-        set_named_record(
-            &mut flow.records,
-            "UserChoice",
-            clean_user_text(user_choice),
-        );
-    }
-
-    if let Some(p) = progress {
-        let _ = p.send("🧠 Планирую маршрут…".to_string());
-    }
-    let plan = make_swarm_plan(
-        llm,
-        &registry,
-        &flow.brief,
-        &flow.records,
-        user_choice,
-        &tool_context,
-    )
-    .await;
-    if plan.tasks.is_empty() {
-        return Ok(FlowTurn {
-            reply: "Не смог собрать план агентов из текущего запроса. Состояние сохранено; попробуйте ещё раз коротко подтвердить выбранный вариант.".into(),
-            trace,
-            done: false,
-        });
-    }
-
-    // True once we skip a side-effecting task because the verifier wasn't ready:
-    // we keep planning/answering but must not mark the turn done (no artifacts yet).
-    let mut artifacts_skipped = false;
+        let plan = make_swarm_plan(
+            llm,
+            &registry,
+            &flow.brief,
+            &flow.records,
+            &user_choice,
+            &tool_context,
+        )
+        .await;
+        flow.pending_plan = Some(plan.clone());
+        persist_flow_checkpoint(session, &flow)?;
+        plan
+    };
     let tasks = plan.tasks;
-    let task_count = tasks.len();
-    let mut completed_data_tasks_this_turn = 0usize;
-    for (task_index, task) in tasks.into_iter().enumerate() {
+    for task in tasks {
         let id = sanitize_record_id(&task.id, &task.agent);
         let task_agent = registry.for_task(&task);
         if let Some(existing) = flow.records.iter().find(|r| r.stage == id) {
@@ -1132,7 +953,6 @@ async fn advance_swarm(
                 trace.push(
                     "side-effect gate not ready: local records are not fully confirmed".into(),
                 );
-                artifacts_skipped = true;
                 continue;
             }
             let verdict =
@@ -1145,7 +965,6 @@ async fn advance_swarm(
                     "verifier-gate not ready: {}",
                     verdict.missing.join("; ")
                 ));
-                artifacts_skipped = true;
                 continue;
             }
         }
@@ -1157,7 +976,7 @@ async fn advance_swarm(
         let query = format!(
             "[brief]\n{}\n\n[selected-option]\n{}\n\n[prior-agent-records]\n{}\n\n[task]\n{}",
             flow.brief.render(),
-            user_choice,
+            &user_choice,
             render_records_clipped(&flow.records, |_| 1200),
             task.task
         );
@@ -1169,6 +988,7 @@ async fn advance_swarm(
             &system,
             &query,
             task.tools,
+            crate::llm::STAGE_MAX_STEPS,
         )
         .await;
         if task.tools {
@@ -1179,48 +999,12 @@ async fn advance_swarm(
             set_named_record(&mut flow.records, &id, output.clone());
             flow.awaiting_choice = None;
             trace.push(format!("• {}: {}", task_agent.name, clip(&output, 90)));
-            // A worker couldn't get every concrete value — hand back a draft of
-            // what we DO have (places, dates, stops) instead of stranding the user.
-            let draft =
-                compose_best_effort(llm, &registry, &flow.brief, &flow.records, &tool_context)
-                    .await;
-            session.trip = Some(flow);
-            return Ok(FlowTurn {
-                reply: draft,
-                trace,
-                done: false,
-            });
+            persist_flow_checkpoint(session, &flow)?;
+            continue;
         }
         trace.push(format!("• {}: {}", task_agent.name, clip(&output, 90)));
         set_named_record(&mut flow.records, &id, output.clone());
-        if is_data_checkpoint_task(&task) {
-            completed_data_tasks_this_turn += 1;
-        }
-        if task.checkpoint {
-            session.trip = Some(flow);
-            return Ok(FlowTurn {
-                reply: output,
-                trace,
-                done: false,
-            });
-        }
-        let has_more_tasks = task_index + 1 < task_count;
-        if completed_data_tasks_this_turn >= DATA_TASKS_PER_TURN && has_more_tasks {
-            let checkpoint = compose_progress_checkpoint(
-                llm,
-                &registry,
-                &flow.brief,
-                &flow.records,
-                &tool_context,
-            )
-            .await;
-            session.trip = Some(flow);
-            return Ok(FlowTurn {
-                reply: checkpoint,
-                trace,
-                done: false,
-            });
-        }
+        persist_flow_checkpoint(session, &flow)?;
     }
 
     let verdict =
@@ -1235,11 +1019,11 @@ async fn advance_swarm(
         ));
         let draft =
             compose_best_effort(llm, &registry, &flow.brief, &flow.records, &tool_context).await;
-        session.trip = Some(flow);
+        session.trip = None;
         return Ok(FlowTurn {
             reply: draft,
             trace,
-            done: false,
+            done: true,
         });
     }
 
@@ -1261,16 +1045,6 @@ async fn advance_swarm(
     .await
     .map(|s| clean_user_text(&s))
     .unwrap_or_else(|_| fallback_compose(&flow.records));
-    if artifacts_skipped {
-        // Data is confirmed now, but the side-effect step was skipped this turn —
-        // keep the flow open so «продолжай» creates the gdoc / calendar event.
-        session.trip = Some(flow);
-        return Ok(FlowTurn {
-            reply: final_answer,
-            trace,
-            done: false,
-        });
-    }
     session.trip = None;
     Ok(FlowTurn {
         reply: final_answer,
@@ -1298,37 +1072,32 @@ async fn make_swarm_plan(
     let raw = complete_swarm_agent(llm, &planner, SWARM_PLANNER_PROMPT, &input)
         .await
         .unwrap_or_default();
-    serde_json::from_str(&extract_json(&raw)).unwrap_or_else(|_| SwarmPlan {
-        tasks: vec![
-            SwarmTask {
-                id: "research".into(),
-                agent: "ResearchAgent".into(),
-                model: None,
-                task: "Research the selected option with the available tools and produce a concrete plan with evidence for the user's actual request.".into(),
-                tools: true,
-                side_effects: false,
-                checkpoint: false,
-            },
-            SwarmTask {
-                id: "verify".into(),
-                agent: "VerifierAgent".into(),
-                model: None,
-                task: "Verify that the plan satisfies the user's request and list any missing evidence.".into(),
-                tools: false,
-                side_effects: false,
-                checkpoint: false,
-            },
-            SwarmTask {
-                id: "artifacts".into(),
-                agent: "ArtifactsAgent".into(),
-                model: None,
-                task: "If the user requested external artifacts and suitable tools are available, create them. If not, report the missing capability without claiming success.".into(),
-                tools: true,
-                side_effects: true,
-                checkpoint: false,
-            },
-        ],
-    })
+    let mut plan = serde_json::from_str::<SwarmPlan>(&extract_json(&raw))
+        .unwrap_or_else(|_| fallback_swarm_plan());
+    plan.tasks.retain(|task| {
+        let agent = task.agent.to_lowercase();
+        !agent.contains("verifier") && !agent.contains("final")
+    });
+    plan.tasks.truncate(4);
+    if plan.tasks.is_empty() {
+        fallback_swarm_plan()
+    } else {
+        plan
+    }
+}
+
+fn fallback_swarm_plan() -> SwarmPlan {
+    SwarmPlan {
+        tasks: vec![SwarmTask {
+            id: "research".into(),
+            agent: "ResearchAgent".into(),
+            model: None,
+            task: "Research the selected option with available tools and produce the complete concrete trip plan requested by the user, including weather, route, stops and every explicit constraint in one pass.".into(),
+            tools: true,
+            side_effects: false,
+            checkpoint: false,
+        }],
+    }
 }
 
 async fn verify_swarm_ready(
@@ -1362,6 +1131,7 @@ async fn run_swarm_worker(
     system: &str,
     query: &str,
     allow_tools: bool,
+    max_steps: usize,
 ) -> String {
     let full_system = format!(
         "{system}\n\nYou are {}. You are one worker in a real swarm: do only your task, \
@@ -1384,7 +1154,7 @@ async fn run_swarm_worker(
                 query,
                 &[],
                 Some(session.chat_id),
-                crate::llm::STAGE_MAX_STEPS,
+                max_steps,
                 Some(&agent.model),
             )
             .await
@@ -1519,6 +1289,11 @@ fn set_named_record(records: &mut Vec<StageRecord>, stage: &str, output: String)
     }
 }
 
+fn persist_flow_checkpoint(session: &mut ChatSession, flow: &TripFlowState) -> Result<()> {
+    session.trip = Some(flow.clone());
+    super::session::save(session)
+}
+
 fn sanitize_record_id(id: &str, agent: &str) -> String {
     let raw = if id.trim().is_empty() { agent } else { id };
     raw.chars()
@@ -1549,39 +1324,8 @@ async fn compose_best_effort(
          DRAFT the user can act on right now: give the candidate place(s), date(s) and stops you \
          DO have with their real values (names, coordinates, distances), and mark anything \
          unconfirmed with «(не подтверждено)». Never reply that nothing is ready. Create NO \
-         external artifacts and do not claim any were created. End with one short line inviting \
-         the user to reply «продолжай» to finish the remaining checks."
-    );
-    complete_swarm_agent(
-        llm,
-        &final_agent,
-        &system,
-        &format!(
-            "[brief]\n{}\n\n[available-tools]\n{}\n\n[agent-records]\n{}",
-            brief.render(),
-            tool_context,
-            render_records_clipped(records, |_| 1800)
-        ),
-    )
-    .await
-    .map(|s| clean_user_text(&s))
-    .unwrap_or_else(|_| fallback_compose(records))
-}
-
-async fn compose_progress_checkpoint(
-    llm: &Llm,
-    registry: &SwarmAgentRegistry,
-    brief: &TripBrief,
-    records: &[StageRecord],
-    tool_context: &str,
-) -> String {
-    let final_agent = registry.get("FinalAgent");
-    let system = format!(
-        "{SWARM_FINAL_PROMPT}\n\nThis is an INTERMEDIATE checkpoint after one data-gathering \
-         worker. Produce a useful partial result now, in the user's language. Include concrete \
-         dates, places, coordinates, and constraints already found. Do not pretend the whole flow \
-         is finished. Do not claim any calendar event or document was created. End with one short \
-         line: ask the user to reply «продолжай» to run the next check/create artifacts."
+         external artifacts and do not claim any were created. State briefly which facts could not \
+         be confirmed, but finish the answer without asking the user to continue internal work."
     );
     complete_swarm_agent(
         llm,
@@ -1757,11 +1501,11 @@ fn fallback_compose(records: &[StageRecord]) -> String {
         .join("\n\n");
 
     if useful.trim().is_empty() {
-        return "Пока не смог завершить сбор данных: один из внешних запросов завис или вернул пустой ответ. Состояние сохранено; напишите «продолжай», и я повторю сбор без создания календаря или документа на непроверенных данных.".to_string();
+        return "Не удалось получить данные от внешнего источника. Запрос завершён без выдуманных маршрутов, календаря или документов; повторять внутренние шаги вручную не требуется.".to_string();
     }
 
     format!(
-        "Пока не удалось довести проверку до конца, но вот что уже собрано. Внешние артефакты ещё не создавал.\n\n{useful}\n\nНапишите «продолжай», и я повторю недостающий сбор данных."
+        "Удалось подтвердить только часть данных. Внешние артефакты не создавались.\n\n{useful}\n\nНеподтверждённые детали исключены из результата."
     )
 }
 
@@ -1945,7 +1689,7 @@ mod tests {
 
         assert!(!out.contains("(stage timed out)"));
         assert!(!out.contains("research:"));
-        assert!(out.contains("продолжай"));
+        assert!(!out.contains("продолжай"));
     }
 
     #[test]
@@ -1965,7 +1709,7 @@ mod tests {
 
         assert!(out.contains("Река А"));
         assert!(!out.contains("(stage failed:"));
-        assert!(out.contains("Внешние артефакты ещё не создавал"));
+        assert!(out.contains("Внешние артефакты не создавались"));
     }
 
     #[test]
@@ -2025,59 +1769,37 @@ mod tests {
     }
 
     #[test]
-    fn broad_place_request_rejects_single_option() {
-        let mut brief = TripBrief::default();
-        brief.fields.insert(
-            "request".into(),
-            "в каких местах рядом с Волгоградом".into(),
-        );
-        let one = "1. Река А — спокойный сплав, 50.1347, 43.5215";
-        let many = "1. Река А — 50.1347, 43.5215\n2. Река Б — 48.700, 44.500";
+    fn persisted_flow_keeps_selected_option_and_plan() {
+        let mut flow = TripFlowState::start();
+        flow.selected_option = Some("Первый вариант".into());
+        flow.pending_plan = Some(SwarmPlan {
+            tasks: vec![SwarmTask {
+                id: "weather".into(),
+                agent: "ResearchAgent".into(),
+                model: None,
+                task: "check weather".into(),
+                tools: true,
+                side_effects: false,
+                checkpoint: false,
+            }],
+        });
 
-        assert!(options_need_repair(
-            &brief,
-            "Хотим байдарки, в каких местах рядом с Волгоградом?",
-            one
-        ));
-        assert!(!options_need_repair(
-            &brief,
-            "Хотим байдарки, в каких местах рядом с Волгоградом?",
-            many
-        ));
+        let encoded = serde_json::to_string(&flow).unwrap();
+        let decoded: TripFlowState = serde_json::from_str(&encoded).unwrap();
+
+        assert_eq!(decoded.selected_option.as_deref(), Some("Первый вариант"));
+        assert_eq!(decoded.pending_plan.unwrap().tasks[0].id, "weather");
     }
 
     #[test]
-    fn activity_choice_request_rejects_single_option() {
-        let mut brief = TripBrief::default();
-        brief.fields.insert(
-            "request".into(),
-            "выбери по погоде байдарки или велосипед".into(),
-        );
-        let one = "1. Веломаршрут — 48.700, 44.500";
-        let many = "1. Веломаршрут — 48.700, 44.500\n2. Байдарки — 50.1347, 43.5215";
+    fn legacy_flow_deserializes_without_persisted_plan() {
+        let decoded: TripFlowState = serde_json::from_str(
+            r#"{"stage":"Planning","brief":{},"records":[],"clarify_rounds":1,"awaiting_choice":"Planning"}"#,
+        )
+        .unwrap();
 
-        assert!(options_need_repair(&brief, "что выбрать?", one));
-        assert!(!options_need_repair(&brief, "что выбрать?", many));
-    }
-
-    #[test]
-    fn failed_options_stage_is_not_retried() {
-        let mut brief = TripBrief::default();
-        brief.fields.insert(
-            "request".into(),
-            "выбери по погоде велосипед или пеший маршрут".into(),
-        );
-
-        assert!(options_need_repair(
-            &brief,
-            "выбери велосипед или пеший маршрут",
-            "(stage failed: provider timeout)"
-        ));
-        assert!(!options_should_retry(
-            &brief,
-            "выбери велосипед или пеший маршрут",
-            "(stage failed: provider timeout)"
-        ));
+        assert!(decoded.pending_plan.is_none());
+        assert!(decoded.selected_option.is_none());
     }
 
     #[test]
