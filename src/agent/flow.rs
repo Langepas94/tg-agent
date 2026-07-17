@@ -482,6 +482,10 @@ fn options_need_repair(brief: &TripBrief, user_text: &str, options: &str) -> boo
         && option_candidate_count(options) < 2
 }
 
+fn options_should_retry(brief: &TripBrief, user_text: &str, options: &str) -> bool {
+    options_need_repair(brief, user_text, options) && !is_stage_failure(options)
+}
+
 fn render_options_repair_needed() -> String {
     "Не хочу выбирать за вас один случайный вариант: для честного сравнения пока недостаточно данных. Я сохранил состояние; напишите «продолжай», и я сначала сопоставлю несколько подходящих видов отдыха и мест по погоде и условиям, а уже потом перейду к маршруту.".to_string()
 }
@@ -976,7 +980,7 @@ async fn advance_swarm(
         )
         .await;
         options = clean_user_text(&options);
-        if options_need_repair(&flow.brief, user_text, &options) {
+        if options_should_retry(&flow.brief, user_text, &options) {
             let repair_prompt = format!(
                 "{SWARM_OPTIONS_PROMPT}\n\nYour previous response did not offer enough distinct \
                  place choices for a broad-location request. One river/route is NOT acceptable. \
@@ -2054,6 +2058,26 @@ mod tests {
 
         assert!(options_need_repair(&brief, "что выбрать?", one));
         assert!(!options_need_repair(&brief, "что выбрать?", many));
+    }
+
+    #[test]
+    fn failed_options_stage_is_not_retried() {
+        let mut brief = TripBrief::default();
+        brief.fields.insert(
+            "request".into(),
+            "выбери по погоде велосипед или пеший маршрут".into(),
+        );
+
+        assert!(options_need_repair(
+            &brief,
+            "выбери велосипед или пеший маршрут",
+            "(stage failed: provider timeout)"
+        ));
+        assert!(!options_should_retry(
+            &brief,
+            "выбери велосипед или пеший маршрут",
+            "(stage failed: provider timeout)"
+        ));
     }
 
     #[test]
