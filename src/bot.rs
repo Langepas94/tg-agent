@@ -40,6 +40,8 @@ pub enum Command {
     Facts,
     #[command(description = "travel-weather flow: /trip <cities/dates>")]
     Trip(String),
+    #[command(description = "product support: /support <question>")]
+    Support(String),
     #[command(description = "reset this chat's memory (keeps long-term)")]
     Reset,
     #[command(description = "clear short context and active flow, keep profile and durable facts")]
@@ -58,6 +60,7 @@ fn base_commands() -> Vec<BotCommand> {
         cmd("info", "view or save extra info"),
         cmd("facts", "show learned facts"),
         cmd("trip", "run the travel-weather flow"),
+        cmd("support", "ask product support"),
         cmd("watches", "list active watches"),
         cmd("unwatch", "stop a watch"),
         cmd("compact", "clear short context and active flow"),
@@ -348,6 +351,9 @@ async fn handle_command(
         Command::Trip(args) => {
             handle_trip(&bot, chat, &state, &args).await?;
         }
+        Command::Support(question) => {
+            handle_support(&bot, chat, &question).await?;
+        }
         Command::Reset => {
             let mut session = crate::agent::session::load(chat.0);
             session.memory.reset_for_new_session();
@@ -417,6 +423,7 @@ async fn send_help(bot: &Bot, chat: ChatId, is_root: bool) -> anyhow::Result<()>
         "/info [label text | clear] — save extra preferences".to_string(),
         "/facts — show your learned facts".to_string(),
         "/trip <cities/dates> — travel-weather flow".to_string(),
+        "/support <question> — ask product support".to_string(),
         "/watches — list your active watches".to_string(),
         "/unwatch <id> | all — stop your watches".to_string(),
         "/compact — clear short context and active flow, keep profile and durable facts"
@@ -440,6 +447,33 @@ async fn send_help(bot: &Bot, chat: ChatId, is_root: bool) -> anyhow::Result<()>
         );
     }
     bot.send_message(chat, lines.join("\n")).await?;
+    Ok(())
+}
+
+async fn handle_support(bot: &Bot, chat: ChatId, question: &str) -> anyhow::Result<()> {
+    let question = question.trim();
+    if question.is_empty() {
+        bot.send_message(chat, "Использование: /support <вопрос>")
+            .await?;
+        return Ok(());
+    }
+    let typing = spawn_typing(bot.clone(), chat);
+    let response = crate::support::answer(question).await;
+    typing.abort();
+    match response {
+        Ok(answer) => {
+            for chunk in split_chunks(&answer, 3900) {
+                if !chunk.trim().is_empty() {
+                    bot.send_message(chat, chunk).await?;
+                }
+            }
+        }
+        Err(error) => {
+            tracing::error!("support request for chat {}: {error:#}", chat.0);
+            bot.send_message(chat, "Поддержка временно недоступна. Попробуйте позже.")
+                .await?;
+        }
+    }
     Ok(())
 }
 

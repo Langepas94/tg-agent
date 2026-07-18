@@ -7,3 +7,4 @@ pub mod mcp_client;
 pub mod persist;
 pub mod scheduler;
 pub mod state;
+pub mod support;

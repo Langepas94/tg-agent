@@ -20,6 +20,8 @@ and verify a concrete route → create only explicitly requested artifacts.
 - **Natural-language agent** — free-text questions go through an LLM
   (OpenAI-compatible, DeepSeek by default) tool-calling loop over the connected
   MCP tools.
+- **User support** — `/support <question>` sends a product question to the
+  isolated support service and returns only its user-safe answer in Telegram.
 - **Agent self-connect** — the agent can attach MCP servers on its own via the
   `mcp_connect` / `mcp_disconnect` meta-tools: when a request needs a capability
   no connected server provides, it picks the server, asks the user for any
