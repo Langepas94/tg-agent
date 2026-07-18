@@ -3,6 +3,7 @@ import json
 import math
 import os
 import re
+import sys
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -11,7 +12,8 @@ from pathlib import Path
 
 
 MARKER = "<!-- project-assistant-ai-review -->"
-LEGACY_MARKERS = {MARKER, "<!-- tg-agent-ai-review -->"}
+LEGACY_MARKERS = {"<!-- tg-agent-ai-review -->"}
+REVIEW_COMMANDS = {"/ai-review", "/review"}
 TOKEN_RE = re.compile(r"[A-Za-zА-Яа-яЁё_][A-Za-zА-Яа-яЁё0-9_]{2,}")
 CODE_SUFFIXES = {".rs", ".toml", ".yml", ".yaml", ".sh", ".py"}
 SKIP_PARTS = {".git", "target", "node_modules", "vendor"}
@@ -48,6 +50,8 @@ def request(url, token=None, method="GET", payload=None, accept="application/vnd
 
 def github_json(api, path, token, method="GET", payload=None):
     raw = request(f"{api}{path}", token=token, method=method, payload=payload)
+    if not raw:
+        return None
     return json.loads(raw.decode())
 
 
@@ -65,6 +69,10 @@ def paginated(api, path, token):
 
 def tokenize(text):
     return [token.lower() for token in TOKEN_RE.findall(text)]
+
+
+def is_review_command(body):
+    return body.strip() in REVIEW_COMMANDS
 
 
 def clip(text, limit, label):
@@ -268,40 +276,50 @@ def llm_review(base_url, api_key, model, language, prompt):
     return content
 
 
-def upsert_comment(api, repository, number, token, review):
+def publish_comment(api, repository, number, token, review):
     path = f"/repos/{repository}/issues/{number}/comments"
     comments = paginated(api, path, token)
     body = clip(f"{MARKER}\n# AI-ревью\n\n{review}", 64000, "review truncated")
-    existing = next(
-        (
-            item
-            for item in comments
-            if any(marker in item.get("body", "") for marker in LEGACY_MARKERS) and item.get("user", {}).get("type") == "Bot"
-        ),
-        None,
-    )
-    if existing:
+    markers = LEGACY_MARKERS | {MARKER}
+    existing = [
+        item
+        for item in comments
+        if any(marker in item.get("body", "") for marker in markers)
+        and item.get("user", {}).get("type") == "Bot"
+    ]
+    created = github_json(api, path, token, method="POST", payload={"body": body})
+    created_id = created.get("id") if isinstance(created, dict) else None
+    for item in existing:
+        if item.get("id") == created_id:
+            continue
         github_json(
             api,
-            f"/repos/{repository}/issues/comments/{existing['id']}",
+            f"/repos/{repository}/issues/comments/{item['id']}",
             token,
-            method="PATCH",
-            payload={"body": body},
+            method="DELETE",
         )
-    else:
-        github_json(api, path, token, method="POST", payload={"body": body})
 
 
-def build_prompt(pull, changed_names, raw_diff, changed_sources, retrieved):
+def build_prompt(pull, changed_names, raw_diff, changed_sources, retrieved, total_limit=48000):
+    available = max(total_limit - 1000, 1000)
+    budgets = {
+        "title": min(500, int(available * 0.03)),
+        "description": min(2000, int(available * 0.08)),
+        "files": min(6000, int(available * 0.12)),
+        "diff": min(18000, int(available * 0.34)),
+        "sources": min(10000, int(available * 0.18)),
+        "retrieved": int(available * 0.25),
+    }
+    rendered = render_chunks(retrieved)
     prompt = (
-        f"PR title: {clip(pull['title'], 500, 'title truncated')}\n"
-        f"PR description:\n{clip(pull.get('body') or '(empty)', 2000, 'description truncated')}\n\n"
-        f"Changed files:\n{clip(changed_names, 6000, 'file list truncated')}\n\n"
-        f"Diff:\n{clip(raw_diff, 18000, 'diff truncated for model context')}\n\n"
-        f"Changed source snapshots:\n{changed_sources or '(unavailable)'}\n\n"
-        f"Retrieved project documentation and code:\n{render_chunks(retrieved) or '(no relevant chunks found)'}"
+        f"PR title: {clip(pull['title'], budgets['title'], 'title truncated')}\n"
+        f"PR description:\n{clip(pull.get('body') or '(empty)', budgets['description'], 'description truncated')}\n\n"
+        f"Changed files:\n{clip(changed_names, budgets['files'], 'file list truncated')}\n\n"
+        f"Diff:\n{clip(raw_diff, budgets['diff'], 'diff truncated for model context')}\n\n"
+        f"Changed source snapshots:\n{clip(changed_sources or '(unavailable)', budgets['sources'], 'changed sources truncated')}\n\n"
+        f"Retrieved project documentation and code:\n{clip(rendered or '(no relevant chunks found)', budgets['retrieved'], 'retrieved context truncated')}"
     )
-    return clip(prompt, 48000, "total review context truncated")
+    return clip(prompt, total_limit, "total review context truncated")
 
 
 def main():
@@ -329,12 +347,20 @@ def main():
         token,
         budget=10000,
     )
-    prompt = build_prompt(pull, changed_names, raw_diff, changed_sources, retrieved)
-    prompt = clip(prompt, provider_prompt_limit(base_url), "provider context truncated")
+    prompt = build_prompt(
+        pull,
+        changed_names,
+        raw_diff,
+        changed_sources,
+        retrieved,
+        total_limit=provider_prompt_limit(base_url),
+    )
     print(f"AI review context: {len(prompt)} characters, {len(files)} changed files")
     review = llm_review(base_url, api_key, model, language, prompt)
-    upsert_comment(api, repository, number, token, review)
+    publish_comment(api, repository, number, token, review)
 
 
 if __name__ == "__main__":
+    if sys.argv[1:] == ["--check-command"]:
+        raise SystemExit(0 if is_review_command(os.environ.get("GITHUB_COMMENT_BODY", "")) else 1)
     main()

@@ -29,7 +29,8 @@ jobs:
       github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'issue_comment' &&
       github.event.issue.pull_request &&
-      (github.event.comment.body == '/ai-review' || github.event.comment.body == '/review') &&
+      (startsWith(github.event.comment.body, '/ai-review') ||
+      startsWith(github.event.comment.body, '/review')) &&
       contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association))
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -38,9 +39,33 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.base.sha || github.sha }}
           persist-credentials: false
+      - name: Resolve review command
+        id: command
+        if: github.event_name == 'issue_comment'
+        env:
+          GITHUB_COMMENT_BODY: ${{ github.event.comment.body }}
+        run: |
+          if python3 .github/scripts/ai_review.py --check-command; then
+            echo "accepted=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "accepted=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Acknowledge review command
+        if: github.event_name == 'issue_comment' && steps.command.outputs.accepted == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.reactions.createForIssueComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: context.payload.comment.id,
+              content: 'eyes'
+            })
       - name: Test review pipeline
+        if: github.event_name != 'issue_comment' || steps.command.outputs.accepted == 'true'
         run: python3 -m unittest discover -s .github/scripts -p 'test_*.py'
       - name: Review pull request
+        if: github.event_name != 'issue_comment' || steps.command.outputs.accepted == 'true'
         env:
           AI_REVIEW_API_KEY: ${{ secrets.AI_REVIEW_API_KEY }}
           AI_REVIEW_BASE_URL: ${{ vars.AI_REVIEW_BASE_URL }}
