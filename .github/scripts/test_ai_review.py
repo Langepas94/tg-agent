@@ -35,15 +35,24 @@ class ReviewPipelineTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "docs").mkdir()
+            (root / "docs" / "user").mkdir()
             (root / "src").mkdir()
             (root / "target").mkdir()
             (root / "README.md").write_text("readme", encoding="utf-8")
             (root / "docs" / "architecture.md").write_text("docs", encoding="utf-8")
+            (root / "docs" / "user" / "getting-started.md").write_text(
+                "user flow", encoding="utf-8"
+            )
             (root / "src" / "main.rs").write_text("fn main() {}", encoding="utf-8")
             (root / "target" / "generated.rs").write_text("generated", encoding="utf-8")
             files = ai_review.knowledge_files(root)
         self.assertEqual(
-            ["README.md", "docs/architecture.md", "src/main.rs"],
+            [
+                "README.md",
+                "docs/architecture.md",
+                "docs/user/getting-started.md",
+                "src/main.rs",
+            ],
             [path for path, _ in files],
         )
 
@@ -74,6 +83,16 @@ class ReviewPipelineTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(RuntimeError, "AI_REVIEW_API_KEY"):
                 ai_review.provider_config("github-token")
+
+    def test_github_models_uses_smaller_prompt_budget(self):
+        self.assertEqual(
+            20000,
+            ai_review.provider_prompt_limit("https://models.github.ai/inference"),
+        )
+        self.assertEqual(
+            48000,
+            ai_review.provider_prompt_limit("https://api.deepseek.com"),
+        )
 
     def test_prompt_has_hard_total_budget(self):
         prompt = ai_review.build_prompt(

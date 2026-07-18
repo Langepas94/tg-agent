@@ -4,12 +4,12 @@
 # `collect2: ld returned 1`). Run from the repo root:  ./deploy.sh
 #
 # Env overrides: VPS_HOST (default root@5.129.234.9), SSH_KEY
-# (default ~/.ssh/id_ed25519_vps), REMOTE_DIR (default /opt/tg-agent),
+# (default ~/Documents/ai/.ssh/timeweb_tg_agent_ed25519), REMOTE_DIR (default /opt/tg-agent),
 # ENABLE_NGINX_PROXY=0 to skip installing/updating the public /admin proxy.
 set -euo pipefail
 
 VPS_HOST="${VPS_HOST:-root@5.129.234.9}"
-SSH_KEY="${SSH_KEY:-$HOME/.ssh/id_ed25519_vps}"
+SSH_KEY="${SSH_KEY:-$HOME/Documents/ai/.ssh/timeweb_tg_agent_ed25519}"
 REMOTE_DIR="${REMOTE_DIR:-/opt/tg-agent}"
 ENABLE_NGINX_PROXY="${ENABLE_NGINX_PROXY:-1}"
 SSH=(ssh -i "$SSH_KEY" -o ConnectTimeout=15)
@@ -17,13 +17,19 @@ SSH=(ssh -i "$SSH_KEY" -o ConnectTimeout=15)
 echo "==> rsync source to $VPS_HOST:$REMOTE_DIR"
 rsync -az -e "ssh -i $SSH_KEY" \
   --exclude .env --exclude state.json --exclude sessions/ \
-  --exclude target/ --exclude .git/ \
+  --exclude target/ --exclude .git \
   ./ "$VPS_HOST:$REMOTE_DIR/"
 
 echo "==> build release + restart + PRUNE artifacts"
 "${SSH[@]}" "$VPS_HOST" "bash -s" <<REMOTE
 set -e
 cd "$REMOTE_DIR"
+if git rev-parse --git-dir >/dev/null 2>&1; then
+  git fetch -q origin main
+  git update-ref refs/heads/main refs/remotes/origin/main
+  git symbolic-ref HEAD refs/heads/main
+  git read-tree HEAD
+fi
 "\$HOME/.cargo/bin/cargo" build --release 2>&1 | tail -3
 systemctl restart tg-agent
 sleep 3

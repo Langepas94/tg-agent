@@ -184,19 +184,16 @@ async fn drive_assert_done(
     session: &mut ChatSession,
     opener: &str,
 ) -> String {
-    let (mut answer, mut done) = step(llm, state, session, opener).await;
-    let mut guard = 0;
-    // A constraint-heavy plan (e.g. a paddling trip needing put-in + isolated
-    // waterside campsite) can take several "продолжай" rounds on a slow host as
-    // workers fill in concrete OSM data; give the swarm room to converge.
-    while !done && guard < 12 {
-        guard += 1;
-        let next = "Давай первый вариант. Подтверждаю, двигайся дальше.";
-        let (r, d) = step(llm, state, session, next).await;
-        answer = r;
-        done = d;
-    }
-    assert!(done, "flow did not finish after {guard} follow-ups");
+    let (_, done) = step(llm, state, session, opener).await;
+    assert!(!done, "flow skipped the explicit option choice");
+    let (answer, done) = step(
+        llm,
+        state,
+        session,
+        "Давай первый вариант. Подтверждаю, двигайся дальше.",
+    )
+    .await;
+    assert!(done, "flow did not finish after the explicit choice");
     answer
 }
 

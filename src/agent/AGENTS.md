@@ -55,7 +55,12 @@ checkpoint for broad requests.
 ## Planning and Verification Rules
 
 - Treat selected activity, place and date as fixed unless the user changes them.
-- Give each worker one narrow task and only the context it needs.
+- Build a minimal bounded task graph and group related tool checks when they can
+  be completed from the same context.
+- Persist the selected option, generated task graph and each completed worker
+  result so a restart resumes only unfinished work.
+- Complete all internal research steps without asking the user to send
+  `продолжай` between them.
 - Workers return concrete findings, not narration about future work.
 - Missing capability or incomplete evidence must be explicit.
 - Verify only constraints the user actually requested.

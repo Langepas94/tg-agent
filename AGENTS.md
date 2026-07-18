@@ -32,6 +32,9 @@ generators, local Ollama chat, or unrelated web agents.
 - src/admin.rs: protected web administration
 - src/agent/: routing, memory, profile and outdoor-planning swarm
 - tests/: ignored live integration and end-to-end scenarios
+- docs/user/: authoritative end-user flows and support answers
+- docs/: architecture, operations, technical troubleshooting, demonstrations
+  and developer-tooling knowledge used by external RAG assistants
 - deploy.sh: production synchronization, release build and service restart
 
 More specific rules are defined in src/AGENTS.md, src/agent/AGENTS.md and
@@ -80,6 +83,18 @@ suitability or external artifact links.
 6. Commit, fetch origin/main, integrate without rewriting shared history, push.
 7. Deploy runtime changes and verify production.
 
+Documentation is executable project context. Keep README and docs aligned with
+the public commands, environment contract and production boundaries. The
+standalone project-assistant indexes README and docs, while the AI-review
+workflow retrieves README, docs, scoped AGENTS files and code. After meaningful
+documentation changes, smoke-test `/help` through project-assistant and run the
+AI-review Python tests.
+
+Support assistants must answer from `docs/user/` first. Technical
+troubleshooting and architecture are secondary evidence and must not override
+the documented user flow. Never ask a user to place passwords, tokens or other
+credentials in a support ticket.
+
 ## Required Validation
 
     cargo fmt --all -- --check
@@ -97,6 +112,7 @@ the trip flow changes.
 ## Production
 
 - Host: root@5.129.234.9
+- SSH key: $HOME/Documents/ai/.ssh/timeweb_tg_agent_ed25519
 - App: /opt/tg-agent
 - Environment: /opt/tg-agent/.env
 - Service: tg-agent.service
@@ -105,7 +121,7 @@ the trip flow changes.
 
 Deploy with:
 
-    SSH_KEY=/path/to/timeweb-key ENABLE_NGINX_PROXY=0 ./deploy.sh
+    ENABLE_NGINX_PROXY=0 ./deploy.sh
 
 After deployment verify version, exactly one bot process, service state and
 recent logs. Never invoke the binary with --version; that starts another bot

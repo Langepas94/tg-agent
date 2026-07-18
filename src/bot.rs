@@ -213,7 +213,11 @@ async fn handle_text(bot: Bot, msg: Message, state: BotState) -> anyhow::Result<
             // Plain `{e}` would drop everything below the top context and is
             // why hangs/errors used to surface as an unhelpful one-liner.
             tracing::error!("agent turn for chat {}: {e:#}", chat.0);
-            bot.send_message(chat, format!("❌ {e:#}")).await?;
+            bot.send_message(
+                chat,
+                "❌ Не удалось обработать запрос. Попробуйте ещё раз через минуту.",
+            )
+            .await?;
         }
     }
     Ok(())
@@ -670,8 +674,12 @@ async fn handle_trip(bot: &Bot, chat: ChatId, state: &BotState, args: &str) -> a
             }
         }
         Err(e) => {
-            bot.send_message(chat, format!("❌ trip flow error: {e:#}"))
-                .await?;
+            tracing::error!("trip flow for chat {}: {e:#}", chat.0);
+            bot.send_message(
+                chat,
+                "❌ Не удалось обработать поездку. Попробуйте ещё раз через минуту.",
+            )
+            .await?;
         }
     }
     Ok(())
