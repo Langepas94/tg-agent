@@ -10,7 +10,7 @@ from collections import Counter
 from pathlib import Path
 
 
-MARKER = "<!-- tg-agent-ai-review -->"
+MARKER = "<!-- project-assistant-ai-review -->"
 TOKEN_RE = re.compile(r"[A-Za-zА-Яа-яЁё_][A-Za-zА-Яа-яЁё0-9_]{2,}")
 CODE_SUFFIXES = {".rs", ".toml", ".yml", ".yaml", ".sh", ".py"}
 SKIP_PARTS = {".git", "target", "node_modules", "vendor"}
