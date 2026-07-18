@@ -3,6 +3,8 @@ name: AI code review
 on:
   pull_request_target:
     types: [opened, synchronize, reopened, ready_for_review]
+  issue_comment:
+    types: [created]
   workflow_dispatch:
     inputs:
       pr_number:
@@ -12,20 +14,27 @@ on:
 
 permissions:
   contents: read
+  issues: write
   models: read
   pull-requests: write
 
 concurrency:
-  group: ai-review-${{ github.event.pull_request.number || inputs.pr_number }}
+  group: ai-review-${{ github.event.pull_request.number || github.event.issue.number || inputs.pr_number }}
   cancel-in-progress: true
 
 jobs:
   review:
-    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.draft == false
+    if: >-
+      github.event_name == 'pull_request_target' ||
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'issue_comment' &&
+      github.event.issue.pull_request &&
+      (github.event.comment.body == '/ai-review' || github.event.comment.body == '/review') &&
+      contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association))
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.base.sha || github.sha }}
           persist-credentials: false
@@ -39,5 +48,5 @@ jobs:
           AI_REVIEW_LANGUAGE: ${{ vars.AI_REVIEW_LANGUAGE }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           GITHUB_TOKEN: ${{ github.token }}
-          PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
+          PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number || inputs.pr_number }}
         run: python3 .github/scripts/ai_review.py

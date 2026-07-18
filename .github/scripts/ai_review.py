@@ -10,7 +10,8 @@ from collections import Counter
 from pathlib import Path
 
 
-MARKER = "<!-- tg-agent-ai-review -->"
+MARKER = "<!-- project-assistant-ai-review -->"
+LEGACY_MARKERS = {MARKER, "<!-- tg-agent-ai-review -->"}
 TOKEN_RE = re.compile(r"[A-Za-zА-Яа-яЁё_][A-Za-zА-Яа-яЁё0-9_]{2,}")
 CODE_SUFFIXES = {".rs", ".toml", ".yml", ".yaml", ".sh", ".py"}
 SKIP_PARTS = {".git", "target", "node_modules", "vendor"}
@@ -275,7 +276,7 @@ def upsert_comment(api, repository, number, token, review):
         (
             item
             for item in comments
-            if MARKER in item.get("body", "") and item.get("user", {}).get("type") == "Bot"
+            if any(marker in item.get("body", "") for marker in LEGACY_MARKERS) and item.get("user", {}).get("type") == "Bot"
         ),
         None,
     )
