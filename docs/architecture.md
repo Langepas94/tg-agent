@@ -76,5 +76,6 @@ sessions, fixtures, documentation, prompts, review logs or generated reports.
 The standalone project-assistant reads README and `docs/` as its RAG corpus and
 obtains live branch, diff, support-ticket and file context through its own MCP.
 The AI-review workflow reads a PR diff and changed files through the GitHub API,
-retrieves relevant documentation and base-branch code, and updates one review
-comment. Neither helper is linked into the production Rust binary.
+retrieves relevant documentation and base-branch code, and maintains one current
+review comment at the bottom of the pull request conversation. Neither helper is
+linked into the production Rust binary.
