@@ -140,6 +140,16 @@ class RetrievalTests(unittest.TestCase):
         self.assertEqual(0, accepted.returncode)
         self.assertEqual(1, rejected.returncode)
 
+    def test_command_cli_rejects_missing_environment_value(self):
+        script = Path(ai_review.__file__)
+        environment = {key: value for key, value in os.environ.items() if key != "GITHUB_COMMENT_BODY"}
+        result = subprocess.run(
+            [sys.executable, str(script), "--check-command"],
+            env=environment,
+            check=False,
+        )
+        self.assertEqual(1, result.returncode)
+
     def test_tokenize_supports_russian_and_normalizes_case(self):
         self.assertEqual(
             ["router", "архитектура", "state_name"],
@@ -387,6 +397,34 @@ class PublishingAndPipelineTests(unittest.TestCase):
         self.assertEqual(1, github_json.call_count)
         self.assertEqual("POST", github_json.call_args.kwargs["method"])
 
+    def test_publish_comment_does_not_delete_old_review_when_create_fails(self):
+        comments = [
+            {"id": 1, "body": ai_review.MARKER, "user": {"type": "Bot"}},
+        ]
+        with patch.object(ai_review, "paginated", return_value=comments), patch.object(
+            ai_review,
+            "github_json",
+            side_effect=RuntimeError("create failed"),
+        ) as github_json:
+            with self.assertRaisesRegex(RuntimeError, "create failed"):
+                ai_review.publish_comment("api", "o/r", 7, "token", "review")
+        self.assertEqual(1, github_json.call_count)
+        self.assertEqual("POST", github_json.call_args.kwargs["method"])
+
+    def test_publish_comment_surfaces_cleanup_failure_after_new_review_exists(self):
+        comments = [
+            {"id": 1, "body": ai_review.MARKER, "user": {"type": "Bot"}},
+        ]
+        with patch.object(ai_review, "paginated", return_value=comments), patch.object(
+            ai_review,
+            "github_json",
+            side_effect=[{"id": 9}, RuntimeError("delete failed")],
+        ) as github_json:
+            with self.assertRaisesRegex(RuntimeError, "delete failed"):
+                ai_review.publish_comment("api", "o/r", 7, "token", "review")
+        self.assertEqual("POST", github_json.call_args_list[0].kwargs["method"])
+        self.assertEqual("DELETE", github_json.call_args_list[1].kwargs["method"])
+
     def test_main_runs_complete_review_pipeline(self):
         pull = {"title": "Change", "body": "Body", "head": {"repo": {"full_name": "fork/r"}, "sha": "head"}}
         files = [{"filename": "src/main.rs", "status": "modified"}]
@@ -453,6 +491,16 @@ class WorkflowContractTests(unittest.TestCase):
         )
         guard = "github.event_name != 'issue_comment' || steps.command.outputs.accepted == 'true'"
         self.assertEqual(2, workflow.count(guard))
+
+    def test_workflow_serializes_reviews_per_pull_request(self):
+        workflow = (Path(ai_review.__file__).parents[1] / "workflows" / "ai-review.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            "group: ai-review-${{ github.event.pull_request.number || github.event.issue.number || inputs.pr_number }}",
+            workflow,
+        )
+        self.assertIn("cancel-in-progress: true", workflow)
 
 
 if __name__ == "__main__":
