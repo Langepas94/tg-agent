@@ -230,6 +230,7 @@ async fn handle_command(
     state: BotState,
 ) -> anyhow::Result<()> {
     let chat = msg.chat.id;
+    let telegram_user_id = msg.from().map(|user| user.id.0);
     if !allow_command(&bot, chat, &state, &cmd).await? {
         return Ok(());
     }
@@ -356,7 +357,7 @@ async fn handle_command(
             handle_trip(&bot, chat, &state, &args).await?;
         }
         Command::Support(question) => {
-            handle_support(&bot, chat, &question).await?;
+            handle_support(&bot, chat, telegram_user_id, &question).await?;
         }
         Command::Reset => {
             let mut session = crate::agent::session::load(chat.0);
@@ -454,15 +455,25 @@ async fn send_help(bot: &Bot, chat: ChatId, is_root: bool) -> anyhow::Result<()>
     Ok(())
 }
 
-async fn handle_support(bot: &Bot, chat: ChatId, question: &str) -> anyhow::Result<()> {
+async fn handle_support(
+    bot: &Bot,
+    chat: ChatId,
+    telegram_user_id: Option<u64>,
+    question: &str,
+) -> anyhow::Result<()> {
     let question = question.trim();
     if question.is_empty() {
         bot.send_message(chat, "Использование: /support <вопрос>")
             .await?;
         return Ok(());
     }
+    let Some(telegram_user_id) = telegram_user_id else {
+        bot.send_message(chat, "Поддержка доступна только в личном чате.")
+            .await?;
+        return Ok(());
+    };
     let typing = spawn_typing(bot.clone(), chat);
-    let response = crate::support::answer(question).await;
+    let response = crate::support::answer(question, telegram_user_id).await;
     typing.abort();
     match response {
         Ok(answer) => {

@@ -7,6 +7,7 @@ const DEFAULT_SUPPORT_URL: &str = "https://support.5-129-234-9.sslip.io";
 #[derive(Serialize)]
 struct SupportRequest {
     command: String,
+    telegram_user_id: u64,
 }
 
 #[derive(Deserialize)]
@@ -14,14 +15,18 @@ struct SupportResponse {
     answer: String,
 }
 
-pub async fn answer(question: &str) -> Result<String> {
+pub async fn answer(question: &str, telegram_user_id: u64) -> Result<String> {
     let base_url =
         std::env::var("SUPPORT_SERVICE_URL").unwrap_or_else(|_| DEFAULT_SUPPORT_URL.to_string());
+    let access_key =
+        std::env::var("SUPPORT_ACCESS_KEY").context("support service access is not configured")?;
     let endpoint = format!("{}/api/support", base_url.trim_end_matches('/'));
     let response = client()
         .post(endpoint)
+        .header("x-support-key", access_key)
         .json(&SupportRequest {
             command: format!("/support {}", question.trim()),
+            telegram_user_id,
         })
         .send()
         .await
@@ -72,5 +77,15 @@ mod tests {
             plain_telegram("**Шаг:** нажмите `Войти`"),
             "Шаг: нажмите Войти"
         );
+    }
+
+    #[test]
+    fn request_contains_telegram_user_id() {
+        let request = SupportRequest {
+            command: "/support Не работает вход".into(),
+            telegram_user_id: 101,
+        };
+        let value = serde_json::to_value(request).unwrap();
+        assert_eq!(value["telegram_user_id"], 101);
     }
 }

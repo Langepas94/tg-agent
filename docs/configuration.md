@@ -17,7 +17,12 @@ DIGEST_INTERVAL_MINUTES=360
 STATE_FILE=state.json
 SESSIONS_DIR=sessions
 RUST_LOG=tg_agent=info,rmcp=info
+SUPPORT_SERVICE_URL=https://support.5-129-234-9.sslip.io
+SUPPORT_ACCESS_KEY=<server-to-server key>
 ```
+
+`SUPPORT_ACCESS_KEY` is shared only between the Telegram bot and the isolated
+support backend. It must never be sent by a Telegram user or shown in chat.
 
 The source-code fallback for `BOT_PASSWORD` is intended only for local
 development. Set a unique value in every real deployment.

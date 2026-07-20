@@ -24,8 +24,9 @@ assistants. RAG over this repository is implemented by the standalone
 - **Natural-language agent** — free-text questions go through an LLM
   (OpenAI-compatible, DeepSeek by default) tool-calling loop over the connected
   MCP tools.
-- **User support** — `/support <question>` sends a product question to the
-  isolated support service and returns only its user-safe answer in Telegram.
+- **User support** — `/support <question>` sends the product question and the
+  authenticated Telegram user ID to the isolated support service. Its read-only
+  JSON CRM MCP resolves that user's active ticket before RAG answering.
 - **Agent self-connect** — the agent can attach MCP servers on its own via the
   `mcp_connect` / `mcp_disconnect` meta-tools: when a request needs a capability
   no connected server provides, it picks the server, asks the user for any

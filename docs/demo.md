@@ -7,7 +7,7 @@ in the neighboring `ai` and `project-assistant` tasks.
 
 1. Confirm `tg-agent.service` and `open-meteo-mcp.service` are active.
 2. Confirm exactly one Telegram bot process is polling.
-3. Open the Telegram bot and the public support console in advance.
+3. Open the Telegram bot and confirm `/support` is visible in its command menu.
 4. Build `project-assistant` with `cargo build --release`.
 5. Keep the support password and all API keys out of screen sharing, shell
    history, tickets and slides.
@@ -49,26 +49,23 @@ Expected sources include `docs/architecture.md` and scoped AGENTS guidance.
 
 ## Scenario 3: support assistant
 
-CLI version:
+In the Telegram bot, send:
 
-```bash
-cargo run --release -- \
-  --project ../tg-agent \
-  --support-data examples/travel-support-data.json \
-  "/support TICKET-1001 Почему не работает авторизация?"
+```text
+/support Почему не работает авторизация?
 ```
 
-Web version: open `http://5.129.234.9/support/`, enter the operator password
-outside screen sharing, load `TICKET-1001` and ask the same question.
+The bot adds the authenticated Telegram user ID. The isolated support backend
+uses its JSON CRM MCP to resolve that user's active ticket and linked profile,
+then retrieves relevant FAQ and user documentation before answering.
 
 Success criteria:
 
-- ticket `TICKET-1001` is joined with `USER-42` through MCP;
-- the first answer source is `docs/user/getting-started.md` or
-  `docs/user/support-and-faq.md`, with technical docs used only as fallback;
-- the answer never asks for or reveals a password;
-- no password returns `401`;
-- `/support/health` returns `200`.
+- no ticket ID, password or access key is entered by the Telegram user;
+- the answer reflects the active ticket linked to the sender's Telegram ID;
+- FAQ and product documentation supply the user-safe resolution steps;
+- internal prompts, tokens, stack and infrastructure are never revealed;
+- an unknown Telegram user does not receive another user's ticket context.
 
 ## Scenario 4: file-working assistant
 
