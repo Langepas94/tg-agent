@@ -16,11 +16,16 @@ through the GitHub API. It retrieves relevant chunks from the base revision:
 
 The model receives the diff and retrieved context and produces a Markdown review
 with potential bugs, architectural problems and recommendations. One pull
-request comment is created and updated after later pushes.
+request comment is kept after every run. A completed rerun publishes the result
+at the bottom of the conversation and then removes older marker-based review
+comments.
 
 The workflow can also be started manually with `workflow_dispatch` and a pull
-request number. This is useful for smoke-testing configuration or rerunning a
-review without pushing another commit.
+request number. An owner, member or collaborator can post `/ai-review` or
+`/review` in a pull request. Leading and trailing whitespace is ignored, and an
+eyes reaction acknowledges an accepted command before review generation starts.
+These paths are useful for smoke-testing configuration or rerunning a review
+without pushing another commit.
 
 ## Repository configuration
 
